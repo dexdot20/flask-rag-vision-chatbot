@@ -1,0 +1,2317 @@
+const bootstrapEl = document.getElementById("app-bootstrap");
+const bootstrapData = (() => {
+  if (!bootstrapEl) {
+    return { settings: {} };
+  }
+  try {
+    return JSON.parse(bootstrapEl.textContent || "{}") || { settings: {} };
+  } catch (_) {
+    return { settings: {} };
+  }
+})();
+
+const messagesEl = document.getElementById("messages");
+const inputEl = document.getElementById("user-input");
+const imageInputEl = document.getElementById("image-input");
+const attachBtn = document.getElementById("attach-btn");
+const attachmentPreviewEl = document.getElementById("attachment-preview");
+const preferencesEl = document.getElementById("preferences-input");
+const scratchpadOutputEl = document.getElementById("scratchpad-output");
+const scratchpadInputEl = document.getElementById("scratchpad-input");
+const scratchpadAdminBlockEl = document.getElementById("scratchpad-admin-block");
+const maxStepsEl = document.getElementById("max-steps-input");
+const summaryTriggerEl = document.getElementById("summary-trigger-input");
+const summaryBatchEl = document.getElementById("summary-batch-input");
+const fetchThresholdEl = document.getElementById("fetch-threshold-input");
+const fetchAggressivenessEl = document.getElementById("fetch-aggressiveness-input");
+const ragAutoInjectEl = document.getElementById("rag-auto-inject-toggle");
+const toolToggleEls = Array.from(document.querySelectorAll("#tool-toggles input[type='checkbox']"));
+const kbSyncBtn = document.getElementById("kb-sync-btn");
+const kbSyncAllBtn = document.getElementById("kb-sync-all-btn");
+const kbStatusEl = document.getElementById("kb-status");
+const kbDocumentsListEl = document.getElementById("kb-documents-list");
+const cancelBtn = document.getElementById("cancel-btn");
+const settingsBtn = document.getElementById("settings-btn");
+const fixBtn = document.getElementById("fix-btn");
+const sendBtn = document.getElementById("send-btn");
+const settingsSaveBtn = document.getElementById("settings-save-btn");
+const modelSel = document.getElementById("model-select");
+const mobileModelSel = document.getElementById("mobile-model-select");
+const clearBtn = document.getElementById("clear-btn");
+const emptyState = document.getElementById("empty-state");
+const errorArea = document.getElementById("error-area");
+const editBanner = document.getElementById("edit-banner");
+const editBannerText = document.getElementById("edit-banner-text");
+const editBannerCancelBtn = document.getElementById("edit-banner-cancel");
+const settingsPanel = document.getElementById("settings-panel");
+const settingsOverlay = document.getElementById("settings-overlay");
+const settingsClose = document.getElementById("settings-close");
+const settingsStatus = document.getElementById("settings-status");
+const tokensBtn = document.getElementById("tokens-btn");
+const tokensBadge = document.getElementById("tokens-badge");
+const statsPanel = document.getElementById("stats-panel");
+const statsOverlay = document.getElementById("stats-overlay");
+const statsClose = document.getElementById("stats-close");
+const headerEl = document.querySelector("header");
+const sidebarList = document.getElementById("sidebar-list");
+const sidebarToggleBtn = document.getElementById("sidebar-toggle-btn");
+const sidebarOverlay = document.getElementById("sidebar-overlay");
+const newChatBtn = document.getElementById("new-chat-btn");
+const mobileToolsBtn = document.getElementById("mobile-tools-btn");
+const mobileToolsPanel = document.getElementById("mobile-tools-panel");
+const mobileToolsOverlay = document.getElementById("mobile-tools-overlay");
+const mobileToolsClose = document.getElementById("mobile-tools-close");
+const mobileSettingsBtn = document.getElementById("mobile-settings-btn");
+const mobileTokensBtn = document.getElementById("mobile-tokens-btn");
+const mobileClearBtn = document.getElementById("mobile-clear-btn");
+
+let history = [];
+let isStreaming = false;
+let isFixing = false;
+let currentConvId = null;
+let activeAbortController = null;
+let selectedImageFile = null;
+let editingMessageId = null;
+const appSettings = bootstrapData.settings || {};
+const featureFlags = bootstrapData.features || appSettings.features || {};
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const ALLOWED_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
+const ragDisabledNoteEl = document.getElementById("rag-disabled-note");
+const visionDisabledNoteEl = document.getElementById("vision-disabled-note");
+
+const markdownEngine = globalThis.marked || null;
+const sanitizer = globalThis.DOMPurify || null;
+const SIDEBAR_STORAGE_KEY = "chatbot.sidebarOpen";
+
+if (markdownEngine && typeof markdownEngine.use === "function") {
+  markdownEngine.use({
+    breaks: true,
+    gfm: true,
+  });
+}
+
+function sanitizeHtml(html) {
+  const rawHtml = String(html || "");
+  if (sanitizer && typeof sanitizer.sanitize === "function") {
+    return sanitizer.sanitize(rawHtml);
+  }
+  return rawHtml;
+}
+
+function renderMarkdown(text) {
+  const rawText = String(text || "");
+  if (markdownEngine && typeof markdownEngine.parse === "function") {
+    return sanitizeHtml(markdownEngine.parse(rawText));
+  }
+  return sanitizeHtml(escHtml(rawText).replace(/\n/g, "<br>"));
+}
+
+function renderBubbleWithCursor(bubbleEl, text) {
+  if (!bubbleEl) {
+    return;
+  }
+
+  bubbleEl.innerHTML = renderMarkdown(text);
+  bubbleEl.querySelectorAll(".stream-cursor").forEach((node) => node.remove());
+
+  const cursor = document.createElement("span");
+  cursor.className = "stream-cursor";
+  cursor.textContent = "▋";
+
+  let target = bubbleEl.lastElementChild;
+  if (target && ["UL", "OL"].includes(target.tagName)) {
+    target = target.lastElementChild || target;
+  }
+
+  if (target) {
+    target.appendChild(cursor);
+  } else {
+    bubbleEl.appendChild(cursor);
+  }
+}
+
+const INPUT_BREAKDOWN_ORDER = [
+  "system_prompt",
+  "user_messages",
+  "assistant_history",
+  "tool_results",
+  "rag_context",
+  "final_instruction",
+];
+
+const INPUT_BREAKDOWN_LABELS = {
+  system_prompt: "System prompt",
+  user_messages: "User messages",
+  assistant_history: "Assistant history",
+  tool_results: "Tool results",
+  rag_context: "RAG context",
+  final_instruction: "Final instruction",
+};
+
+const tokenTurns = [];
+
+function createEmptyBreakdown() {
+  return INPUT_BREAKDOWN_ORDER.reduce((acc, key) => {
+    acc[key] = 0;
+    return acc;
+  }, {});
+}
+
+function toFiniteNumber(value, fallback = 0) {
+  return Number.isFinite(Number(value)) ? Number(value) : fallback;
+}
+
+function normalizeBreakdown(rawBreakdown) {
+  const normalized = createEmptyBreakdown();
+  const source = rawBreakdown && typeof rawBreakdown === "object" ? rawBreakdown : {};
+  INPUT_BREAKDOWN_ORDER.forEach((key) => {
+    normalized[key] = Math.max(0, Math.round(toFiniteNumber(source[key], 0)));
+  });
+  return normalized;
+}
+
+function sumBreakdown(breakdown) {
+  return INPUT_BREAKDOWN_ORDER.reduce((sum, key) => sum + toFiniteNumber(breakdown[key], 0), 0);
+}
+
+function normalizeUsagePayload(usage) {
+  const source = usage && typeof usage === "object" ? usage : {};
+  const inputBreakdown = normalizeBreakdown(source.input_breakdown);
+  const estimatedInputTokens = Math.max(
+    sumBreakdown(inputBreakdown),
+    Math.round(toFiniteNumber(source.estimated_input_tokens, 0)),
+  );
+
+  return {
+    prompt_tokens: Math.max(0, Math.round(toFiniteNumber(source.prompt_tokens, 0))),
+    completion_tokens: Math.max(0, Math.round(toFiniteNumber(source.completion_tokens, 0))),
+    total_tokens: Math.max(0, Math.round(toFiniteNumber(source.total_tokens, 0))),
+    estimated_input_tokens: estimatedInputTokens,
+    input_breakdown: inputBreakdown,
+    cost: Math.max(0, toFiniteNumber(source.cost, 0)),
+    currency: String(source.currency || "USD") || "USD",
+    model: String(source.model || "—") || "—",
+  };
+}
+
+function aggregateBreakdown(turns) {
+  const aggregate = createEmptyBreakdown();
+  turns.forEach((turn) => {
+    INPUT_BREAKDOWN_ORDER.forEach((key) => {
+      aggregate[key] += toFiniteNumber(turn.input_breakdown[key], 0);
+    });
+  });
+  return aggregate;
+}
+
+function renderBreakdownList(containerId, breakdown) {
+  const container = document.getElementById(containerId);
+  if (!container) {
+    return;
+  }
+
+  const entries = INPUT_BREAKDOWN_ORDER.filter((key) => toFiniteNumber(breakdown[key], 0) > 0);
+  if (!entries.length) {
+    container.innerHTML = '<div class="breakdown-empty">No input-source estimate available yet.</div>';
+    return;
+  }
+
+  container.innerHTML = entries
+    .map(
+      (key) =>
+        `<div class="breakdown-row">` +
+          `<span class="breakdown-label">${escHtml(INPUT_BREAKDOWN_LABELS[key] || key)}</span>` +
+          `<span class="breakdown-value">${fmt(breakdown[key])}</span>` +
+        `</div>`,
+    )
+    .join("");
+}
+
+function renderTurnBreakdownInline(breakdown) {
+  const entries = INPUT_BREAKDOWN_ORDER.filter((key) => toFiniteNumber(breakdown[key], 0) > 0);
+  if (!entries.length) {
+    return "";
+  }
+
+  return (
+    `<div class="turn-breakdown">` +
+      entries
+        .map(
+          (key) =>
+            `<span class="turn-breakdown-chip">${escHtml(INPUT_BREAKDOWN_LABELS[key] || key)}: ${fmt(breakdown[key])}</span>`,
+        )
+        .join("") +
+    `</div>`
+  );
+}
+
+function renderTokenStats() {
+  const totalUser = tokenTurns.reduce((sum, turn) => sum + turn.prompt_tokens, 0);
+  const totalAsst = tokenTurns.reduce((sum, turn) => sum + turn.completion_tokens, 0);
+  const grandTotal = tokenTurns.reduce((sum, turn) => sum + turn.total_tokens, 0);
+  const totalCost = tokenTurns.reduce((sum, turn) => sum + turn.cost, 0);
+  const sessionBreakdown = aggregateBreakdown(tokenTurns);
+  const lastTurn = tokenTurns.length ? tokenTurns[tokenTurns.length - 1] : null;
+
+  document.getElementById("stat-user").textContent = fmt(totalUser);
+  document.getElementById("stat-asst").textContent = fmt(totalAsst);
+  document.getElementById("stat-total").textContent = fmt(grandTotal);
+  document.getElementById("stat-cost").textContent = "$" + totalCost.toFixed(6);
+  document.getElementById("stat-last-input").textContent = lastTurn ? fmt(lastTurn.prompt_tokens) : "—";
+  document.getElementById("stat-last-output").textContent = lastTurn ? fmt(lastTurn.completion_tokens) : "—";
+  document.getElementById("stat-last-total").textContent = lastTurn ? fmt(lastTurn.total_tokens) : "—";
+  document.getElementById("stat-last-model").textContent = lastTurn ? lastTurn.model : "—";
+  document.getElementById("stat-breakdown-session-total").textContent = fmt(sumBreakdown(sessionBreakdown));
+  document.getElementById("stat-breakdown-latest-total").textContent = lastTurn
+    ? fmt(lastTurn.estimated_input_tokens)
+    : "—";
+  tokensBadge.textContent = fmt(grandTotal);
+
+  renderBreakdownList("session-breakdown-list", sessionBreakdown);
+  renderBreakdownList("latest-breakdown-list", lastTurn ? lastTurn.input_breakdown : createEmptyBreakdown());
+
+  const list = document.getElementById("turns-list");
+  if (!tokenTurns.length) {
+    list.innerHTML = '<div class="breakdown-empty">No completed assistant turns yet.</div>';
+    return;
+  }
+
+  list.innerHTML = tokenTurns
+    .map(
+      (turn, index) =>
+        `<div class="turn-item">` +
+          `<div class="turn-header"><span class="turn-label">Assistant turn ${index + 1}</span> <span class="turn-model">${escHtml(turn.model || "—")}</span></div>` +
+          `<div class="turn-details">` +
+            `<span class="turn-stat"><span class="stats-dot dot-user"></span>${fmt(turn.prompt_tokens)} in</span>` +
+            `<span class="turn-stat"><span class="stats-dot dot-asst"></span>${fmt(turn.completion_tokens)} out</span>` +
+            `<span class="turn-stat">${fmt(turn.total_tokens)} total</span>` +
+            (turn.cost ? `<span class="turn-stat cost-stat">$${turn.cost.toFixed(6)}</span>` : "") +
+          `</div>` +
+          renderTurnBreakdownInline(turn.input_breakdown) +
+        `</div>`,
+    )
+    .join("");
+}
+
+function normalizeHistoryEntry(entry) {
+  const source = entry && typeof entry === "object" ? entry : {};
+  const normalizedId = Number(source.id);
+  const usage = source.usage && typeof source.usage === "object" ? normalizeUsagePayload(source.usage) : null;
+  const role = ["assistant", "user", "tool", "system", "summary"].includes(source.role) ? source.role : "user";
+  const toolCalls = Array.isArray(source.tool_calls) ? source.tool_calls : [];
+  const toolCallId = typeof source.tool_call_id === "string" && source.tool_call_id.trim()
+    ? source.tool_call_id.trim()
+    : null;
+  return {
+    id: Number.isInteger(normalizedId) ? normalizedId : null,
+    role,
+    content: String(source.content || ""),
+    metadata: source.metadata && typeof source.metadata === "object" ? source.metadata : null,
+    tool_calls: toolCalls,
+    tool_call_id: toolCallId,
+    usage,
+  };
+}
+
+function buildRequestMessagesFromHistory(entries = history) {
+  return entries.map((item) => ({
+    role: item.role,
+    content: item.content,
+    metadata: item.metadata || null,
+    tool_calls: Array.isArray(item.tool_calls) ? item.tool_calls : [],
+    tool_call_id: item.tool_call_id || null,
+  }));
+}
+
+function isRenderableHistoryEntry(message) {
+  if (!message) {
+    return false;
+  }
+
+  if (message.role === "assistant" && Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+    return false;
+  }
+
+  return message.role === "user" || message.role === "assistant" || message.role === "summary";
+}
+
+function getVisibleHistoryEntries(entries = history) {
+  return entries.filter(isRenderableHistoryEntry);
+}
+
+function buildAssistantMetadata({ reasoning = "", toolTrace = [], tool_trace = null, toolResults = [], tool_results = null, usage = null } = {}) {
+  const normalizedToolTrace = Array.isArray(tool_trace) ? tool_trace : toolTrace;
+  const normalizedToolResults = Array.isArray(tool_results) ? tool_results : toolResults;
+
+  return reasoning || usage || normalizedToolResults.length || normalizedToolTrace.length
+    ? {
+        ...(reasoning ? { reasoning_content: reasoning } : {}),
+        ...(normalizedToolTrace.length ? { tool_trace: normalizedToolTrace } : {}),
+        ...(normalizedToolResults.length ? { tool_results: normalizedToolResults } : {}),
+        ...(usage ? { usage } : {}),
+      }
+    : null;
+}
+
+function shouldGenerateConversationTitle() {
+  const visibleEntries = getVisibleHistoryEntries();
+  return Boolean(
+    currentConvId &&
+    visibleEntries.length === 2 &&
+    visibleEntries[0]?.role === "user" &&
+    visibleEntries[1]?.role === "assistant",
+  );
+}
+
+async function streamNdjsonResponse(response, onEvent) {
+  if (!response.body) {
+    throw new Error("The server returned an empty response stream.");
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+
+  const processLine = (line) => {
+    if (!line.trim()) {
+      return;
+    }
+    try {
+      onEvent(JSON.parse(line));
+    } catch (_) {
+      // Ignore malformed partial chunks.
+    }
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+    lines.forEach(processLine);
+  }
+
+  buffer += decoder.decode();
+  processLine(buffer);
+}
+
+function getHistoryMessageIndex(messageId) {
+  const normalizedId = Number(messageId);
+  if (!Number.isInteger(normalizedId)) {
+    return -1;
+  }
+  return history.findIndex((item) => Number(item.id) === normalizedId);
+}
+
+function getHistoryMessage(messageId) {
+  const index = getHistoryMessageIndex(messageId);
+  return index >= 0 ? history[index] : null;
+}
+
+function clearEditTarget() {
+  editingMessageId = null;
+  editBanner.hidden = true;
+  editBannerText.textContent = "";
+}
+
+function refreshEditBanner() {
+  const message = getHistoryMessage(editingMessageId);
+  if (!message || message.role !== "user") {
+    clearEditTarget();
+    return;
+  }
+
+  editBanner.hidden = false;
+  editBannerText.textContent = "Editing an earlier message. Sending now will replace that turn and continue from there.";
+}
+
+function beginEditingMessage(messageId) {
+  if (isStreaming || isFixing) {
+    return;
+  }
+
+  const message = getHistoryMessage(messageId);
+  if (!message || message.role !== "user") {
+    return;
+  }
+
+  editingMessageId = Number(message.id);
+  inputEl.value = message.content;
+  autoResize(inputEl);
+  clearSelectedImage();
+  refreshEditBanner();
+  renderConversationHistory();
+  inputEl.focus();
+  inputEl.setSelectionRange(inputEl.value.length, inputEl.value.length);
+}
+
+function createMessageActions(messageId) {
+  const actions = document.createElement("div");
+  actions.className = "msg-actions";
+
+  const editBtn = document.createElement("button");
+  editBtn.type = "button";
+  editBtn.className = "msg-action-btn";
+  editBtn.textContent = "Edit";
+  editBtn.disabled = !Number.isInteger(Number(messageId));
+  editBtn.addEventListener("click", () => beginEditingMessage(messageId));
+
+  actions.appendChild(editBtn);
+  return actions;
+}
+
+function renderConversationHistory() {
+  const fragment = document.createDocumentFragment();
+  fragment.appendChild(emptyState);
+
+  if (!history.length) {
+    emptyState.style.display = "";
+    messagesEl.replaceChildren(fragment);
+    scrollToBottom();
+    return;
+  }
+
+  emptyState.style.display = "none";
+  history.forEach((message) => {
+    if (!isRenderableHistoryEntry(message)) {
+      return;
+    }
+    fragment.appendChild(createMessageGroup(message.role, message.content, message.metadata || null, {
+      messageId: message.id,
+      editable: message.role === "user",
+      isEditingTarget: Number(message.id) === Number(editingMessageId),
+    }));
+  });
+  messagesEl.replaceChildren(fragment);
+  scrollToBottom();
+}
+
+function rebuildTokenStatsFromHistory() {
+  resetTokenStats();
+  history.forEach((message) => {
+    if (message.role === "assistant" && message.usage) {
+      updateStats(message.usage);
+    }
+  });
+}
+
+function createAssistantStreamingGroup() {
+  const asstGroup = document.createElement("div");
+  asstGroup.className = "msg-group assistant";
+
+  const metaRow = document.createElement("div");
+  metaRow.className = "msg-meta-row";
+
+  const asstLabel = document.createElement("div");
+  asstLabel.className = "msg-label";
+  asstLabel.textContent = "Assistant";
+
+  metaRow.appendChild(asstLabel);
+
+  const stepLog = document.createElement("div");
+  stepLog.className = "step-log";
+  stepLog.style.display = "none";
+
+  const asstBubble = document.createElement("div");
+  asstBubble.className = "bubble thinking cursor";
+  asstBubble.textContent = "Thinking…";
+
+  asstGroup.appendChild(metaRow);
+  asstGroup.appendChild(stepLog);
+  asstGroup.appendChild(asstBubble);
+  messagesEl.appendChild(asstGroup);
+  scrollToBottom();
+
+  return { asstGroup, stepLog, asstBubble };
+}
+
+function applyPersistedMessageIds(persistedIds, assistantEntry) {
+  if (!persistedIds || typeof persistedIds !== "object") {
+    return;
+  }
+
+  const userId = Number(persistedIds.user_message_id);
+  if (Number.isInteger(userId)) {
+    for (let index = history.length - 1; index >= 0; index -= 1) {
+      if (history[index].role === "user") {
+        history[index].id = userId;
+        break;
+      }
+    }
+  }
+
+  const assistantId = Number(persistedIds.assistant_message_id);
+  if (assistantEntry && Number.isInteger(assistantId)) {
+    assistantEntry.id = assistantId;
+  }
+}
+
+function updateStats(usage) {
+  tokenTurns.push(normalizeUsagePayload(usage));
+  renderTokenStats();
+}
+
+function fmt(value) {
+  return Number.isFinite(value) ? value.toLocaleString() : "—";
+}
+
+function openStats() {
+  closeMobileTools();
+  closeSettings();
+  statsPanel.classList.add("open");
+  statsOverlay.classList.add("open");
+}
+
+function closeStats() {
+  statsPanel.classList.remove("open");
+  statsOverlay.classList.remove("open");
+}
+
+function openSettings() {
+  closeMobileTools();
+  closeStats();
+  settingsPanel.classList.add("open");
+  settingsOverlay.classList.add("open");
+  void refreshSettings();
+}
+
+function closeSettings() {
+  settingsPanel.classList.remove("open");
+  settingsOverlay.classList.remove("open");
+}
+
+function openMobileTools() {
+  closeSettings();
+  closeStats();
+  mobileToolsPanel?.classList.add("open");
+  mobileToolsOverlay?.classList.add("open");
+  mobileToolsBtn?.setAttribute("aria-expanded", "true");
+  mobileToolsPanel?.setAttribute("aria-hidden", "false");
+}
+
+function closeMobileTools() {
+  mobileToolsPanel?.classList.remove("open");
+  mobileToolsOverlay?.classList.remove("open");
+  mobileToolsBtn?.setAttribute("aria-expanded", "false");
+  mobileToolsPanel?.setAttribute("aria-hidden", "true");
+}
+
+function syncModelSelectors(value) {
+  const nextValue = String(value || "");
+  if (modelSel && modelSel.value !== nextValue) {
+    modelSel.value = nextValue;
+  }
+  if (mobileModelSel && mobileModelSel.value !== nextValue) {
+    mobileModelSel.value = nextValue;
+  }
+}
+
+function setSettingsStatus(message, tone = "muted") {
+  settingsStatus.textContent = message;
+  settingsStatus.dataset.tone = tone;
+}
+
+function isMobileViewport() {
+  return window.matchMedia("(max-width: 980px)").matches;
+}
+
+function updateHeaderOffset() {
+  if (!headerEl) {
+    return;
+  }
+  document.documentElement.style.setProperty("--header-offset", `${headerEl.offsetHeight}px`);
+}
+
+function readSidebarPreference() {
+  try {
+    const stored = localStorage.getItem(SIDEBAR_STORAGE_KEY);
+    if (stored === null) {
+      return null;
+    }
+    return stored === "true";
+  } catch (_) {
+    return null;
+  }
+}
+
+function writeSidebarPreference(isOpen) {
+  try {
+    localStorage.setItem(SIDEBAR_STORAGE_KEY, String(Boolean(isOpen)));
+  } catch (_) {
+    // Ignore storage errors.
+  }
+}
+
+function updateSidebarToggleLabel(isOpen) {
+  if (!sidebarToggleBtn) {
+    return;
+  }
+  sidebarToggleBtn.setAttribute("aria-expanded", String(Boolean(isOpen)));
+  sidebarToggleBtn.title = isOpen ? "Hide conversations" : "Show conversations";
+  const labelEl = sidebarToggleBtn.querySelector(".sidebar-toggle__label");
+  const iconEl = sidebarToggleBtn.querySelector(".sidebar-toggle__icon");
+  if (labelEl) {
+    labelEl.textContent = isOpen ? "Conversations" : "Open conversations";
+  }
+  if (iconEl) {
+    iconEl.textContent = isOpen ? "☰" : "☰";
+  }
+}
+
+function setSidebarOpen(isOpen, persist = true) {
+  document.body.classList.toggle("sidebar-collapsed", !isOpen);
+  updateSidebarToggleLabel(isOpen);
+  if (persist) {
+    writeSidebarPreference(isOpen);
+  }
+}
+
+function toggleSidebar() {
+  const isOpen = !document.body.classList.contains("sidebar-collapsed");
+  setSidebarOpen(!isOpen);
+}
+
+function closeSidebarOnMobile() {
+  if (isMobileViewport()) {
+    setSidebarOpen(false);
+  }
+}
+
+tokensBtn.addEventListener("click", openStats);
+statsClose.addEventListener("click", closeStats);
+statsOverlay.addEventListener("click", closeStats);
+settingsBtn.addEventListener("click", openSettings);
+settingsClose.addEventListener("click", closeSettings);
+settingsOverlay.addEventListener("click", closeSettings);
+if (sidebarToggleBtn) {
+  sidebarToggleBtn.addEventListener("click", toggleSidebar);
+}
+if (sidebarOverlay) {
+  sidebarOverlay.addEventListener("click", () => setSidebarOpen(false));
+}
+if (mobileToolsBtn) {
+  mobileToolsBtn.addEventListener("click", () => {
+    if (mobileToolsPanel?.classList.contains("open")) {
+      closeMobileTools();
+    } else {
+      openMobileTools();
+    }
+  });
+}
+if (mobileToolsClose) {
+  mobileToolsClose.addEventListener("click", closeMobileTools);
+}
+if (mobileToolsOverlay) {
+  mobileToolsOverlay.addEventListener("click", closeMobileTools);
+}
+if (mobileSettingsBtn) {
+  mobileSettingsBtn.addEventListener("click", () => {
+    openSettings();
+    closeMobileTools();
+  });
+}
+if (mobileTokensBtn) {
+  mobileTokensBtn.addEventListener("click", () => {
+    openStats();
+    closeMobileTools();
+  });
+}
+if (mobileClearBtn) {
+  mobileClearBtn.addEventListener("click", () => {
+    startNewChat();
+    closeMobileTools();
+  });
+}
+if (modelSel) {
+  modelSel.addEventListener("change", () => syncModelSelectors(modelSel.value));
+}
+if (mobileModelSel) {
+  mobileModelSel.addEventListener("change", () => syncModelSelectors(mobileModelSel.value));
+}
+
+window.addEventListener("resize", () => {
+  updateHeaderOffset();
+  if (!isMobileViewport()) {
+    closeMobileTools();
+  }
+}, { passive: true });
+
+window.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    if (mobileToolsPanel?.classList.contains("open")) {
+      closeMobileTools();
+      return;
+    }
+  }
+  if (event.key === "Escape" && !document.body.classList.contains("sidebar-collapsed") && isMobileViewport()) {
+    setSidebarOpen(false);
+  }
+});
+
+async function loadSidebar() {
+  const response = await fetch("/api/conversations");
+  const list = await response.json();
+  sidebarList.innerHTML = "";
+  if (list.length === 0) {
+    sidebarList.innerHTML = '<p class="sidebar-empty">No conversations yet.</p>';
+    return;
+  }
+  list.forEach((conversation) => {
+    const item = document.createElement("div");
+    item.className = "sidebar-item" + (conversation.id === currentConvId ? " active" : "");
+    item.dataset.id = conversation.id;
+    item.innerHTML =
+      `<span class="sidebar-title">${escHtml(conversation.title)}</span>` +
+      `<button class="sidebar-del" title="Delete" data-id="${conversation.id}">` +
+      `  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">` +
+      `    <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>` +
+      `  </svg>` +
+      `</button>`;
+    item.addEventListener("click", (event) => {
+      if (event.target.closest(".sidebar-del")) {
+        return;
+      }
+      if (conversation.id !== currentConvId) {
+        openConversation(conversation.id);
+        closeSidebarOnMobile();
+      }
+    });
+    item.querySelector(".sidebar-del").addEventListener("click", (event) => {
+      event.stopPropagation();
+      deleteConversation(conversation.id);
+    });
+    sidebarList.appendChild(item);
+  });
+}
+
+async function openConversation(id) {
+  const response = await fetch(`/api/conversations/${id}`);
+  const data = await response.json();
+  if (!response.ok) {
+    return;
+  }
+
+  resetTokenStats();
+  history = [];
+  currentConvId = id;
+  syncModelSelectors(data.conversation.model);
+  clearEditTarget();
+
+  history = Array.isArray(data.messages) ? data.messages.map(normalizeHistoryEntry) : [];
+  renderConversationHistory();
+  rebuildTokenStatsFromHistory();
+
+  loadSidebar();
+  scrollToBottom();
+  inputEl.focus();
+}
+
+async function deleteConversation(id) {
+  await fetch(`/api/conversations/${id}`, { method: "DELETE" });
+  if (id === currentConvId) {
+    startNewChat();
+  } else {
+    loadSidebar();
+  }
+}
+
+function startNewChat() {
+  currentConvId = null;
+  history = [];
+  clearEditTarget();
+  clearSelectedImage();
+  resetTokenStats();
+  renderConversationHistory();
+  errorArea.innerHTML = "";
+  loadSidebar();
+  inputEl.focus();
+  closeSidebarOnMobile();
+}
+
+function escHtml(str) {
+  return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+const TOOL_UI_CONFIG = {
+  search_knowledge_base: {
+    icon: "🧠",
+    label: "Knowledge Base",
+    runningTitle: "Searching knowledge base",
+    doneTitle: "Knowledge results ready",
+    errorTitle: "Knowledge search failed",
+    fallbackDetail: "Looking through indexed context and synced chat memory.",
+  },
+  search_web: {
+    icon: "🔎",
+    label: "Web Search",
+    runningTitle: "Searching the web",
+    doneTitle: "Web results ready",
+    errorTitle: "Web search failed",
+    fallbackDetail: "Collecting live sources from the open web.",
+  },
+  fetch_url: {
+    icon: "🌐",
+    label: "Web Fetch",
+    runningTitle: "Reading page",
+    doneTitle: "Page content extracted",
+    errorTitle: "Page read failed",
+    fallbackDetail: "Opening the source and extracting readable content.",
+  },
+  search_news_ddgs: {
+    icon: "📰",
+    label: "News Search",
+    runningTitle: "Scanning news sources",
+    doneTitle: "News results ready",
+    errorTitle: "News search failed",
+    fallbackDetail: "Checking recent headlines and source coverage.",
+  },
+  search_news_google: {
+    icon: "🗞️",
+    label: "Google News",
+    runningTitle: "Scanning Google News",
+    doneTitle: "Google News results ready",
+    errorTitle: "Google News search failed",
+    fallbackDetail: "Checking recent headlines and publisher coverage.",
+  },
+};
+
+function getToolUiConfig(toolName) {
+  return TOOL_UI_CONFIG[toolName] || {
+    icon: "⚙️",
+    label: "Tool",
+    runningTitle: "Running tool",
+    doneTitle: "Tool completed",
+    errorTitle: "Tool failed",
+    fallbackDetail: "Processing tool call.",
+  };
+}
+
+function formatToolDuration(durationMs) {
+  if (!Number.isFinite(durationMs) || durationMs < 0) {
+    return "";
+  }
+  if (durationMs < 1000) {
+    return `${Math.max(1, Math.round(durationMs))} ms`;
+  }
+  if (durationMs < 10_000) {
+    return `${(durationMs / 1000).toFixed(1)} s`;
+  }
+  return `${Math.round(durationMs / 1000)} s`;
+}
+
+function extractHost(value) {
+  const text = String(value || "").trim();
+  if (!text) {
+    return "";
+  }
+  try {
+    return new URL(text).hostname.replace(/^www\./i, "");
+  } catch (_) {
+    return "";
+  }
+}
+
+function normalizeToolSummary(summary) {
+  const raw = String(summary || "").trim();
+  if (!raw) {
+    return { text: "", cached: false, isError: false };
+  }
+
+  const cached = /\(cached\)$/i.test(raw);
+  const withoutCached = raw.replace(/\s*\(cached\)$/i, "").trim();
+  const isError = /^error:/i.test(withoutCached);
+  const text = isError ? withoutCached.replace(/^error:\s*/i, "").trim() : withoutCached;
+  return { text, cached, isError };
+}
+
+function buildToolMeta(toolName, preview, options = {}) {
+  const meta = [];
+  const detail = String(preview || "").trim();
+  const { cached = false, durationMs = null } = options;
+
+  if (toolName === "fetch_url") {
+    const host = extractHost(detail);
+    if (host) {
+      meta.push(host);
+    }
+    if (detail) {
+      meta.push("URL");
+    }
+  } else if (["search_web", "search_news_ddgs", "search_news_google"].includes(toolName) && detail) {
+    const queryCount = detail
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean).length;
+    if (queryCount > 0) {
+      meta.push(`${queryCount} quer${queryCount === 1 ? "y" : "ies"}`);
+    }
+  } else if (toolName === "search_knowledge_base") {
+    meta.push("semantic retrieval");
+  }
+
+  if (cached) {
+    meta.push("cached");
+  }
+
+  const durationText = formatToolDuration(durationMs);
+  if (durationText) {
+    meta.push(durationText);
+  }
+
+  return meta;
+}
+
+function ensureToolStepSection(stepLog, stepSections, step, maxSteps) {
+  const stepKey = String(step || 1);
+  if (stepSections[stepKey]) {
+    return stepSections[stepKey];
+  }
+
+  const section = document.createElement("section");
+  section.className = "step-section";
+
+  const header = document.createElement("div");
+  header.className = "step-section-header";
+
+  const title = document.createElement("div");
+  title.className = "step-section-title";
+  title.textContent = `Step ${stepKey}`;
+
+  const caption = document.createElement("div");
+  caption.className = "step-section-caption";
+  caption.textContent = maxSteps ? `Tool round ${stepKey}/${maxSteps}` : "Tool round";
+
+  header.appendChild(title);
+  header.appendChild(caption);
+
+  const items = document.createElement("div");
+  items.className = "step-section-items";
+
+  section.appendChild(header);
+  section.appendChild(items);
+  stepLog.appendChild(section);
+
+  stepSections[stepKey] = items;
+  return items;
+}
+
+function createToolStepItem(toolName) {
+  const config = getToolUiConfig(toolName);
+  const item = document.createElement("div");
+  item.className = "step-item step-running";
+  item.innerHTML = [
+    '<div class="step-item-icon"></div>',
+    '<div class="step-item-body">',
+    '  <div class="step-item-top">',
+    '    <span class="step-status-badge"></span>',
+    '    <span class="step-item-label"></span>',
+    '    <span class="step-time"></span>',
+    "  </div>",
+    '  <div class="step-title"></div>',
+    '  <div class="step-detail"></div>',
+    '  <div class="step-meta"></div>',
+    '  <div class="step-summary"></div>',
+    "</div>",
+  ].join("");
+  item.querySelector(".step-item-icon").textContent = config.icon;
+  return item;
+}
+
+function setToolStepState(item, payload) {
+  const config = getToolUiConfig(payload.toolName);
+  const state = payload.state || "running";
+  const preview = String(payload.preview || "").trim();
+  const durationMs = Number.isFinite(payload.durationMs) ? payload.durationMs : null;
+  const metaItems = buildToolMeta(payload.toolName, preview, {
+    cached: Boolean(payload.cached),
+    durationMs,
+  });
+
+  item.classList.remove("step-running", "step-done", "step-error");
+  item.classList.add(`step-${state}`);
+
+  const badge = item.querySelector(".step-status-badge");
+  const label = item.querySelector(".step-item-label");
+  const time = item.querySelector(".step-time");
+  const title = item.querySelector(".step-title");
+  const detail = item.querySelector(".step-detail");
+  const meta = item.querySelector(".step-meta");
+  const summary = item.querySelector(".step-summary");
+  const icon = item.querySelector(".step-item-icon");
+
+  badge.textContent = state === "running" ? "Running" : state === "error" ? "Failed" : payload.cached ? "Cached" : "Done";
+  label.textContent = config.label;
+  time.textContent = state === "running" ? "" : formatToolDuration(durationMs);
+  title.textContent = state === "running" ? config.runningTitle : state === "error" ? config.errorTitle : config.doneTitle;
+
+  const detailText = preview || config.fallbackDetail;
+  detail.textContent = detailText;
+  detail.style.display = detailText ? "" : "none";
+
+  meta.innerHTML = metaItems.map((value) => `<span class="step-chip">${escHtml(value)}</span>`).join("");
+  meta.style.display = metaItems.length ? "" : "none";
+
+  summary.textContent = String(payload.summary || "").trim();
+  summary.style.display = summary.textContent ? "" : "none";
+
+  icon.textContent = config.icon;
+  item.dataset.state = state;
+}
+
+newChatBtn.addEventListener("click", startNewChat);
+
+function autoResize(element) {
+  element.style.height = "auto";
+  element.style.height = element.scrollHeight + "px";
+}
+
+inputEl.addEventListener("input", () => {
+  autoResize(inputEl);
+});
+
+preferencesEl.addEventListener("input", () => {
+  setSettingsStatus("Unsaved changes", "warning");
+  autoResize(preferencesEl);
+});
+
+if (scratchpadInputEl) {
+  scratchpadInputEl.addEventListener("input", () => {
+    setSettingsStatus("Unsaved changes", "warning");
+    autoResize(scratchpadInputEl);
+  });
+}
+
+maxStepsEl.addEventListener("input", () => {
+  setSettingsStatus("Unsaved changes", "warning");
+});
+
+summaryTriggerEl.addEventListener("input", () => {
+  setSettingsStatus("Unsaved changes", "warning");
+});
+
+summaryBatchEl.addEventListener("input", () => {
+  setSettingsStatus("Unsaved changes", "warning");
+});
+
+fetchThresholdEl.addEventListener("input", () => {
+  setSettingsStatus("Unsaved changes", "warning");
+});
+
+fetchAggressivenessEl.addEventListener("input", () => {
+  setSettingsStatus("Unsaved changes", "warning");
+});
+
+ragAutoInjectEl.addEventListener("change", () => {
+  setSettingsStatus("Unsaved changes", "warning");
+});
+
+toolToggleEls.forEach((element) => {
+  element.addEventListener("change", () => {
+    setSettingsStatus("Unsaved changes", "warning");
+  });
+});
+
+function getSelectedTools() {
+  return toolToggleEls.filter((element) => element.checked).map((element) => element.value);
+}
+
+function applySelectedTools(selected) {
+  const active = new Set(Array.isArray(selected) ? selected : []);
+  toolToggleEls.forEach((element) => {
+    element.checked = active.has(element.value);
+  });
+}
+
+function renderScratchpad() {
+  if (!scratchpadOutputEl) {
+    return;
+  }
+  const scratchpad = String(appSettings.scratchpad || "").trim();
+  scratchpadOutputEl.textContent = scratchpad || "No scratchpad entries yet.";
+  if (scratchpadInputEl) {
+    scratchpadInputEl.value = appSettings.scratchpad || "";
+    autoResize(scratchpadInputEl);
+  }
+}
+
+function applySettingsToForm() {
+  preferencesEl.value = appSettings.user_preferences || "";
+  maxStepsEl.value = String(appSettings.max_steps || 5);
+  summaryTriggerEl.value = String(appSettings.chat_summary_trigger_message_count || 40);
+  summaryBatchEl.value = String(appSettings.chat_summary_batch_size || 20);
+  fetchThresholdEl.value = String(appSettings.fetch_url_token_threshold || 3500);
+  fetchAggressivenessEl.value = String(appSettings.fetch_url_clip_aggressiveness || 50);
+  applySelectedTools(appSettings.active_tools || []);
+  ragAutoInjectEl.checked = Boolean(featureFlags.rag_enabled ? appSettings.rag_auto_inject : false);
+  autoResize(preferencesEl);
+  renderScratchpad();
+}
+
+async function refreshSettings() {
+  try {
+    const response = await fetch("/api/settings");
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.error || "Failed to load settings.");
+    }
+
+    appSettings.user_preferences = data.user_preferences || "";
+    appSettings.scratchpad = data.scratchpad || "";
+    appSettings.max_steps = data.max_steps || 5;
+    appSettings.chat_summary_trigger_message_count = data.chat_summary_trigger_message_count || 40;
+    appSettings.chat_summary_batch_size = data.chat_summary_batch_size || 20;
+    appSettings.fetch_url_token_threshold = data.fetch_url_token_threshold || 3500;
+    appSettings.fetch_url_clip_aggressiveness = data.fetch_url_clip_aggressiveness ?? 50;
+    appSettings.active_tools = Array.isArray(data.active_tools) ? data.active_tools : [];
+    appSettings.rag_auto_inject = Boolean(data.rag_auto_inject);
+    if (data.features && typeof data.features === "object") {
+      Object.assign(featureFlags, data.features);
+    }
+    applySettingsToForm();
+    applyFeatureAvailability();
+  } catch (_) {
+    renderScratchpad();
+  }
+}
+
+function applyFeatureAvailability() {
+  const ragEnabled = Boolean(featureFlags.rag_enabled);
+  const visionEnabled = Boolean(featureFlags.vision_enabled);
+  const scratchpadAdminEditing = Boolean(featureFlags.scratchpad_admin_editing);
+
+  ragAutoInjectEl.disabled = !ragEnabled;
+  kbSyncBtn.disabled = !ragEnabled;
+  kbSyncAllBtn.disabled = !ragEnabled;
+  if (ragDisabledNoteEl) {
+    ragDisabledNoteEl.hidden = ragEnabled;
+  }
+  if (!ragEnabled) {
+    setKbStatus("RAG disabled in .env", "warning");
+  }
+
+  attachBtn.hidden = !visionEnabled;
+  imageInputEl.disabled = !visionEnabled;
+  if (visionDisabledNoteEl) {
+    visionDisabledNoteEl.hidden = visionEnabled;
+  }
+  if (!visionEnabled) {
+    clearSelectedImage();
+  }
+
+  if (scratchpadAdminBlockEl) {
+    scratchpadAdminBlockEl.hidden = !scratchpadAdminEditing;
+  }
+  if (scratchpadInputEl) {
+    scratchpadInputEl.disabled = !scratchpadAdminEditing;
+  }
+}
+
+async function saveSettings() {
+  const payload = {
+    user_preferences: preferencesEl.value.trim(),
+    max_steps: parseInt(maxStepsEl.value, 10) || 5,
+    chat_summary_trigger_message_count: parseInt(summaryTriggerEl.value, 10) || 40,
+    chat_summary_batch_size: parseInt(summaryBatchEl.value, 10) || 20,
+    fetch_url_token_threshold: parseInt(fetchThresholdEl.value, 10) || 3500,
+    fetch_url_clip_aggressiveness: parseInt(fetchAggressivenessEl.value, 10) || 50,
+    active_tools: getSelectedTools(),
+    rag_auto_inject: featureFlags.rag_enabled ? ragAutoInjectEl.checked : false,
+  };
+  if (featureFlags.scratchpad_admin_editing && scratchpadInputEl) {
+    payload.scratchpad = scratchpadInputEl.value;
+  }
+
+  setSettingsStatus("Saving…");
+  settingsSaveBtn.disabled = true;
+
+  try {
+    const response = await fetch("/api/settings", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.error || "Failed to save settings.");
+    }
+
+    appSettings.user_preferences = data.user_preferences || "";
+    appSettings.scratchpad = data.scratchpad || "";
+    appSettings.max_steps = data.max_steps || 5;
+    appSettings.chat_summary_trigger_message_count = data.chat_summary_trigger_message_count || 40;
+    appSettings.chat_summary_batch_size = data.chat_summary_batch_size || 20;
+    appSettings.fetch_url_token_threshold = data.fetch_url_token_threshold || 3500;
+    appSettings.fetch_url_clip_aggressiveness = data.fetch_url_clip_aggressiveness ?? 50;
+    appSettings.active_tools = Array.isArray(data.active_tools) ? data.active_tools : [];
+    appSettings.rag_auto_inject = Boolean(data.rag_auto_inject);
+    if (data.features && typeof data.features === "object") {
+      Object.assign(featureFlags, data.features);
+    }
+    applySettingsToForm();
+    applyFeatureAvailability();
+    setSettingsStatus("Saved", "success");
+  } catch (error) {
+    setSettingsStatus(error.message, "error");
+  } finally {
+    settingsSaveBtn.disabled = false;
+  }
+}
+
+settingsSaveBtn.addEventListener("click", saveSettings);
+
+inputEl.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !event.shiftKey) {
+    event.preventDefault();
+    if (!isStreaming && !isFixing) {
+      sendMessage();
+    }
+  }
+});
+
+cancelBtn.addEventListener("click", () => {
+  if (activeAbortController) {
+    activeAbortController.abort();
+  }
+});
+
+editBannerCancelBtn.addEventListener("click", () => {
+  clearEditTarget();
+  inputEl.focus();
+});
+
+sendBtn.addEventListener("click", () => {
+  if (!isStreaming && !isFixing) {
+    sendMessage();
+  }
+});
+fixBtn.addEventListener("click", () => {
+  if (!isStreaming && !isFixing) {
+    fixMessage();
+  }
+});
+clearBtn.addEventListener("click", startNewChat);
+attachBtn.addEventListener("click", () => {
+  if (!isStreaming && !isFixing && Boolean(featureFlags.vision_enabled)) {
+    imageInputEl.click();
+  }
+});
+kbSyncBtn.addEventListener("click", syncKnowledgeBaseConversations);
+kbSyncAllBtn.addEventListener("click", syncKnowledgeBaseConversations);
+
+imageInputEl.addEventListener("change", () => {
+  if (!featureFlags.vision_enabled) {
+    clearSelectedImage();
+    return;
+  }
+  const file = imageInputEl.files && imageInputEl.files[0];
+  if (!file) {
+    return;
+  }
+  if (!ALLOWED_IMAGE_TYPES.has(file.type)) {
+    showError("Unsupported image type. Upload PNG, JPG or WEBP.");
+    clearSelectedImage();
+    return;
+  }
+  if (file.size > MAX_IMAGE_BYTES) {
+    showError("Image is too large. Upload a maximum of 10 MB.");
+    clearSelectedImage();
+    return;
+  }
+  selectedImageFile = file;
+  renderAttachmentPreview();
+});
+
+function resetTokenStats() {
+  tokenTurns.length = 0;
+  renderTokenStats();
+}
+
+function setStreaming(active) {
+  isStreaming = active;
+  sendBtn.style.display = active ? "none" : "";
+  cancelBtn.style.display = active ? "" : "none";
+  fixBtn.disabled = active;
+  inputEl.disabled = active;
+  attachBtn.disabled = active || !Boolean(featureFlags.vision_enabled);
+}
+
+function setFixing(active) {
+  isFixing = active;
+  sendBtn.disabled = active;
+  fixBtn.disabled = active;
+  inputEl.disabled = active;
+  attachBtn.disabled = active || !Boolean(featureFlags.vision_enabled);
+}
+
+function showError(message) {
+  errorArea.innerHTML = `<div class="error-toast">${escHtml(String(message || "An unexpected error occurred."))}</div>`;
+  setTimeout(() => {
+    errorArea.innerHTML = "";
+  }, 5000);
+}
+
+function setKbStatus(message, tone = "muted") {
+  kbStatusEl.textContent = message;
+  kbStatusEl.dataset.tone = tone;
+}
+
+async function loadKnowledgeBaseDocuments() {
+  if (!Boolean(featureFlags.rag_enabled)) {
+    renderKnowledgeBaseDocuments([]);
+    setKbStatus("RAG disabled in .env", "warning");
+    return;
+  }
+  try {
+    const response = await fetch("/api/rag/documents");
+    if (response.status === 410) {
+      renderKnowledgeBaseDocuments([]);
+      setKbStatus("RAG disabled in .env", "warning");
+      return;
+    }
+    const docs = await response.json();
+    renderKnowledgeBaseDocuments(Array.isArray(docs) ? docs : []);
+  } catch (_) {
+    renderKnowledgeBaseDocuments([]);
+  }
+}
+
+function renderKnowledgeBaseDocuments(docs) {
+  kbDocumentsListEl.innerHTML = "";
+
+  if (!docs.length) {
+    kbDocumentsListEl.innerHTML = '<p class="kb-empty">No indexed sources yet.</p>';
+    return;
+  }
+
+  docs.forEach((doc) => {
+    const item = document.createElement("div");
+    item.className = "kb-doc-item";
+
+    const meta = document.createElement("div");
+    meta.className = "kb-doc-meta";
+
+    const title = document.createElement("div");
+    title.className = "kb-doc-title";
+    title.textContent = doc.source_name || "Untitled source";
+
+    const sub = document.createElement("div");
+    sub.className = "kb-doc-subtitle";
+    sub.textContent = `${doc.source_type || "document"} · ${doc.category || "general"} · ${doc.chunk_count || 0} chunks`;
+
+    meta.appendChild(title);
+    meta.appendChild(sub);
+
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "kb-doc-delete";
+    del.textContent = "Delete";
+    del.addEventListener("click", () => deleteKnowledgeBaseDocument(doc.source_key));
+
+    item.appendChild(meta);
+    item.appendChild(del);
+    kbDocumentsListEl.appendChild(item);
+  });
+}
+
+async function deleteKnowledgeBaseDocument(sourceKey) {
+  if (!sourceKey) {
+    return;
+  }
+  setKbStatus("Deleting source…");
+  try {
+    const response = await fetch(`/api/rag/documents/${encodeURIComponent(sourceKey)}`, { method: "DELETE" });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(data.error || "Delete failed.");
+    }
+    setKbStatus("Source deleted", "success");
+    loadKnowledgeBaseDocuments();
+  } catch (error) {
+    setKbStatus(error.message, "error");
+  }
+}
+
+async function syncKnowledgeBaseConversations() {
+  if (!Boolean(featureFlags.rag_enabled)) {
+    setKbStatus("RAG disabled in .env", "warning");
+    return;
+  }
+  setKbStatus("Syncing conversations into RAG…");
+  kbSyncBtn.disabled = true;
+  kbSyncAllBtn.disabled = true;
+  try {
+    const response = await fetch("/api/rag/sync-conversations", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(data.error || "Conversation sync failed.");
+    }
+    setKbStatus(`${data.count || 0} RAG sources synced`, "success");
+    loadKnowledgeBaseDocuments();
+  } catch (error) {
+    setKbStatus(error.message, "error");
+  } finally {
+    kbSyncBtn.disabled = false;
+    kbSyncAllBtn.disabled = false;
+  }
+}
+
+function formatFileSize(size) {
+  if (!Number.isFinite(size) || size <= 0) {
+    return "0 KB";
+  }
+  if (size < 1024 * 1024) {
+    return `${Math.max(1, Math.round(size / 1024))} KB`;
+  }
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function clearSelectedImage() {
+  selectedImageFile = null;
+  imageInputEl.value = "";
+  renderAttachmentPreview();
+}
+
+function renderAttachmentPreview() {
+  if (!selectedImageFile) {
+    attachmentPreviewEl.hidden = true;
+    attachmentPreviewEl.innerHTML = "";
+    return;
+  }
+
+  attachmentPreviewEl.hidden = false;
+  attachmentPreviewEl.innerHTML =
+    `<div class="attachment-chip">` +
+      `<span class="attachment-chip__icon">🖼️</span>` +
+      `<span class="attachment-chip__meta">` +
+        `<strong>${escHtml(selectedImageFile.name)}</strong>` +
+        `<small>Ready for Qwen vision analysis · ${formatFileSize(selectedImageFile.size)}</small>` +
+      `</span>` +
+      `<button type="button" class="attachment-chip__remove" title="Remove image">×</button>` +
+    `</div>`;
+
+  attachmentPreviewEl.querySelector(".attachment-chip__remove").addEventListener("click", clearSelectedImage);
+}
+
+function appendAttachmentBadge(group, metadata) {
+  const imageName = metadata && metadata.image_name;
+  if (!imageName) {
+    return;
+  }
+  const imageId = metadata && metadata.image_id ? String(metadata.image_id).trim() : "";
+  const hasVisionContext = metadata && (metadata.ocr_text || metadata.vision_summary || metadata.assistant_guidance);
+  const stateLabel = hasVisionContext ? "Qwen vision context added" : "Image to be processed";
+  const label = imageId ? `${imageName} · ${imageId}` : imageName;
+
+  const badge = document.createElement("div");
+  badge.className = "message-attachment";
+  badge.innerHTML =
+    `<span class="message-attachment__icon">🖼️</span>` +
+    `<span class="message-attachment__name">${escHtml(label)}</span>` +
+    `<span class="message-attachment__state">${stateLabel}</span>`;
+  group.appendChild(badge);
+}
+
+function updateAttachmentBadge(group, metadata) {
+  const nameEl = group.querySelector(".message-attachment__name");
+  const stateEl = group.querySelector(".message-attachment__state");
+  if (!stateEl || !nameEl) {
+    return;
+  }
+  const imageName = metadata && metadata.image_name ? String(metadata.image_name) : "";
+  const imageId = metadata && metadata.image_id ? String(metadata.image_id).trim() : "";
+  nameEl.textContent = imageId ? `${imageName} · ${imageId}` : imageName;
+  stateEl.textContent = metadata && (metadata.ocr_text || metadata.vision_summary || metadata.assistant_guidance)
+    ? "Qwen vision context added"
+    : "Image to be processed";
+}
+
+function buildVisionNoteHtml(metadata) {
+  if (!metadata) {
+    return "";
+  }
+
+  const summary = String(metadata.vision_summary || "").trim();
+  const guidance = String(metadata.assistant_guidance || "").trim();
+  const keyPoints = Array.isArray(metadata.key_points) ? metadata.key_points.filter(Boolean) : [];
+  const ocrText = String(metadata.ocr_text || "").trim();
+  const imageId = String(metadata.image_id || "").trim();
+  const parts = [];
+
+  if (imageId) {
+    parts.push(`<div><strong>Image ID:</strong> ${escHtml(imageId)}</div>`);
+  }
+  if (summary) {
+    parts.push(`<div><strong>Summary:</strong> ${escHtml(summary)}</div>`);
+  }
+  if (keyPoints.length) {
+    parts.push(
+      `<div><strong>Highlights:</strong><ul>` +
+        keyPoints.slice(0, 4).map((point) => `<li>${escHtml(String(point))}</li>`).join("") +
+      `</ul></div>`
+    );
+  }
+  if (guidance) {
+    parts.push(`<div><strong>Guidance note:</strong> ${escHtml(guidance)}</div>`);
+  }
+  if (ocrText) {
+    parts.push(`<div><strong>OCR:</strong> ${escHtml(ocrText.slice(0, 240))}${ocrText.length > 240 ? "…" : ""}</div>`);
+  }
+
+  return parts.join("");
+}
+
+function appendVisionDetails(group, metadata) {
+  const noteHtml = buildVisionNoteHtml(metadata);
+  if (!noteHtml) {
+    return;
+  }
+
+  const note = document.createElement("div");
+  note.className = "message-vision-note";
+  note.innerHTML = noteHtml;
+  group.appendChild(note);
+}
+
+function updateVisionDetails(group, metadata) {
+  const existing = group.querySelector(".message-vision-note");
+  const noteHtml = buildVisionNoteHtml(metadata);
+
+  if (!noteHtml) {
+    if (existing) {
+      existing.remove();
+    }
+    return;
+  }
+
+  if (existing) {
+    existing.innerHTML = noteHtml;
+    return;
+  }
+
+  appendVisionDetails(group, metadata);
+}
+
+function getReasoningText(metadata) {
+  if (!metadata || typeof metadata !== "object") {
+    return "";
+  }
+  return String(metadata.reasoning_content || "").trim();
+}
+
+function getToolTraceEntries(metadata) {
+  if (!metadata || typeof metadata !== "object" || !Array.isArray(metadata.tool_trace)) {
+    return [];
+  }
+
+  return metadata.tool_trace
+    .filter((entry) => entry && typeof entry === "object" && String(entry.tool_name || "").trim())
+    .map((entry) => ({
+      step: Number.isFinite(Number(entry.step)) ? Math.max(1, Number(entry.step)) : 1,
+      tool_name: String(entry.tool_name || "").trim(),
+      preview: String(entry.preview || "").trim(),
+      summary: String(entry.summary || "").trim(),
+      state: ["running", "done", "error"].includes(String(entry.state || "").trim())
+        ? String(entry.state || "").trim()
+        : "done",
+      cached: entry.cached === true,
+    }));
+}
+
+function getAssistantFetchIndicator(metadata) {
+  if (!metadata || typeof metadata !== "object" || !Array.isArray(metadata.tool_results)) {
+    return null;
+  }
+
+  const fetchResults = metadata.tool_results.filter(
+    (entry) => entry && typeof entry === "object" && entry.tool_name === "fetch_url",
+  );
+  if (!fetchResults.length) {
+    return null;
+  }
+
+  const clippedEntry = fetchResults.find((entry) => String(entry.content_mode || "").trim() === "clipped_text");
+  if (clippedEntry) {
+    return {
+      label: fetchResults.length > 1 ? `${fetchResults.length} web sources clipped` : "Web source clipped",
+      title: String(clippedEntry.summary_notice || "").trim()
+        || "Long fetched content was cleaned and clipped before the model used it.",
+      tone: "summary",
+    };
+  }
+
+  const summarizedEntry = fetchResults.find((entry) => String(entry.content_mode || "").trim() === "rag_summary");
+  if (summarizedEntry) {
+    return {
+      label: fetchResults.length > 1 ? `${fetchResults.length} web sources summarized` : "Web source summarized",
+      title: String(summarizedEntry.summary_notice || "").trim()
+        || "Long fetched content was cleaned and summarized before the model used it.",
+      tone: "summary",
+    };
+  }
+
+  const cleanedEntry = fetchResults.find((entry) => entry.cleanup_applied === true);
+  if (cleanedEntry) {
+    return {
+      label: fetchResults.length > 1 ? `${fetchResults.length} web sources cleaned` : "Web source cleaned",
+      title: "Fetched web content was cleaned before the model used it.",
+      tone: "clean",
+    };
+  }
+
+  return null;
+}
+
+function updateAssistantFetchBadge(group, metadata) {
+  const indicator = getAssistantFetchIndicator(metadata);
+  const existing = group.querySelector(".assistant-context-badge");
+
+  if (!indicator) {
+    if (existing) {
+      existing.remove();
+    }
+    return;
+  }
+
+  const badge = existing || document.createElement("div");
+  badge.className = `assistant-context-badge assistant-context-badge--${indicator.tone}`;
+  badge.title = indicator.title;
+  badge.innerHTML =
+    `<span class="assistant-context-badge__icon">${indicator.tone === "summary" ? "✦" : "🧹"}</span>` +
+    `<span class="assistant-context-badge__label">${escHtml(indicator.label)}</span>`;
+
+  if (!existing) {
+    const anchor = group.querySelector(".tool-trace-panel") || group.querySelector(".reasoning-panel") || group.querySelector(".bubble");
+    if (anchor) {
+      group.insertBefore(badge, anchor);
+    } else {
+      group.appendChild(badge);
+    }
+  }
+}
+
+function updateAssistantToolTrace(group, metadata) {
+  const entries = getToolTraceEntries(metadata);
+  const existing = group.querySelector(".tool-trace-panel");
+
+  if (!entries.length) {
+    if (existing) {
+      existing.remove();
+    }
+    return;
+  }
+
+  const panel = existing || document.createElement("section");
+  panel.className = "tool-trace-panel";
+
+  const title = document.createElement("div");
+  title.className = "tool-trace-panel__title";
+  title.textContent = entries.length === 1 ? "Tool used" : `Tools used (${entries.length})`;
+
+  const body = document.createElement("div");
+  body.className = "tool-trace-panel__body";
+
+  const sections = {};
+  entries.forEach((entry) => {
+    const sectionItems = ensureToolStepSection(body, sections, entry.step, null);
+    const item = createToolStepItem(entry.tool_name);
+    const normalizedSummary = normalizeToolSummary(entry.summary);
+    setToolStepState(item, {
+      toolName: entry.tool_name,
+      preview: entry.preview,
+      summary: normalizedSummary.text,
+      state: entry.state || (normalizedSummary.isError ? "error" : "done"),
+      cached: entry.cached || normalizedSummary.cached,
+    });
+    sectionItems.appendChild(item);
+  });
+
+  panel.innerHTML = "";
+  panel.appendChild(title);
+  panel.appendChild(body);
+
+  if (!existing) {
+    const anchor = group.querySelector(".reasoning-panel") || group.querySelector(".bubble");
+    if (anchor) {
+      group.insertBefore(panel, anchor);
+    } else {
+      group.appendChild(panel);
+    }
+  }
+}
+
+function buildReasoningPanel(reasoningText) {
+  const text = String(reasoningText || "").trim();
+  if (!text) {
+    return null;
+  }
+
+  const details = document.createElement("details");
+  details.className = "reasoning-panel";
+  details.open = true;
+
+  const summary = document.createElement("summary");
+  summary.textContent = "Reasoning";
+
+  const body = document.createElement("div");
+  body.className = "reasoning-body";
+  body.innerHTML = renderMarkdown(text);
+
+  details.appendChild(summary);
+  details.appendChild(body);
+  return details;
+}
+
+function updateReasoningPanel(group, reasoningText) {
+  const text = String(reasoningText || "").trim();
+  const existing = group.querySelector(".reasoning-panel");
+
+  if (!text) {
+    if (existing) {
+      existing.remove();
+    }
+    return;
+  }
+
+  if (existing) {
+    const body = existing.querySelector(".reasoning-body");
+    if (body) {
+      body.innerHTML = renderMarkdown(text);
+    }
+    return;
+  }
+
+  const panel = buildReasoningPanel(text);
+  if (!panel) {
+    return;
+  }
+
+  const bubble = group.querySelector(".bubble");
+  if (bubble) {
+    group.insertBefore(panel, bubble);
+  } else {
+    group.appendChild(panel);
+  }
+}
+
+function createMessageGroup(role, text, metadata = null, options = {}) {
+  emptyState.style.display = "none";
+
+  const group = document.createElement("div");
+  group.className = `msg-group ${role}`;
+  if (Number.isInteger(Number(options.messageId))) {
+    group.dataset.messageId = String(options.messageId);
+  }
+  if (options.isEditingTarget) {
+    group.classList.add("editing-target");
+  }
+
+  const metaRow = document.createElement("div");
+  metaRow.className = "msg-meta-row";
+
+  const label = document.createElement("div");
+  label.className = "msg-label";
+  label.textContent = role === "user" ? "You" : role === "summary" ? "Summary" : "Assistant";
+
+  metaRow.appendChild(label);
+  if (role === "user" && options.editable) {
+    metaRow.appendChild(createMessageActions(options.messageId));
+  }
+
+  const bubble = document.createElement("div");
+  bubble.className = "bubble";
+  const hasImage = Boolean(metadata && metadata.image_name);
+  const displayText = text || (hasImage ? "Image uploaded." : "");
+
+  if ((role === "assistant" || role === "summary") && text !== "Thinking…") {
+    bubble.innerHTML = renderMarkdown(text);
+  } else {
+    bubble.textContent = displayText;
+  }
+
+  group.appendChild(metaRow);
+  if (role === "assistant") {
+    updateAssistantFetchBadge(group, metadata);
+    updateAssistantToolTrace(group, metadata);
+    updateReasoningPanel(group, getReasoningText(metadata));
+  }
+  group.appendChild(bubble);
+  if (role === "user" && hasImage) {
+    appendAttachmentBadge(group, metadata);
+    appendVisionDetails(group, metadata);
+  }
+  return group;
+}
+
+function appendGroup(role, text, metadata = null, options = {}) {
+  const group = createMessageGroup(role, text, metadata, options);
+  messagesEl.appendChild(group);
+  scrollToBottom();
+  return group;
+}
+
+function scrollToBottom() {
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+async function fixMessage() {
+  const text = inputEl.value.trim();
+  if (!text) {
+    return;
+  }
+
+  errorArea.innerHTML = "";
+  setFixing(true);
+  fixBtn.textContent = "Fixing…";
+
+  try {
+    const response = await fetch("/api/fix-text", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text,
+        model: modelSel.value,
+      }),
+    });
+
+    const data = await response.json().catch(() => ({ error: "An unexpected error occurred." }));
+    if (!response.ok) {
+      throw new Error(data.error || "An unexpected error occurred.");
+    }
+
+    inputEl.value = data.text || text;
+    autoResize(inputEl);
+    inputEl.focus();
+    inputEl.setSelectionRange(inputEl.value.length, inputEl.value.length);
+  } catch (error) {
+    showError(error.message);
+  } finally {
+    setFixing(false);
+    fixBtn.textContent = "Fix";
+  }
+}
+
+async function sendMessage() {
+  const text = inputEl.value.trim();
+  const pendingImage = selectedImageFile;
+  if (!text && !pendingImage) {
+    return;
+  }
+
+  if (pendingImage && !Boolean(featureFlags.vision_enabled)) {
+    clearSelectedImage();
+    showError("Image uploads are disabled in .env.");
+    return;
+  }
+
+  const editingEntry = getHistoryMessage(editingMessageId);
+  const isEditing = Boolean(editingEntry && editingEntry.role === "user");
+  const editedMessageId = isEditing ? Number(editingEntry.id) : null;
+
+  errorArea.innerHTML = "";
+  inputEl.value = "";
+  inputEl.style.height = "auto";
+  clearSelectedImage();
+
+  if (!currentConvId) {
+    const response = await fetch("/api/conversations", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: "New Chat", model: modelSel.value }),
+    });
+    const conversation = await response.json();
+    currentConvId = conversation.id;
+    loadSidebar();
+  }
+
+  let userMetadata = pendingImage ? { image_name: pendingImage.name } : null;
+  let userGroup;
+
+  if (isEditing) {
+    const editIndex = getHistoryMessageIndex(editedMessageId);
+    if (editIndex < 0) {
+      clearEditTarget();
+      showError("The selected message could not be edited.");
+      return;
+    }
+
+    if (!pendingImage) {
+      userMetadata = editingEntry.metadata || null;
+    }
+
+    history = history.slice(0, editIndex + 1).map((item) => ({
+      ...normalizeHistoryEntry(item),
+      metadata: item.metadata && typeof item.metadata === "object" ? { ...item.metadata } : null,
+    }));
+    history[editIndex] = {
+      ...history[editIndex],
+      content: text,
+      metadata: userMetadata,
+    };
+    rebuildTokenStatsFromHistory();
+    renderConversationHistory();
+    userGroup = messagesEl.querySelector(".msg-group.user:last-of-type");
+    clearEditTarget();
+  } else {
+    const userEntry = { id: null, role: "user", content: text, metadata: userMetadata };
+    history.push(userEntry);
+    userGroup = appendGroup("user", text, userMetadata, { editable: false, messageId: null });
+  }
+
+  const { asstGroup, stepLog, asstBubble } = createAssistantStreamingGroup();
+
+  const controller = new AbortController();
+  activeAbortController = controller;
+  setStreaming(true);
+
+  let rawAnswer = "";
+  let rawReasoning = "";
+  let fullAnswer = "";
+  let latestUsage = null;
+  let assistantToolResults = [];
+  let assistantToolTrace = [];
+  let assistantToolHistory = [];
+  let persistedMessageIds = null;
+  let receivedHistorySync = false;
+  const stepItems = {};
+  const stepSections = {};
+  const assistantTraceByKey = {};
+  let latestStepInfo = { step: 1, maxSteps: null };
+
+  try {
+    const requestMessages = buildRequestMessagesFromHistory();
+
+    let response;
+    if (pendingImage) {
+      const formData = new FormData();
+      formData.append("messages", JSON.stringify(requestMessages));
+      formData.append("model", modelSel.value);
+      formData.append("conversation_id", String(currentConvId));
+      formData.append("user_content", text);
+      if (editedMessageId !== null) {
+        formData.append("edited_message_id", String(editedMessageId));
+      }
+      formData.append("image", pendingImage);
+
+      response = await fetch("/chat", {
+        method: "POST",
+        signal: controller.signal,
+        body: formData,
+      });
+    } else {
+      response = await fetch("/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
+        body: JSON.stringify({
+          messages: requestMessages,
+          model: modelSel.value,
+          conversation_id: currentConvId,
+          edited_message_id: editedMessageId,
+          user_content: text,
+        }),
+      });
+    }
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({ error: "An unexpected error occurred." }));
+      throw new Error(error.error || "An unexpected error occurred.");
+    }
+
+    await streamNdjsonResponse(response, (event) => {
+      if (event.type === "step_started") {
+        latestStepInfo = {
+          step: event.step || latestStepInfo.step,
+          maxSteps: event.max_steps || latestStepInfo.maxSteps,
+        };
+      } else if (event.type === "vision_complete" || event.type === "ocr_complete") {
+        const lastMessage = history[history.length - 1];
+        if (lastMessage && lastMessage.role === "user") {
+          lastMessage.metadata = {
+            ...(lastMessage.metadata || {}),
+            image_id: event.image_id,
+            image_name: event.image_name,
+            ocr_text: event.ocr_text,
+            vision_summary: event.vision_summary,
+            assistant_guidance: event.assistant_guidance,
+            key_points: Array.isArray(event.key_points) ? event.key_points : [],
+          };
+          updateAttachmentBadge(userGroup, lastMessage.metadata);
+          updateVisionDetails(userGroup, lastMessage.metadata);
+        }
+        scrollToBottom();
+      } else if (event.type === "step_update") {
+        stepLog.style.display = "";
+        const toolKey = event.call_id || event.tool || "__generic__";
+        const sectionItems = ensureToolStepSection(
+          stepLog,
+          stepSections,
+          event.step || latestStepInfo.step,
+          event.max_steps || latestStepInfo.maxSteps,
+        );
+        if (!stepItems[toolKey]) {
+          const item = createToolStepItem(event.tool);
+          sectionItems.appendChild(item);
+          stepItems[toolKey] = {
+            el: item,
+            toolName: event.tool,
+            preview: event.preview || "",
+            startedAt: performance.now(),
+          };
+        }
+        const itemRef = stepItems[toolKey];
+        itemRef.toolName = event.tool || itemRef.toolName;
+        itemRef.preview = event.preview || itemRef.preview;
+        setToolStepState(itemRef.el, {
+          toolName: itemRef.toolName,
+          preview: itemRef.preview,
+          state: "running",
+        });
+        if (event.tool) {
+          const traceEntry = assistantTraceByKey[toolKey] || {
+            tool_name: event.tool,
+            step: event.step || latestStepInfo.step || 1,
+            preview: event.preview || "",
+            summary: "",
+            state: "running",
+            cached: false,
+          };
+          traceEntry.tool_name = event.tool || traceEntry.tool_name;
+          traceEntry.step = event.step || traceEntry.step || 1;
+          traceEntry.preview = event.preview || traceEntry.preview || "";
+          traceEntry.state = "running";
+          assistantTraceByKey[toolKey] = traceEntry;
+          if (!assistantToolTrace.includes(traceEntry)) {
+            assistantToolTrace.push(traceEntry);
+          }
+        }
+        scrollToBottom();
+      } else if (event.type === "tool_result") {
+        const toolKey = event.call_id || event.tool || "__generic__";
+        const itemRef = stepItems[toolKey];
+        if (itemRef) {
+          const normalizedSummary = normalizeToolSummary(event.summary);
+          const durationMs = performance.now() - itemRef.startedAt;
+          setToolStepState(itemRef.el, {
+            toolName: event.tool || itemRef.toolName,
+            preview: itemRef.preview,
+            summary: normalizedSummary.text,
+            state: normalizedSummary.isError ? "error" : "done",
+            cached: normalizedSummary.cached,
+            durationMs,
+          });
+          const traceEntry = assistantTraceByKey[toolKey] || {
+            tool_name: event.tool || itemRef.toolName,
+            step: event.step || latestStepInfo.step || 1,
+            preview: itemRef.preview || "",
+            summary: "",
+            state: "done",
+            cached: false,
+          };
+          traceEntry.tool_name = event.tool || traceEntry.tool_name;
+          traceEntry.step = event.step || traceEntry.step || 1;
+          traceEntry.preview = itemRef.preview || traceEntry.preview || "";
+          traceEntry.summary = normalizedSummary.text;
+          traceEntry.state = normalizedSummary.isError ? "error" : "done";
+          traceEntry.cached = normalizedSummary.cached;
+          assistantTraceByKey[toolKey] = traceEntry;
+          if (!assistantToolTrace.includes(traceEntry)) {
+            assistantToolTrace.push(traceEntry);
+          }
+          scrollToBottom();
+        }
+      } else if (event.type === "tool_error") {
+        const toolKey = event.call_id || event.tool || "__generic__";
+        let itemRef = stepItems[toolKey];
+        if (!itemRef) {
+          const sectionItems = ensureToolStepSection(
+            stepLog,
+            stepSections,
+            event.step || latestStepInfo.step,
+            latestStepInfo.maxSteps,
+          );
+          const item = createToolStepItem(event.tool);
+          sectionItems.appendChild(item);
+          itemRef = {
+            el: item,
+            toolName: event.tool,
+            preview: "",
+            startedAt: performance.now(),
+          };
+          stepItems[toolKey] = itemRef;
+        }
+
+        if (itemRef) {
+          const durationMs = performance.now() - itemRef.startedAt;
+          stepLog.style.display = "";
+          setToolStepState(itemRef.el, {
+            toolName: event.tool || itemRef.toolName,
+            preview: itemRef.preview,
+            summary: event.error || "Error",
+            state: "error",
+            durationMs,
+          });
+          if (event.tool) {
+            const traceEntry = assistantTraceByKey[toolKey] || {
+              tool_name: event.tool || itemRef.toolName,
+              step: event.step || latestStepInfo.step || 1,
+              preview: itemRef.preview || "",
+              summary: "",
+              state: "error",
+              cached: false,
+            };
+            traceEntry.tool_name = event.tool || traceEntry.tool_name;
+            traceEntry.step = event.step || traceEntry.step || 1;
+            traceEntry.preview = itemRef.preview || traceEntry.preview || "";
+            traceEntry.summary = event.error || "Error";
+            traceEntry.state = "error";
+            assistantTraceByKey[toolKey] = traceEntry;
+            if (!assistantToolTrace.includes(traceEntry)) {
+              assistantToolTrace.push(traceEntry);
+            }
+          }
+        } else {
+          const errItem = document.createElement("div");
+          errItem.className = "step-item step-error";
+          errItem.textContent = event.error || "Error";
+          stepLog.style.display = "";
+          stepLog.appendChild(errItem);
+        }
+        scrollToBottom();
+      } else if (event.type === "answer_start") {
+        asstBubble.classList.remove("thinking");
+        asstBubble.textContent = "";
+      } else if (event.type === "reasoning_start") {
+        updateReasoningPanel(asstGroup, rawReasoning);
+        scrollToBottom();
+      } else if (event.type === "reasoning_delta") {
+        rawReasoning += event.text || "";
+        updateReasoningPanel(asstGroup, rawReasoning);
+        scrollToBottom();
+      } else if (event.type === "answer_delta") {
+        rawAnswer += event.text || "";
+        fullAnswer = rawAnswer;
+        renderBubbleWithCursor(asstBubble, fullAnswer);
+        scrollToBottom();
+      } else if (event.type === "usage") {
+        latestUsage = normalizeUsagePayload(event);
+        updateStats(latestUsage);
+      } else if (event.type === "assistant_tool_results") {
+        assistantToolResults = Array.isArray(event.tool_results) ? event.tool_results : [];
+        updateAssistantFetchBadge(asstGroup, { tool_results: assistantToolResults });
+        scrollToBottom();
+      } else if (event.type === "assistant_tool_history") {
+        const nextToolHistory = Array.isArray(event.messages)
+          ? event.messages.map(normalizeHistoryEntry).filter((item) => item.role === "assistant" || item.role === "tool")
+          : [];
+        assistantToolHistory.push(...nextToolHistory);
+      } else if (event.type === "history_sync") {
+        receivedHistorySync = true;
+        history = Array.isArray(event.messages) ? event.messages.map(normalizeHistoryEntry) : [];
+        rebuildTokenStatsFromHistory();
+        renderConversationHistory();
+      } else if (event.type === "message_ids") {
+        persistedMessageIds = event;
+      } else if (event.type === "done") {
+        // no-op
+      }
+    });
+
+    asstBubble.classList.remove("cursor");
+    asstBubble.innerHTML = renderMarkdown(fullAnswer);
+    const assistantEntry = {
+      id: null,
+      role: "assistant",
+      content: fullAnswer,
+      usage: latestUsage,
+      metadata: buildAssistantMetadata({
+        reasoning: rawReasoning,
+        tool_trace: assistantToolTrace,
+        tool_results: assistantToolResults,
+        usage: latestUsage,
+      }),
+    };
+    if (!receivedHistorySync) {
+      history.push(...assistantToolHistory, assistantEntry);
+      applyPersistedMessageIds(persistedMessageIds, assistantEntry);
+    }
+    clearEditTarget();
+    renderConversationHistory();
+
+    if (shouldGenerateConversationTitle()) {
+      generateTitle(currentConvId);
+    } else {
+      loadSidebar();
+    }
+  } catch (error) {
+    if (fullAnswer.trim()) {
+      asstBubble.classList.remove("cursor");
+      asstBubble.innerHTML = renderMarkdown(fullAnswer);
+
+      const assistantEntry = {
+        id: null,
+        role: "assistant",
+        content: fullAnswer,
+        usage: latestUsage,
+        metadata: buildAssistantMetadata({
+          reasoning: rawReasoning,
+          tool_trace: assistantToolTrace,
+          tool_results: assistantToolResults,
+          usage: latestUsage,
+        }),
+      };
+      if (!receivedHistorySync) {
+        history.push(...assistantToolHistory, assistantEntry);
+        applyPersistedMessageIds(persistedMessageIds, assistantEntry);
+      }
+      clearEditTarget();
+      renderConversationHistory();
+      loadSidebar();
+
+      if (error.name !== "AbortError") {
+        showError("Connection was interrupted. The partial answer was preserved.");
+      }
+    } else {
+      if (currentConvId) {
+        await openConversation(currentConvId);
+      } else {
+        startNewChat();
+      }
+      if (error.name !== "AbortError") {
+        showError(error.message);
+      }
+    }
+  } finally {
+    activeAbortController = null;
+    setStreaming(false);
+    refreshEditBanner();
+    inputEl.focus();
+  }
+}
+
+async function generateTitle(convId) {
+  try {
+    await fetch(`/api/conversations/${convId}/generate-title`, { method: "POST" });
+  } finally {
+    loadSidebar();
+  }
+}
+
+setKbStatus("Knowledge base idle");
+autoResize(preferencesEl);
+clearEditTarget();
+
+applySettingsToForm();
+applyFeatureAvailability();
+updateHeaderOffset();
+const initialSidebarPref = readSidebarPreference();
+setSidebarOpen(initialSidebarPref === null ? !isMobileViewport() : initialSidebarPref, false);
+syncModelSelectors(modelSel ? modelSel.value : "");
+loadSidebar();
+loadKnowledgeBaseDocuments();

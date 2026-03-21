@@ -1,0 +1,26 @@
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+exclude = [
+  "venv",
+  ".venv",
+  "__pycache__",
+  "chroma_db",
+]
+
+[tool.ruff.lint]
+select = [
+  "F",
+  "I",
+  "B",
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]

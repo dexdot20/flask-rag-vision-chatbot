@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ChatBot</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify/dist/purify.min.js"></script>
+</head>
+<body>
+
+<header>
+  <div class="header-brand">
+    <div class="header-logo">✦</div>
+    <h1>ChatBot</h1>
+  </div>
+  <div class="header-controls">
+    <div class="model-select-wrapper">
+      <select id="model-select" title="Select model">
+        {% for m in models %}
+        <option value="{{ m.id }}">{{ m.name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <button class="btn-ghost sidebar-toggle" id="sidebar-toggle-btn" type="button" aria-controls="sidebar" aria-expanded="true">
+      <span class="sidebar-toggle__label">Conversations</span>
+    </button>
+    <button class="btn-ghost" id="settings-btn">Settings</button>
+    <button class="btn-ghost btn-ghost--danger" id="clear-btn">Clear Chat</button>
+    <button class="btn-tokens" id="tokens-btn" title="Token usage and cost">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>
+      </svg>
+      <span><span id="tokens-badge">0</span> tokens</span>
+    </button>
+    <button class="btn-ghost mobile-tools-toggle" id="mobile-tools-btn" type="button" aria-controls="mobile-tools-panel" aria-expanded="false" title="More options">
+      <span aria-hidden="true">⋯</span>
+    </button>
+  </div>
+</header>
+
+<div id="mobile-tools-panel" class="mobile-tools-panel" aria-hidden="true">
+  <div class="mobile-tools-panel__header">
+    <span>More</span>
+    <button id="mobile-tools-close" type="button" title="Close">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+        <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+      </svg>
+    </button>
+  </div>
+  <div class="mobile-tools-panel__section">
+    <div class="settings-label">Model</div>
+    <div class="model-select-wrapper model-select-wrapper--mobile">
+      <select id="mobile-model-select" title="Select model">
+        {% for m in models %}
+        <option value="{{ m.id }}">{{ m.name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+  </div>
+  <div class="mobile-tools-panel__section mobile-tools-panel__section--actions">
+    <button class="mobile-tools-action" id="mobile-settings-btn" type="button">Settings</button>
+    <button class="mobile-tools-action" id="mobile-tokens-btn" type="button">Usage &amp; cost</button>
+    <button class="mobile-tools-action mobile-tools-action--danger" id="mobile-clear-btn" type="button">Clear chat</button>
+  </div>
+</div>
+<div id="mobile-tools-overlay" class="mobile-tools-overlay"></div>
+
+<div id="stats-panel" class="stats-panel" aria-hidden="true">
+  <div class="stats-panel-header">
+    <span>Usage & Cost</span>
+    <button id="stats-close" title="Close">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+        <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+      </svg>
+    </button>
+  </div>
+
+  <div class="stats-section stats-section-intro">
+    <div class="stats-section-title">How to read this</div>
+    <p class="stats-note">Provider totals come from the API usage payload for completed assistant turns. Input-source sections below are local estimates of how each prompt was assembled.</p>
+    <p class="stats-note">Cost is estimated with current DeepSeek V3.2 API pricing using cache-miss input tokens: $0.28 per 1M input tokens, $0.42 per 1M output tokens. If DeepSeek applies cache-hit pricing, actual billed cost can be lower.</p>
+  </div>
+
+  <div class="stats-section">
+    <div class="stats-section-title">Provider totals (session)</div>
+    <div class="stats-section-card">
+    <div class="stats-row">
+      <span class="stats-label">
+        <span class="stats-dot dot-user"></span>Input tokens (prompt)
+      </span>
+      <span class="stats-value" id="stat-user">0</span>
+    </div>
+    <div class="stats-row">
+      <span class="stats-label">
+        <span class="stats-dot dot-asst"></span>Output tokens (completion)
+      </span>
+      <span class="stats-value" id="stat-asst">0</span>
+    </div>
+    <div class="stats-row stats-row-total">
+      <span class="stats-label">Total tokens</span>
+      <span class="stats-value" id="stat-total">0</span>
+    </div>
+    <div class="stats-row">
+      <span class="stats-label">Estimated cost (USD, cache-miss basis)</span>
+      <span class="stats-value" id="stat-cost">$0.000000</span>
+    </div>
+    </div>
+    <p class="stats-note">Session totals aggregate every completed assistant turn in the current conversation.</p>
+  </div>
+
+  <div class="stats-section">
+    <div class="stats-section-title">Provider totals (latest assistant turn)</div>
+    <div class="stats-section-card">
+    <div class="stats-row">
+      <span class="stats-label">Input tokens (prompt)</span>
+      <span class="stats-value" id="stat-last-input">—</span>
+    </div>
+    <div class="stats-row">
+      <span class="stats-label">Output tokens (completion)</span>
+      <span class="stats-value" id="stat-last-output">—</span>
+    </div>
+    <div class="stats-row stats-row-total">
+      <span class="stats-label">Total tokens</span>
+      <span class="stats-value" id="stat-last-total">—</span>
+    </div>
+    <div class="stats-row">
+      <span class="stats-label">Model</span>
+      <span class="stats-value" id="stat-last-model">—</span>
+    </div>
+    </div>
+    <p class="stats-note">Includes every model call made while producing the latest assistant reply, including tool-execution rounds.</p>
+  </div>
+
+  <div class="stats-section">
+    <div class="stats-section-title">Estimated input sources (session)</div>
+    <div class="stats-section-card">
+    <div class="stats-row">
+      <span class="stats-label">Estimated input total</span>
+      <span class="stats-value" id="stat-breakdown-session-total">0</span>
+    </div>
+    <div id="session-breakdown-list" class="breakdown-list"></div>
+    </div>
+    <p class="stats-note">This is a cumulative session estimate across completed assistant turns. It is inferred locally from the prompt sources sent to the model, so it can differ from billed input tokens.</p>
+  </div>
+
+  <div class="stats-section">
+    <div class="stats-section-title">Estimated input sources (latest assistant turn)</div>
+    <div class="stats-section-card">
+    <div class="stats-row">
+      <span class="stats-label">Estimated input total</span>
+      <span class="stats-value" id="stat-breakdown-latest-total">—</span>
+    </div>
+    <div id="latest-breakdown-list" class="breakdown-list"></div>
+    </div>
+  </div>
+
+  <div class="stats-section" id="turns-section">
+    <div class="stats-section-title">Completed assistant turns</div>
+    <p class="stats-note">Each row is one completed assistant reply with provider totals and the local input-source estimate for that turn.</p>
+    <div id="turns-list" class="stats-turns-list"></div>
+  </div>
+</div>
+<div id="stats-overlay" class="stats-overlay"></div>
+
+<div id="settings-panel" class="settings-panel" aria-hidden="true">
+  <div class="settings-panel-header">
+    <span>Settings</span>
+    <button id="settings-close" title="Close">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+        <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+      </svg>
+    </button>
+  </div>
+
+  <div class="settings-section">
+    <div class="settings-section-title">AI Preferences</div>
+    <p class="settings-copy">Saved here once, applied automatically on every message, and injected into the runtime system prompt as user preferences.</p>
+    <label class="settings-label" for="preferences-input">Response preferences</label>
+    <textarea id="preferences-input" rows="8" placeholder="Example: Reply in English, keep answers concise, and use bullet points when useful."></textarea>
+    <label class="settings-label" for="max-steps-input">Web search step limit (1–10)</label>
+    <input type="number" class="settings-number" id="max-steps-input" min="1" max="10" value="5" />
+    <label class="settings-label" for="summary-trigger-input">Conversation summary trigger in visible messages (10–500)</label>
+    <input type="number" class="settings-number" id="summary-trigger-input" min="10" max="500" value="40" />
+    <label class="settings-label" for="summary-batch-input">Messages to summarize per pass (5–100)</label>
+    <input type="number" class="settings-number" id="summary-batch-input" min="5" max="100" value="20" />
+    <label class="settings-label" for="fetch-threshold-input">Fetch URL clipping threshold in tokens (400–20000)</label>
+    <input type="number" class="settings-number" id="fetch-threshold-input" min="400" max="20000" value="3500" />
+    <label class="settings-label" for="fetch-aggressiveness-input">Fetch clipping aggressiveness (0–100)</label>
+    <input type="number" class="settings-number" id="fetch-aggressiveness-input" min="0" max="100" value="50" />
+    <label class="settings-label">Tool permissions</label>
+    <p class="settings-copy">Only selected tools are exposed in the runtime prompt contract and only they can be executed.</p>
+    <div class="tool-toggles" id="tool-toggles">
+      <label class="tool-toggle"><input type="checkbox" value="append_scratchpad" /> <span>Append persistent scratchpad</span></label>
+      <label class="tool-toggle"><input type="checkbox" value="ask_clarifying_question" /> <span>Ask interactive clarification questions</span></label>
+      <label class="tool-toggle"><input type="checkbox" value="image_explain" /> <span>Follow up on stored images</span></label>
+      <label class="tool-toggle"><input type="checkbox" value="search_knowledge_base" /> <span>Knowledge base search</span></label>
+      <label class="tool-toggle"><input type="checkbox" value="search_web" /> <span>Web search</span></label>
+      <label class="tool-toggle"><input type="checkbox" value="fetch_url" /> <span>Read URL content</span></label>
+      <label class="tool-toggle"><input type="checkbox" value="search_news_ddgs" /> <span>Search news (DDGS)</span></label>
+      <label class="tool-toggle"><input type="checkbox" value="search_news_google" /> <span>Search news (Google)</span></label>
+    </div>
+    <div class="settings-actions">
+      <span id="settings-status" class="settings-status">Not saved yet</span>
+      <button class="btn-primary" id="settings-save-btn">Save</button>
+    </div>
+  </div>
+
+  <div class="settings-section">
+    <div class="settings-section-title">Scratchpad</div>
+    <p class="settings-copy">This is AI-managed persistent memory. It is injected into each runtime system prompt as read-only context and can only be updated through the dedicated scratchpad tool.</p>
+    <div class="settings-label">Stored notes</div>
+    <pre id="scratchpad-output" class="settings-readonly">No scratchpad entries yet.</pre>
+    <div id="scratchpad-admin-block" hidden>
+      <label class="settings-label" for="scratchpad-input">Admin manual editing</label>
+      <p class="settings-copy">Admin mode is enabled. Saving here replaces the full scratchpad content after normalization and deduplication.</p>
+      <textarea id="scratchpad-input" rows="8" placeholder="One durable memory note per line."></textarea>
+    </div>
+  </div>
+
+  <div class="settings-section">
+    <div class="settings-section-title">Knowledge Base (RAG)</div>
+    <p class="settings-copy">RAG now indexes only synced conversation history and successful text-like tool results. Legacy file, URL, and note ingestion is disabled.</p>
+    <p id="rag-disabled-note" class="settings-copy" hidden>RAG is disabled in .env, so knowledge-base sync and auto-injection are unavailable.</p>
+    <label class="tool-toggle"><input type="checkbox" id="rag-auto-inject-toggle" /> <span>Auto inject retrieved context into each chat turn</span></label>
+
+    <div class="kb-actions-row">
+      <button class="btn-ghost" id="kb-sync-btn" type="button">Sync chats</button>
+    </div>
+
+    <div class="settings-actions">
+      <span id="kb-status" class="settings-status">Knowledge base idle</span>
+      <button class="btn-primary" id="kb-sync-all-btn" type="button">Re-sync all chats</button>
+    </div>
+
+    <div class="kb-documents-block">
+      <div class="settings-label">Indexed sources</div>
+      <div id="kb-documents-list" class="kb-documents-list"></div>
+    </div>
+  </div>
+</div>
+<div id="settings-overlay" class="settings-overlay"></div>
+
+<div class="main-layout">
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+      <button class="btn-new-chat" id="new-chat-btn">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+        </svg>
+        New Chat
+      </button>
+    </div>
+    <nav class="sidebar-list" id="sidebar-list"></nav>
+  </aside>
+
+  <div class="chat-area">
+    <div id="messages">
+      <div class="empty-state" id="empty-state">
+        <div class="empty-state-icon">✦</div>
+        <h2>How can I help you?</h2>
+        <p>Ask anything — I'll respond instantly using the selected model.</p>
+      </div>
+    </div>
+
+    <div id="input-area">
+      <div id="edit-banner" class="edit-banner" hidden>
+        <span id="edit-banner-text">Editing an earlier message.</span>
+        <button id="edit-banner-cancel" class="edit-banner__cancel" type="button">Cancel</button>
+      </div>
+      <div class="input-wrapper">
+        <input id="image-input" type="file" accept="image/png,image/jpeg,image/webp" hidden />
+        <button id="attach-btn" class="btn-attach" title="Add image" type="button">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 1 1 5.66 5.66L9.41 17.41a2 2 0 1 1-2.83-2.83l8.49-8.48"/>
+          </svg>
+        </button>
+        <textarea id="user-input" rows="1" placeholder="Type a message…"></textarea>
+        <button class="btn-fix" id="fix-btn" title="Improve text">Fix</button>
+        <button id="cancel-btn" class="btn-cancel" title="Cancel" style="display:none">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+            <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+        <button id="send-btn" title="Send">
+          <svg width="15" height="15" viewBox="0 0 24 24">
+            <path d="M2 21l21-9L2 3v7l15 2-15 2z"/>
+          </svg>
+        </button>
+      </div>
+      <div id="attachment-preview" class="attachment-preview" hidden></div>
+      <p id="vision-disabled-note" class="input-hint" hidden>Image uploads are disabled in .env, so local vision analysis is unavailable.</p>
+      <p class="input-hint">Press <kbd>Enter</kbd> to send &nbsp;·&nbsp; <kbd>Shift+Enter</kbd> for a new line</p>
+      <div id="error-area"></div>
+    </div>
+  </div>
+</div>
+
+  <div id="sidebar-overlay" class="sidebar-overlay"></div>
+
+<script id="app-bootstrap" type="application/json">{{ {"settings": settings, "features": settings.features}|tojson }}</script>
+<script src="/static/app.js"></script>
+</body>
+</html>

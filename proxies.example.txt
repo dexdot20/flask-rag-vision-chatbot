@@ -1,0 +1,7 @@
+# Optional HTTP/HTTPS/SOCKS proxy list for outbound web requests.
+# One proxy per line.
+# Supported formats:
+# http://user:password@host:port
+# https://user:password@host:port
+# socks5://user:password@host:port
+# socks5h://user:password@host:port
