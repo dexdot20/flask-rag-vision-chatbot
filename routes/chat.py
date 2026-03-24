@@ -480,47 +480,26 @@ def register_chat_routes(app) -> None:
     def fix_text():
         data = request.get_json(silent=True) or {}
         text = (data.get("text") or "").strip()
-        model = data.get("model", "deepseek-chat")
 
         if not text:
             return jsonify({"error": "No text provided."}), 400
 
-        if not is_valid_model_id(model):
-            return jsonify({"error": "Invalid model."}), 400
-
-        settings = get_app_settings()
-        active_tool_names = get_active_tool_names(settings)
-        fetch_url_clip_aggressiveness = get_fetch_url_clip_aggressiveness(settings)
-        fetch_url_token_threshold = get_fetch_url_token_threshold(settings)
-        messages = prepend_runtime_context(
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "You improve user-written text without changing its core meaning. "
-                        "Correct spelling, grammar, punctuation, and clarity. Preserve the original language, tone, and intent. "
-                        "Do not add commentary, explanations, quotes, labels, or markdown fences. "
-                        "Return only the improved text."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": text,
-                },
-            ],
-            settings["user_preferences"],
-            active_tool_names,
-        )
-
-        max_steps = max(1, min(10, int(settings.get("max_steps", 5))))
-        result = collect_agent_response(
-            messages,
-            model,
-            max_steps,
-            active_tool_names,
-            fetch_url_token_threshold=fetch_url_token_threshold,
-            fetch_url_clip_aggressiveness=fetch_url_clip_aggressiveness,
-        )
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You improve user-written text without changing its core meaning. "
+                    "Correct spelling, grammar, punctuation, and clarity. Preserve the original language, tone, and intent. "
+                    "Do not add commentary, explanations, quotes, labels, or markdown fences. "
+                    "Return only the improved text."
+                ),
+            },
+            {
+                "role": "user",
+                "content": text,
+            },
+        ]
+        result = collect_agent_response(messages, "deepseek-chat", 1, [])
         fixed_text = (result.get("content") or "").strip()
         if not fixed_text:
             errors = result.get("errors") or []

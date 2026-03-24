@@ -3180,16 +3180,12 @@ async function fixMessage() {
 
   errorArea.innerHTML = "";
   setFixing(true);
-  fixBtn.textContent = "Fixing…";
 
   try {
     const response = await fetch("/api/fix-text", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        text,
-        model: modelSel.value,
-      }),
+      body: JSON.stringify({ text }),
     });
 
     const data = await response.json().catch(() => ({ error: "An unexpected error occurred." }));
@@ -3205,7 +3201,6 @@ async function fixMessage() {
     showError(error.message);
   } finally {
     setFixing(false);
-    fixBtn.textContent = "Fix";
   }
 }
 
