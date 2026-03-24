@@ -25,6 +25,9 @@ from db import (
     get_rag_auto_inject_enabled,
     get_rag_context_size,
     get_rag_sensitivity,
+    get_summary_dynamic_batch,
+    get_summary_skip_first,
+    get_summary_skip_last,
     get_tool_memory_auto_inject_enabled,
     normalize_active_tool_names,
     normalize_scratchpad_text,
@@ -48,6 +51,9 @@ def register_page_routes(app) -> None:
             "chat_summary_mode": get_chat_summary_mode(raw),
             "chat_summary_trigger_token_count": get_chat_summary_trigger_token_count(raw),
             "chat_summary_batch_size": get_chat_summary_batch_size(raw),
+            "summary_skip_first": get_summary_skip_first(raw),
+            "summary_skip_last": get_summary_skip_last(raw),
+            "summary_dynamic_batch": get_summary_dynamic_batch(raw),
             "fetch_url_token_threshold": get_fetch_url_token_threshold(raw),
             "fetch_url_clip_aggressiveness": get_fetch_url_clip_aggressiveness(raw),
             "features": get_feature_flags(),
@@ -74,6 +80,9 @@ def register_page_routes(app) -> None:
                 "chat_summary_mode": get_chat_summary_mode(raw),
                 "chat_summary_trigger_token_count": get_chat_summary_trigger_token_count(raw),
                 "chat_summary_batch_size": get_chat_summary_batch_size(raw),
+                "summary_skip_first": get_summary_skip_first(raw),
+                "summary_skip_last": get_summary_skip_last(raw),
+                "summary_dynamic_batch": get_summary_dynamic_batch(raw),
                 "fetch_url_token_threshold": get_fetch_url_token_threshold(raw),
                 "fetch_url_clip_aggressiveness": get_fetch_url_clip_aggressiveness(raw),
                 "features": get_feature_flags(),
@@ -93,6 +102,9 @@ def register_page_routes(app) -> None:
         chat_summary_mode_raw = data.get("chat_summary_mode")
         chat_summary_trigger_raw = data.get("chat_summary_trigger_token_count")
         chat_summary_batch_raw = data.get("chat_summary_batch_size")
+        summary_skip_first_raw = data.get("summary_skip_first")
+        summary_skip_last_raw = data.get("summary_skip_last")
+        summary_dynamic_batch_raw = data.get("summary_dynamic_batch")
         fetch_url_token_threshold_raw = data.get("fetch_url_token_threshold")
         fetch_url_clip_aggressiveness_raw = data.get("fetch_url_clip_aggressiveness")
         scratchpad = data.get("scratchpad")
@@ -109,6 +121,9 @@ def register_page_routes(app) -> None:
             and chat_summary_mode_raw is None
             and chat_summary_trigger_raw is None
             and chat_summary_batch_raw is None
+            and summary_skip_first_raw is None
+            and summary_skip_last_raw is None
+            and summary_dynamic_batch_raw is None
             and fetch_url_token_threshold_raw is None
             and fetch_url_clip_aggressiveness_raw is None
         ):
@@ -199,6 +214,32 @@ def register_page_routes(app) -> None:
                 return jsonify({"error": "chat_summary_batch_size must be between 5 and 100."}), 400
             settings["chat_summary_batch_size"] = str(chat_summary_batch)
 
+        if summary_skip_first_raw is not None:
+            try:
+                summary_skip_first = int(summary_skip_first_raw)
+            except (TypeError, ValueError):
+                return jsonify({"error": "summary_skip_first must be an integer."}), 400
+            if not (0 <= summary_skip_first <= 20):
+                return jsonify({"error": "summary_skip_first must be between 0 and 20."}), 400
+            settings["summary_skip_first"] = str(summary_skip_first)
+
+        if summary_skip_last_raw is not None:
+            try:
+                summary_skip_last = int(summary_skip_last_raw)
+            except (TypeError, ValueError):
+                return jsonify({"error": "summary_skip_last must be an integer."}), 400
+            if not (0 <= summary_skip_last <= 20):
+                return jsonify({"error": "summary_skip_last must be between 0 and 20."}), 400
+            settings["summary_skip_last"] = str(summary_skip_last)
+
+        if summary_dynamic_batch_raw is not None:
+            if isinstance(summary_dynamic_batch_raw, bool):
+                settings["summary_dynamic_batch"] = "true" if summary_dynamic_batch_raw else "false"
+            else:
+                settings["summary_dynamic_batch"] = (
+                    "true" if str(summary_dynamic_batch_raw).strip().lower() in {"1", "true", "yes", "on"} else "false"
+                )
+
         if fetch_url_token_threshold_raw is not None:
             try:
                 fetch_url_token_threshold = int(fetch_url_token_threshold_raw)
@@ -231,6 +272,9 @@ def register_page_routes(app) -> None:
                 "chat_summary_mode": get_chat_summary_mode(settings),
                 "chat_summary_trigger_token_count": get_chat_summary_trigger_token_count(settings),
                 "chat_summary_batch_size": get_chat_summary_batch_size(settings),
+                "summary_skip_first": get_summary_skip_first(settings),
+                "summary_skip_last": get_summary_skip_last(settings),
+                "summary_dynamic_batch": get_summary_dynamic_batch(settings),
                 "fetch_url_token_threshold": get_fetch_url_token_threshold(settings),
                 "fetch_url_clip_aggressiveness": get_fetch_url_clip_aggressiveness(settings),
                 "features": get_feature_flags(),

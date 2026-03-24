@@ -205,6 +205,9 @@ DEFAULT_SETTINGS = {
     "chat_summary_trigger_token_count": str(CHAT_SUMMARY_TRIGGER_TOKEN_COUNT),
     "chat_summary_batch_size": str(CHAT_SUMMARY_BATCH_SIZE),
     "chat_summary_mode": CHAT_SUMMARY_MODE if CHAT_SUMMARY_MODE in CHAT_SUMMARY_ALLOWED_MODES else "auto",
+    "summary_skip_first": "2",
+    "summary_skip_last": "1",
+    "summary_dynamic_batch": "true",
 }
 
 

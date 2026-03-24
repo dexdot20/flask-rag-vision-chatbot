@@ -23,6 +23,7 @@ from app import create_app
 from canvas_service import create_canvas_runtime_state, find_latest_canvas_documents, normalize_canvas_document, replace_canvas_lines
 from db import (
     append_to_scratchpad,
+    count_visible_message_tokens,
     create_image_asset,
     get_active_tool_names,
     get_app_settings,
@@ -41,6 +42,7 @@ from messages import (
     normalize_chat_messages,
     prepend_runtime_context,
 )
+from routes.chat import build_summary_prompt_messages
 from tool_registry import TOOL_SPEC_BY_NAME
 from web_tools import (
     _extract_html,
@@ -2703,6 +2705,9 @@ class AppRoutesTestCase(unittest.TestCase):
                 "chat_summary_mode": "auto",
                 "chat_summary_trigger_token_count": "1000",
                 "chat_summary_batch_size": "20",
+                "summary_skip_first": "0",
+                "summary_skip_last": "0",
+                "summary_dynamic_batch": "false",
             }
         )
 
@@ -2714,7 +2719,7 @@ class AppRoutesTestCase(unittest.TestCase):
                 )
 
         fake_summary = {
-            "content": "Summary of the first 20 messages.",
+            "content": "Summary of the first 20 messages with enough retained detail to meet the minimum length validation threshold for summaries.",
             "reasoning_content": "",
             "usage": None,
             "tool_results": [],
@@ -2755,7 +2760,7 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(conversation_messages[0]["metadata"]["summary_batch_size"], 20)
         self.assertEqual(
             conversation_messages[0]["content"],
-            "Conversation summary (generated from deleted messages):\n\nSummary of the first 20 messages.",
+            "Conversation summary (generated from deleted messages):\n\nSummary of the first 20 messages with enough retained detail to meet the minimum length validation threshold for summaries.",
         )
         self.assertEqual(len(conversation_messages), 22)
         self.assertEqual(conversation_messages[-1]["role"], "assistant")
@@ -2819,6 +2824,9 @@ class AppRoutesTestCase(unittest.TestCase):
                 "chat_summary_mode": "auto",
                 "chat_summary_trigger_token_count": "1000",
                 "chat_summary_batch_size": "5",
+                "summary_skip_first": "0",
+                "summary_skip_last": "0",
+                "summary_dynamic_batch": "false",
             }
         )
 
@@ -2842,7 +2850,7 @@ class AppRoutesTestCase(unittest.TestCase):
                 )
 
         fake_summary = {
-            "content": "Summary of the first five visible messages.",
+            "content": "Summary of the first five visible messages with enough retained detail to meet the minimum length validation threshold for summaries.",
             "reasoning_content": "",
             "usage": None,
             "tool_results": [],
@@ -2899,6 +2907,185 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(visible_rows[1]["content"], '{"ok":true}')
         self.assertEqual(deleted_count, 5)
 
+    def test_chat_summary_can_trigger_from_large_tool_history(self):
+        conversation_id = self._create_conversation()
+        dense_tool_payload = json.dumps(
+            {
+                "results": [
+                    {
+                        "title": f"Result {index}",
+                        "content": " ".join(["tool-context"] * 120),
+                    }
+                    for index in range(12)
+                ]
+            },
+            ensure_ascii=False,
+        )
+        save_app_settings(
+            {
+                "user_preferences": "",
+                "max_steps": "1",
+                "active_tools": "[]",
+                "rag_auto_inject": "false",
+                "chat_summary_mode": "auto",
+                "chat_summary_trigger_token_count": "1000",
+                "chat_summary_batch_size": "5",
+                "summary_skip_first": "0",
+                "summary_skip_last": "0",
+                "summary_dynamic_batch": "false",
+            }
+        )
+
+        with get_db() as conn:
+            conn.execute(
+                "INSERT INTO messages (conversation_id, role, content, metadata) VALUES (?, 'user', ?, ?)",
+                (conversation_id, "Short user message", None),
+            )
+            conn.execute(
+                "INSERT INTO messages (conversation_id, role, content, metadata) VALUES (?, 'assistant', ?, ?)",
+                (conversation_id, "Short assistant reply", None),
+            )
+            conn.execute(
+                "INSERT INTO messages (conversation_id, role, content, tool_call_id) VALUES (?, 'tool', ?, ?)",
+                (conversation_id, dense_tool_payload, "call-1"),
+            )
+
+        fake_summary = {
+            "content": "Summary of the early visible conversation with enough retained detail to meet the minimum length validation threshold for summaries.",
+            "reasoning_content": "",
+            "usage": None,
+            "tool_results": [],
+            "errors": [],
+        }
+        fake_events = iter(
+            [
+                {"type": "answer_start"},
+                {"type": "answer_delta", "text": "Fresh answer"},
+                {"type": "tool_capture", "tool_results": []},
+                {"type": "done"},
+            ]
+        )
+
+        with patch("routes.chat.collect_agent_response", return_value=fake_summary), patch(
+            "routes.chat.run_agent_stream", return_value=fake_events
+        ), patch("routes.chat.sync_conversations_to_rag_safe"):
+            response = self.client.post(
+                "/chat",
+                json={
+                    "conversation_id": conversation_id,
+                    "model": "deepseek-chat",
+                    "user_content": "Latest question",
+                    "messages": [{"role": "user", "content": "Latest question"}],
+                },
+            )
+            streamed_events = [json.loads(line) for line in response.get_data(as_text=True).strip().splitlines()]
+
+        self.assertEqual(response.status_code, 200)
+        summary_event = next((event for event in streamed_events if event["type"] == "conversation_summary_applied"), None)
+        self.assertIsNotNone(summary_event)
+        self.assertEqual(summary_event["covered_message_count"], 2)
+
+        with get_db() as conn:
+            visible_rows = conn.execute(
+                "SELECT role, tool_call_id FROM messages WHERE conversation_id = ? AND deleted_at IS NULL ORDER BY position, id",
+                (conversation_id,),
+            ).fetchall()
+
+        self.assertEqual(
+            [(row["role"], row["tool_call_id"]) for row in visible_rows],
+            [
+                ("summary", None),
+                ("tool", "call-1"),
+                ("user", None),
+                ("assistant", None),
+            ],
+        )
+
+    def test_build_summary_prompt_messages_filters_empty_and_merges_assistant_history(self):
+        prompt_messages = build_summary_prompt_messages(
+            [
+                {"role": "user", "content": "First user request"},
+                {"role": "assistant", "content": "   "},
+                {"role": "assistant", "content": "First assistant note"},
+                {"role": "assistant", "content": "Second assistant note"},
+                {"role": "assistant", "content": FINAL_ANSWER_ERROR_TEXT},
+                {"role": "user", "content": "   "},
+                {"role": "user", "content": "Second user request"},
+            ],
+            "",
+        )
+
+        self.assertEqual([message["role"] for message in prompt_messages], ["system", "user"])
+        self.assertIn("USER:\nFirst user request", prompt_messages[1]["content"])
+        self.assertIn("ASSISTANT:\nFirst assistant note\n\nSecond assistant note", prompt_messages[1]["content"])
+        self.assertIn("USER:\nSecond user request", prompt_messages[1]["content"])
+        self.assertNotIn(FINAL_ANSWER_ERROR_TEXT, prompt_messages[1]["content"])
+
+    def test_chat_summary_status_reports_detailed_failure_stage(self):
+        conversation_id = self._create_conversation()
+        dense_message = " ".join(["context"] * 120)
+        save_app_settings(
+            {
+                "user_preferences": "",
+                "max_steps": "1",
+                "active_tools": "[]",
+                "rag_auto_inject": "false",
+                "chat_summary_mode": "auto",
+                "chat_summary_trigger_token_count": "1000",
+                "chat_summary_batch_size": "5",
+                "summary_skip_first": "0",
+                "summary_skip_last": "0",
+                "summary_dynamic_batch": "false",
+            }
+        )
+
+        with get_db() as conn:
+            for index in range(12):
+                conn.execute(
+                    "INSERT INTO messages (conversation_id, role, content, metadata) VALUES (?, 'user', ?, ?)",
+                    (conversation_id, f"Seed {index + 1} {dense_message}", None),
+                )
+
+        failing_summary = {
+            "content": "",
+            "reasoning_content": "",
+            "usage": None,
+            "tool_results": [],
+            "errors": ["This model's maximum context length is 131072 tokens. However, you requested 132465 tokens."],
+        }
+        fake_events = iter(
+            [
+                {"type": "answer_start"},
+                {"type": "answer_delta", "text": "Live answer"},
+                {"type": "tool_capture", "tool_results": []},
+                {"type": "done"},
+            ]
+        )
+
+        with patch("routes.chat.collect_agent_response", return_value=failing_summary), patch(
+            "routes.chat.run_agent_stream", return_value=fake_events
+        ), patch("routes.chat.sync_conversations_to_rag_safe"):
+            response = self.client.post(
+                "/chat",
+                json={
+                    "conversation_id": conversation_id,
+                    "model": "deepseek-chat",
+                    "user_content": f"Latest {dense_message}",
+                    "messages": [{"role": "user", "content": f"Latest {dense_message}"}],
+                },
+            )
+            events = [json.loads(line) for line in response.get_data(as_text=True).strip().splitlines()]
+
+        self.assertEqual(response.status_code, 200)
+        status_event = next((event for event in events if event["type"] == "conversation_summary_status"), None)
+        self.assertIsNotNone(status_event)
+        self.assertEqual(status_event["reason"], "summary_generation_failed")
+        self.assertEqual(status_event["failure_stage"], "context_too_large")
+        self.assertIn("maximum context length", status_event["failure_detail"])
+        self.assertEqual(status_event["returned_text_length"], 0)
+        self.assertEqual(status_event["summary_error_count"], 1)
+        self.assertGreaterEqual(status_event["candidate_message_count"], 1)
+
     def test_chat_summary_rejects_error_summary_without_deleting_messages(self):
         conversation_id = self._create_conversation()
         dense_message = " ".join(["history"] * 120)
@@ -2911,6 +3098,9 @@ class AppRoutesTestCase(unittest.TestCase):
                 "chat_summary_mode": "auto",
                 "chat_summary_trigger_token_count": "1000",
                 "chat_summary_batch_size": "5",
+                "summary_skip_first": "0",
+                "summary_skip_last": "0",
+                "summary_dynamic_batch": "false",
             }
         )
 
@@ -2979,6 +3169,9 @@ class AppRoutesTestCase(unittest.TestCase):
                 "chat_summary_mode": "auto",
                 "chat_summary_trigger_token_count": "1000",
                 "chat_summary_batch_size": "5",
+                "summary_skip_first": "0",
+                "summary_skip_last": "0",
+                "summary_dynamic_batch": "false",
             }
         )
 
@@ -2990,14 +3183,14 @@ class AppRoutesTestCase(unittest.TestCase):
                 )
 
         first_summary = {
-            "content": "First summary block with enough retained detail.",
+            "content": "First summary block with enough retained detail to satisfy the minimum length validation threshold for summary generation.",
             "reasoning_content": "",
             "usage": None,
             "tool_results": [],
             "errors": [],
         }
         second_summary = {
-            "content": "Second summary block with enough retained detail.",
+            "content": "Second summary block with enough retained detail to satisfy the minimum length validation threshold for summary generation.",
             "reasoning_content": "",
             "usage": None,
             "tool_results": [],
@@ -3039,11 +3232,11 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(len(summary_messages), 2)
         self.assertEqual(
             summary_messages[0]["content"],
-            "Conversation summary (generated from deleted messages):\n\nFirst summary block with enough retained detail.",
+            "Conversation summary (generated from deleted messages):\n\nFirst summary block with enough retained detail to satisfy the minimum length validation threshold for summary generation.",
         )
         self.assertEqual(
             summary_messages[1]["content"],
-            "Conversation summary (generated from deleted messages):\n\nSecond summary block with enough retained detail.",
+            "Conversation summary (generated from deleted messages):\n\nSecond summary block with enough retained detail to satisfy the minimum length validation threshold for summary generation.",
         )
         self.assertEqual(summary_messages[0]["metadata"]["covered_message_count"], 5)
         self.assertEqual(summary_messages[1]["metadata"]["covered_message_count"], 5)
@@ -3065,6 +3258,9 @@ class AppRoutesTestCase(unittest.TestCase):
                 "chat_summary_mode": "never",
                 "chat_summary_trigger_token_count": "1000",
                 "chat_summary_batch_size": "5",
+                "summary_skip_first": "0",
+                "summary_skip_last": "0",
+                "summary_dynamic_batch": "false",
             }
         )
 
@@ -3238,6 +3434,396 @@ class AppRoutesTestCase(unittest.TestCase):
         # Must use exactly 1 step and zero tools — prevents multi-turn tool calls
         self.assertEqual(max_steps, 1)
         self.assertEqual(enabled_tool_names, [])
+
+    def test_get_unsummarized_visible_messages_skip_first_and_last(self):
+        from db import get_unsummarized_visible_messages
+
+        messages = [
+            {"id": 1, "position": 1, "role": "user", "content": "First"},
+            {"id": 2, "position": 2, "role": "assistant", "content": "Second"},
+            {"id": 3, "position": 3, "role": "user", "content": "Third"},
+            {"id": 4, "position": 4, "role": "assistant", "content": "Fourth"},
+            {"id": 5, "position": 5, "role": "user", "content": "Fifth"},
+        ]
+        result = get_unsummarized_visible_messages(messages, skip_first=1, skip_last=1)
+        self.assertEqual([m["id"] for m in result], [2, 3, 4])
+
+        result_all = get_unsummarized_visible_messages(messages, skip_first=0, skip_last=0)
+        self.assertEqual([m["id"] for m in result_all], [1, 2, 3, 4, 5])
+
+        result_over = get_unsummarized_visible_messages(messages, skip_first=3, skip_last=3)
+        self.assertEqual(result_over, [])
+
+        result_with_limit = get_unsummarized_visible_messages(messages, skip_first=1, skip_last=1, limit=2)
+        self.assertEqual([m["id"] for m in result_with_limit], [2, 3])
+
+    def test_get_unsummarized_visible_messages_ignores_hidden_tool_call_assistant_entries(self):
+        from db import get_unsummarized_visible_messages
+
+        messages = [
+            {"id": 1, "position": 1, "role": "user", "content": "First", "tool_calls": []},
+            {
+                "id": 2,
+                "position": 2,
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-1", "function": {"name": "search_web", "arguments": "{}"}}],
+            },
+            {"id": 3, "position": 3, "role": "assistant", "content": "Visible assistant", "tool_calls": []},
+            {"id": 4, "position": 4, "role": "user", "content": "Fourth", "tool_calls": []},
+            {"id": 5, "position": 5, "role": "assistant", "content": "Fifth", "tool_calls": []},
+        ]
+
+        result = get_unsummarized_visible_messages(messages, skip_first=1, skip_last=1)
+        self.assertEqual([message["id"] for message in result], [3, 4])
+
+    def test_dynamic_batch_size_calculation(self):
+        from routes.chat import _calculate_dynamic_batch_size
+
+        result = _calculate_dynamic_batch_size([], 20)
+        self.assertEqual(result, 20)
+
+        messages = [{"content": "short"}] * 10
+        result = _calculate_dynamic_batch_size(messages, 20)
+        self.assertGreaterEqual(result, 5)
+        self.assertLessEqual(result, 20)
+
+        dense_messages = [{"content": " ".join(["dense"] * 400)} for _ in range(12)]
+        dense_result = _calculate_dynamic_batch_size(dense_messages, 20)
+        self.assertLess(dense_result, 20)
+
+    def test_manual_summarize_endpoint_returns_404_for_missing_conversation(self):
+        response = self.client.post(
+            "/api/conversations/999999/summarize",
+            json={"force": True},
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_manual_summarize_endpoint_can_force_summarize(self):
+        conversation_id = self._create_conversation()
+        dense_message = " ".join(["manual"] * 120)
+        save_app_settings(
+            {
+                "user_preferences": "",
+                "max_steps": "1",
+                "active_tools": "[]",
+                "rag_auto_inject": "false",
+                "chat_summary_mode": "never",
+                "chat_summary_trigger_token_count": "1000",
+                "chat_summary_batch_size": "5",
+                "summary_skip_first": "0",
+                "summary_skip_last": "0",
+                "summary_dynamic_batch": "false",
+            }
+        )
+
+        with get_db() as conn:
+            for index in range(12):
+                conn.execute(
+                    "INSERT INTO messages (conversation_id, role, content, metadata) VALUES (?, 'user', ?, ?)",
+                    (conversation_id, f"Seed {index + 1} {dense_message}", None),
+                )
+
+        fake_summary = {
+            "content": "Manual summary with enough retained detail to satisfy the minimum length validation threshold for summary generation results.",
+            "reasoning_content": "",
+            "usage": None,
+            "tool_results": [],
+            "errors": [],
+        }
+        with patch("routes.chat.collect_agent_response", return_value=fake_summary), patch(
+            "routes.chat.sync_conversations_to_rag_safe"
+        ):
+            response = self.client.post(
+                f"/api/conversations/{conversation_id}/summarize",
+                json={"force": True},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertTrue(data["applied"])
+        self.assertGreater(data["covered_message_count"], 0)
+
+    def test_manual_summarize_endpoint_honors_false_force_strings(self):
+        conversation_id = self._create_conversation()
+        save_app_settings(
+            {
+                "user_preferences": "",
+                "max_steps": "1",
+                "active_tools": "[]",
+                "rag_auto_inject": "false",
+                "chat_summary_mode": "never",
+                "chat_summary_trigger_token_count": "1000",
+                "chat_summary_batch_size": "5",
+                "summary_skip_first": "0",
+                "summary_skip_last": "0",
+                "summary_dynamic_batch": "false",
+            }
+        )
+
+        with get_db() as conn:
+            conn.execute(
+
+                "INSERT INTO messages (conversation_id, role, content, metadata) VALUES (?, 'user', ?, ?)",
+                (conversation_id, "Seed message", None),
+            )
+
+        with patch("routes.chat.collect_agent_response") as mocked_collect:
+            response = self.client.post(
+                f"/api/conversations/{conversation_id}/summarize",
+                json={"force": "false"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertFalse(data["applied"])
+        self.assertEqual(data["reason"], "mode_never")
+        mocked_collect.assert_not_called()
+
+    def test_manual_summarize_preserves_edges_and_inserts_summary_at_first_covered_slot(self):
+        conversation_id = self._create_conversation()
+        save_app_settings(
+            {
+                "user_preferences": "",
+                "max_steps": "1",
+                "active_tools": "[]",
+                "rag_auto_inject": "false",
+                "chat_summary_mode": "never",
+                "chat_summary_trigger_token_count": "1000",
+                "chat_summary_batch_size": "10",
+                "summary_skip_first": "2",
+                "summary_skip_last": "2",
+                "summary_dynamic_batch": "false",
+            }
+        )
+
+        with get_db() as conn:
+            for index in range(8):
+                conn.execute(
+                    "INSERT INTO messages (conversation_id, role, content, metadata) VALUES (?, 'user', ?, ?)",
+                    (conversation_id, f"Message {index + 1}", None),
+                )
+
+        fake_summary = {
+            "content": "Summary block with enough retained detail to satisfy the minimum length validation threshold and preserve chronology across the covered messages.",
+            "reasoning_content": "",
+            "usage": None,
+            "tool_results": [],
+            "errors": [],
+        }
+
+        with patch("routes.chat.collect_agent_response", return_value=fake_summary), patch(
+            "routes.chat.sync_conversations_to_rag_safe"
+        ):
+            response = self.client.post(
+                f"/api/conversations/{conversation_id}/summarize",
+                json={"force": True},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertTrue(data["applied"])
+        self.assertEqual(data["covered_message_count"], 4)
+
+        messages = data["messages"]
+        self.assertEqual([message["content"] for message in messages if message["role"] == "user"], ["Message 1", "Message 2", "Message 7", "Message 8"])
+        self.assertEqual([message["role"] for message in messages], ["user", "user", "summary", "user", "user"])
+
+        summary_message = next(message for message in messages if message["role"] == "summary")
+        self.assertEqual(summary_message["metadata"]["covered_message_ids"], [3, 4, 5, 6])
+        self.assertEqual(summary_message["metadata"]["summary_insert_strategy"], "replace_first_covered_message_preserve_positions")
+        self.assertEqual(summary_message["position"], 3)
+
+    def test_visible_token_count_ignores_hidden_tool_messages_and_tool_call_assistants(self):
+        visible_messages = [
+            {"role": "user", "content": "Visible user text"},
+            {"role": "assistant", "content": "Visible assistant text"},
+            {"role": "tool", "content": "Hidden tool result"},
+            {"role": "summary", "content": "Visible summary text"},
+        ]
+        mixed_messages = [
+            {"role": "user", "content": "Visible user text"},
+            {"role": "assistant", "content": "Visible assistant text"},
+            {
+                "role": "assistant",
+                "content": "Hidden assistant tool call",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "search_web", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "content": "Hidden tool result"},
+            {"role": "summary", "content": "Visible summary text"},
+        ]
+
+        self.assertEqual(count_visible_message_tokens(mixed_messages), count_visible_message_tokens(visible_messages))
+
+    def test_undo_summary_restores_messages_in_original_order(self):
+        conversation_id = self._create_conversation()
+        save_app_settings(
+            {
+                "user_preferences": "",
+                "max_steps": "1",
+                "active_tools": "[]",
+                "rag_auto_inject": "false",
+                "chat_summary_mode": "never",
+                "chat_summary_trigger_token_count": "1000",
+                "chat_summary_batch_size": "10",
+                "summary_skip_first": "2",
+                "summary_skip_last": "2",
+                "summary_dynamic_batch": "false",
+            }
+        )
+
+        with get_db() as conn:
+            for index in range(8):
+                conn.execute(
+                    "INSERT INTO messages (conversation_id, role, content, metadata) VALUES (?, 'user', ?, ?)",
+                    (conversation_id, f"Message {index + 1}", None),
+                )
+
+        fake_summary = {
+            "content": "Summary block with enough retained detail to satisfy the minimum length validation threshold and allow undo restoration.",
+            "reasoning_content": "",
+            "usage": None,
+            "tool_results": [],
+            "errors": [],
+        }
+
+        with patch("routes.chat.collect_agent_response", return_value=fake_summary), patch(
+            "routes.chat.sync_conversations_to_rag_safe"
+        ):
+            summarize_response = self.client.post(
+                f"/api/conversations/{conversation_id}/summarize",
+                json={"force": True},
+            )
+
+        summary_message_id = summarize_response.get_json()["summary_message_id"]
+        with patch("routes.chat.sync_conversations_to_rag_safe"):
+            undo_response = self.client.post(
+                f"/api/conversations/{conversation_id}/summaries/{summary_message_id}/undo"
+            )
+
+        self.assertEqual(undo_response.status_code, 200)
+        data = undo_response.get_json()
+        self.assertTrue(data["reverted"])
+        self.assertEqual(data["restored_message_count"], 4)
+        self.assertEqual([message["role"] for message in data["messages"]], ["user"] * 8)
+        self.assertEqual([message["content"] for message in data["messages"]], [f"Message {index}" for index in range(1, 9)])
+        self.assertEqual([message["position"] for message in data["messages"]], list(range(1, 9)))
+
+    def test_undo_summary_restores_legacy_summary_layout(self):
+        conversation_id = self._create_conversation()
+
+        with get_db() as conn:
+            inserted_ids = []
+            for index in range(8):
+                inserted_ids.append(
+                    conn.execute(
+                        "INSERT INTO messages (conversation_id, role, content, metadata, position) VALUES (?, 'user', ?, ?, ?)",
+                        (conversation_id, f"Message {index + 1}", None, index + 1),
+                    ).lastrowid
+                )
+
+            deleted_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            conn.execute(
+                "UPDATE messages SET deleted_at = ? WHERE conversation_id = ? AND id IN (?, ?, ?, ?)",
+                (deleted_at, conversation_id, inserted_ids[2], inserted_ids[3], inserted_ids[4], inserted_ids[5]),
+            )
+            conn.execute(
+                "UPDATE messages SET position = 4 WHERE id = ?",
+                (inserted_ids[6],),
+            )
+            conn.execute(
+                "UPDATE messages SET position = 5 WHERE id = ?",
+                (inserted_ids[7],),
+            )
+            summary_id = conn.execute(
+                "INSERT INTO messages (conversation_id, role, content, metadata, position) VALUES (?, 'summary', ?, ?, 3)",
+                (
+                    conversation_id,
+                    "Conversation summary (generated from deleted messages):\n\nLegacy summary block.",
+                    serialize_message_metadata(
+                        {
+                            "is_summary": True,
+                            "summary_source": "conversation_history",
+                            "covers_from_position": 3,
+                            "covers_to_position": 6,
+                            "covered_message_count": 4,
+                            "covered_message_ids": [inserted_ids[2], inserted_ids[3], inserted_ids[4], inserted_ids[5]],
+                            "generated_at": deleted_at,
+                        }
+                    ),
+                ),
+            ).lastrowid
+
+        with patch("routes.chat.sync_conversations_to_rag_safe"):
+            response = self.client.post(
+                f"/api/conversations/{conversation_id}/summaries/{summary_id}/undo"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertTrue(data["reverted"])
+        self.assertEqual([message["content"] for message in data["messages"]], [f"Message {index}" for index in range(1, 9)])
+        self.assertEqual([message["position"] for message in data["messages"]], list(range(1, 9)))
+
+    def test_settings_include_new_summary_params(self):
+        save_app_settings(
+            {
+                "user_preferences": "",
+                "max_steps": "5",
+                "active_tools": "[]",
+                "summary_skip_first": "3",
+                "summary_skip_last": "2",
+                "summary_dynamic_batch": "false",
+            }
+        )
+        response = self.client.get("/api/settings")
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data["summary_skip_first"], 3)
+        self.assertEqual(data["summary_skip_last"], 2)
+        self.assertFalse(data["summary_dynamic_batch"])
+
+    def test_settings_patch_validates_new_summary_params(self):
+        response = self.client.patch(
+            "/api/settings",
+            json={"summary_skip_first": 5, "summary_skip_last": 3, "summary_dynamic_batch": True},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data["summary_skip_first"], 5)
+        self.assertEqual(data["summary_skip_last"], 3)
+        self.assertTrue(data["summary_dynamic_batch"])
+
+    def test_settings_patch_rejects_invalid_skip_values(self):
+        response = self.client.patch(
+            "/api/settings",
+            json={"summary_skip_first": 25},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_structured_summary_prompt_contains_sections(self):
+        prompt_messages = build_summary_prompt_messages(
+            [
+                {"role": "user", "content": "Tell me about Python"},
+                {"role": "assistant", "content": "Python is a programming language."},
+            ],
+            "",
+        )
+        system_content = prompt_messages[0]["content"]
+        self.assertIn("User Goals & Intentions", system_content)
+        self.assertIn("Key Facts & Information", system_content)
+        self.assertIn("Decisions & Agreements", system_content)
+        self.assertIn("Unresolved Questions", system_content)
+        self.assertIn("Important Context", system_content)
+        self.assertIn("sufficient detail", system_content)
 
 
 if __name__ == "__main__":

@@ -46,6 +46,7 @@ MESSAGE_USAGE_BREAKDOWN_KEYS = (
 )
 MESSAGE_TOOL_TRACE_STATES = {"running", "done", "error"}
 VISIBLE_CHAT_ROLES = {"user", "assistant", "summary"}
+SUMMARY_TRIGGER_TOKEN_ROLES = {"user", "assistant", "tool"}
 
 
 def configure_db_path(path: str | None = None) -> str:
@@ -951,6 +952,7 @@ def serialize_message_metadata(metadata: dict | None) -> str | None:
     for key in (
         "covers_from_position",
         "covers_to_position",
+        "summary_position",
         "covered_message_count",
         "trigger_threshold",
         "trigger_token_count",
@@ -968,6 +970,14 @@ def serialize_message_metadata(metadata: dict | None) -> str | None:
     summary_model = str(metadata.get("summary_model") or "").strip()
     if summary_model:
         cleaned["summary_model"] = summary_model[:120]
+
+    summary_insert_strategy = str(metadata.get("summary_insert_strategy") or "").strip()
+    if summary_insert_strategy in {
+        "after_covered_block",
+        "replace_first_covered_message",
+        "replace_first_covered_message_preserve_positions",
+    }:
+        cleaned["summary_insert_strategy"] = summary_insert_strategy
 
     covered_message_ids = metadata.get("covered_message_ids")
     if isinstance(covered_message_ids, list):
@@ -1275,6 +1285,32 @@ def get_chat_summary_batch_size(settings: dict | None = None) -> int:
     return max(5, min(100, value))
 
 
+def get_summary_skip_first(settings: dict | None = None) -> int:
+    source = settings if settings is not None else get_app_settings()
+    raw_value = source.get("summary_skip_first", DEFAULT_SETTINGS["summary_skip_first"])
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        value = 2
+    return max(0, min(20, value))
+
+
+def get_summary_skip_last(settings: dict | None = None) -> int:
+    source = settings if settings is not None else get_app_settings()
+    raw_value = source.get("summary_skip_last", DEFAULT_SETTINGS["summary_skip_last"])
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        value = 1
+    return max(0, min(20, value))
+
+
+def get_summary_dynamic_batch(settings: dict | None = None) -> bool:
+    source = settings if settings is not None else get_app_settings()
+    raw_value = source.get("summary_dynamic_batch", DEFAULT_SETTINGS["summary_dynamic_batch"])
+    return str(raw_value).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def get_fetch_url_token_threshold(settings: dict | None = None) -> int:
     source = settings if settings is not None else get_app_settings()
     raw_value = source.get("fetch_url_token_threshold", DEFAULT_SETTINGS["fetch_url_token_threshold"])
@@ -1380,36 +1416,96 @@ def soft_delete_messages(
     )
 
 
+def restore_soft_deleted_messages(
+    conn: sqlite3.Connection,
+    conversation_id: int,
+    message_ids: Iterable[int],
+) -> None:
+    normalized_ids = [int(message_id) for message_id in message_ids if int(message_id) > 0]
+    if not normalized_ids:
+        return
+    placeholders = ", ".join("?" for _ in normalized_ids)
+    conn.execute(
+        f"UPDATE messages SET deleted_at = NULL WHERE conversation_id = ? AND id IN ({placeholders}) AND deleted_at IS NOT NULL",
+        (conversation_id, *normalized_ids),
+    )
+
+
+def shift_message_positions(
+    conn: sqlite3.Connection,
+    conversation_id: int,
+    start_position: int,
+    delta: int,
+    exclude_message_ids: Iterable[int] | None = None,
+) -> None:
+    if delta == 0:
+        return
+    normalized_start = int(start_position or 0)
+    excluded_ids = [int(message_id) for message_id in (exclude_message_ids or []) if int(message_id) > 0]
+    query = "UPDATE messages SET position = position + ? WHERE conversation_id = ? AND position >= ?"
+    params: list[object] = [delta, conversation_id, normalized_start]
+    if excluded_ids:
+        placeholders = ", ".join("?" for _ in excluded_ids)
+        query += f" AND id NOT IN ({placeholders})"
+        params.extend(excluded_ids)
+    conn.execute(query, tuple(params))
+
+
+def is_renderable_chat_message(message: dict) -> bool:
+    if not isinstance(message, dict):
+        return False
+    role = str(message.get("role") or "").strip()
+    if role == "assistant":
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list) and tool_calls:
+            return False
+    return role in VISIBLE_CHAT_ROLES
+
+
 def count_visible_message_tokens(messages: list[dict]) -> int:
     total = 0
     for message in messages:
         if not isinstance(message, dict):
             continue
         role = str(message.get("role") or "").strip()
-        if role not in VISIBLE_CHAT_ROLES or role == "summary":
+        if role == "assistant":
+            tool_calls = message.get("tool_calls")
+            if isinstance(tool_calls, list) and tool_calls:
+                continue
+        if role not in {"user", "assistant", "tool", "summary"}:
             continue
         total += estimate_text_tokens(str(message.get("content") or ""))
     return total
 
 
-def get_unsummarized_visible_messages(messages: list[dict], limit: int | None = None) -> list[dict]:
-    selected = []
+def get_unsummarized_visible_messages(
+    messages: list[dict],
+    limit: int | None = None,
+    skip_first: int = 0,
+    skip_last: int = 0,
+) -> list[dict]:
     ordered_messages = sorted(
         (message for message in messages if isinstance(message, dict)),
         key=lambda message: (int(message.get("position") or 0), int(message.get("id") or 0)),
     )
+    candidates = []
     for message in ordered_messages:
-        if not isinstance(message, dict):
+        if not is_renderable_chat_message(message):
             continue
         role = str(message.get("role") or "").strip()
-        if role not in VISIBLE_CHAT_ROLES:
-            continue
         if role == "summary":
             continue
-        selected.append(message)
-        if limit is not None and len(selected) >= limit:
-            break
-    return selected
+        candidates.append(message)
+
+    skip_first = max(0, skip_first)
+    skip_last = max(0, skip_last)
+    if skip_first + skip_last >= len(candidates):
+        return []
+    eligible = candidates[skip_first:len(candidates) - skip_last] if skip_last > 0 else candidates[skip_first:]
+
+    if limit is not None:
+        eligible = eligible[:limit]
+    return eligible
 
 
 def find_summary_covering_message_id(conversation_id: int, message_id: int) -> dict | None:

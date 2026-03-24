@@ -224,6 +224,61 @@
     <input type="number" class="settings-number" id="summary-trigger-input" min="1000" max="200000" value="80000" />
     <label class="settings-label" for="summary-batch-input">Messages to summarize per pass (5–100)</label>
     <input type="number" class="settings-number" id="summary-batch-input" min="5" max="100" value="20" />
+    <label class="settings-label" for="summary-skip-first-input">Protect first N messages from summary (0–20)</label>
+    <input type="number" class="settings-number" id="summary-skip-first-input" min="0" max="20" value="2" />
+    <label class="settings-label" for="summary-skip-last-input">Protect last N messages from summary (0–20)</label>
+    <input type="number" class="settings-number" id="summary-skip-last-input" min="0" max="20" value="1" />
+    <label class="tool-toggle"><input type="checkbox" id="summary-dynamic-batch-toggle" checked /> <span>Dynamic batch size (auto-adjust based on token density)</span></label>
+    <div class="summary-inspector" id="summary-inspector">
+      <div class="summary-inspector__header">
+        <span class="settings-label">Summary process</span>
+        <span class="summary-inspector__badge" id="summary-inspector-badge" data-tone="muted">Waiting</span>
+      </div>
+      <p class="summary-inspector__headline" id="summary-inspector-headline">Start chatting to see when automatic summary will run.</p>
+      <div class="summary-inspector__grid">
+        <div class="summary-inspector__metric">
+          <span>Counted now</span>
+          <strong id="summary-inspector-current">0</strong>
+        </div>
+        <div class="summary-inspector__metric">
+          <span>Trigger</span>
+          <strong id="summary-inspector-trigger">80,000</strong>
+        </div>
+        <div class="summary-inspector__metric">
+          <span>Next pass</span>
+          <strong id="summary-inspector-next">20 msgs</strong>
+        </div>
+        <div class="summary-inspector__metric">
+          <span>Gap</span>
+          <strong id="summary-inspector-gap">80,000 left</strong>
+        </div>
+      </div>
+      <div class="summary-inspector__grid">
+        <div class="summary-inspector__metric">
+          <span>Candidates</span>
+          <strong id="summary-inspector-candidates">0</strong>
+        </div>
+        <div class="summary-inspector__metric">
+          <span>Filtered empty</span>
+          <strong id="summary-inspector-empty">0</strong>
+        </div>
+        <div class="summary-inspector__metric">
+          <span>Tool tokens</span>
+          <strong id="summary-inspector-tool-tokens">0</strong>
+        </div>
+        <div class="summary-inspector__metric">
+          <span>Last output</span>
+          <strong id="summary-inspector-output">—</strong>
+        </div>
+      </div>
+      <p class="summary-inspector__detail" id="summary-inspector-detail">Counts user, assistant, and tool history. Does not count runtime system prompt, RAG context, or final-answer instructions.</p>
+      <p class="summary-inspector__detail" id="summary-inspector-reason">The latest summary decision will appear here after each completed assistant turn.</p>
+      <p class="summary-inspector__detail" id="summary-inspector-last">No summary pass has run in this conversation yet.</p>
+      <div class="summary-inspector__actions">
+        <button id="summary-now-btn" class="btn-ghost" type="button">Summarize now</button>
+        <button id="summary-undo-btn" class="btn-ghost" type="button">Undo last summary</button>
+      </div>
+    </div>
     <label class="settings-label" for="fetch-threshold-input">Fetch URL clipping threshold in tokens (400–20000)</label>
     <input type="number" class="settings-number" id="fetch-threshold-input" min="400" max="20000" value="3500" />
     <label class="settings-label" for="fetch-aggressiveness-input">Fetch clipping aggressiveness (0–100)</label>

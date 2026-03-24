@@ -1433,7 +1433,6 @@ def run_agent_stream(
         tool_call_parts = []
         content_streaming_live = False
         stream_error = None
-        _CONTENT_FLUSH_CHAR_THRESHOLD = 80
 
         try:
             for chunk in response:
@@ -1457,14 +1456,9 @@ def run_agent_stream(
                     elif tool_call_parts:
                         buffered_content_deltas.append(content_delta)
                     else:
-                        buffered_content_deltas.append(content_delta)
-                        buffered_chars = sum(len(d) for d in buffered_content_deltas)
-                        if buffered_chars >= _CONTENT_FLUSH_CHAR_THRESHOLD:
-                            content_streaming_live = True
-                            for pending in buffered_content_deltas:
-                                for event in emit_answer(pending):
-                                    yield event
-                            buffered_content_deltas = []
+                        content_streaming_live = True
+                        for event in emit_answer(content_delta):
+                            yield event
                 if getattr(chunk, "usage", None):
                     add_usage(chunk.usage)
         except Exception as exc:

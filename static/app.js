@@ -24,6 +24,11 @@ const maxStepsEl = document.getElementById("max-steps-input");
 const summaryModeEl = document.getElementById("summary-mode-select");
 const summaryTriggerEl = document.getElementById("summary-trigger-input");
 const summaryBatchEl = document.getElementById("summary-batch-input");
+const summarySkipFirstEl = document.getElementById("summary-skip-first-input");
+const summarySkipLastEl = document.getElementById("summary-skip-last-input");
+const summaryDynamicBatchEl = document.getElementById("summary-dynamic-batch-toggle");
+const summaryNowBtn = document.getElementById("summary-now-btn");
+const summaryUndoBtn = document.getElementById("summary-undo-btn");
 const fetchThresholdEl = document.getElementById("fetch-threshold-input");
 const fetchAggressivenessEl = document.getElementById("fetch-aggressiveness-input");
 const ragAutoInjectEl = document.getElementById("rag-auto-inject-toggle");
@@ -54,6 +59,19 @@ const settingsPanel = document.getElementById("settings-panel");
 const settingsOverlay = document.getElementById("settings-overlay");
 const settingsClose = document.getElementById("settings-close");
 const settingsStatus = document.getElementById("settings-status");
+const summaryInspectorBadge = document.getElementById("summary-inspector-badge");
+const summaryInspectorHeadline = document.getElementById("summary-inspector-headline");
+const summaryInspectorCurrent = document.getElementById("summary-inspector-current");
+const summaryInspectorTrigger = document.getElementById("summary-inspector-trigger");
+const summaryInspectorNext = document.getElementById("summary-inspector-next");
+const summaryInspectorGap = document.getElementById("summary-inspector-gap");
+const summaryInspectorCandidates = document.getElementById("summary-inspector-candidates");
+const summaryInspectorEmpty = document.getElementById("summary-inspector-empty");
+const summaryInspectorToolTokens = document.getElementById("summary-inspector-tool-tokens");
+const summaryInspectorOutput = document.getElementById("summary-inspector-output");
+const summaryInspectorDetail = document.getElementById("summary-inspector-detail");
+const summaryInspectorReason = document.getElementById("summary-inspector-reason");
+const summaryInspectorLast = document.getElementById("summary-inspector-last");
 const canvasBtn = document.getElementById("canvas-btn");
 const canvasPanel = document.getElementById("canvas-panel");
 const canvasOverlay = document.getElementById("canvas-overlay");
@@ -109,6 +127,7 @@ let streamingCanvasDocuments = [];
 let canvasHasUnreadUpdates = false;
 let lastCanvasTriggerEl = null;
 let lastExportTriggerEl = null;
+let latestSummaryStatus = null;
 const appSettings = bootstrapData.settings || {};
 const featureFlags = bootstrapData.features || appSettings.features || {};
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
@@ -323,6 +342,15 @@ function renderStreamingMarkdown(text) {
       } else {
         codeFence = fenceMatch[1] || "";
       }
+      continue;
+    }
+
+    const thematicBreakMatch = line.match(/^\s{0,3}(?:-\s*){3,}\s*$|^\s{0,3}(?:\*\s*){3,}\s*$|^\s{0,3}(?:_\s*){3,}\s*$/);
+    if (thematicBreakMatch) {
+      flushParagraph();
+      closeList();
+      flushTable();
+      htmlParts.push("<hr>");
       continue;
     }
 
@@ -1299,6 +1327,7 @@ function renderConversationHistory() {
     emptyState.style.display = "";
     messagesEl.replaceChildren(fragment);
     scrollToBottom();
+    renderSummaryInspector();
     return;
   }
 
@@ -1317,6 +1346,7 @@ function renderConversationHistory() {
   });
   messagesEl.replaceChildren(fragment);
   scrollToBottom();
+  renderSummaryInspector();
 }
 
 function rebuildTokenStatsFromHistory() {
@@ -1386,6 +1416,292 @@ function updateStats(usage) {
 
 function fmt(value) {
   return Number.isFinite(value) ? value.toLocaleString() : "—";
+}
+
+function estimateLocalTokens(text) {
+  const normalized = String(text || "").trim();
+  if (!normalized) {
+    return 0;
+  }
+
+  const words = normalized.split(/\s+/).filter(Boolean).length;
+  const charEstimate = normalized.length / 4;
+  const wordEstimate = words * 1.35;
+  return Math.max(1, Math.round(Math.max(charEstimate, wordEstimate)));
+}
+
+function getSummaryModeValue() {
+  return String(summaryModeEl?.value || appSettings.chat_summary_mode || "auto").trim() || "auto";
+}
+
+function getSummaryTriggerValue() {
+  const rawValue = parseInt(summaryTriggerEl?.value || appSettings.chat_summary_trigger_token_count || 80000, 10);
+  return Number.isFinite(rawValue) ? rawValue : 80000;
+}
+
+function getSummaryBatchValue() {
+  const rawValue = parseInt(summaryBatchEl?.value || appSettings.chat_summary_batch_size || 20, 10);
+  return Number.isFinite(rawValue) ? rawValue : 20;
+}
+
+function getEffectiveSummaryTriggerValue() {
+  const baseTrigger = getSummaryTriggerValue();
+  return getSummaryModeValue() === "aggressive"
+    ? Math.max(1000, Math.floor(baseTrigger / 2))
+    : baseTrigger;
+}
+
+function estimateSummaryTriggerTokens(entries = history) {
+  return (entries || []).reduce((total, entry) => {
+    const role = String(entry?.role || "").trim();
+    if (!role) {
+      return total;
+    }
+    if (role === "assistant" && Array.isArray(entry?.tool_calls) && entry.tool_calls.length > 0) {
+      return total;
+    }
+    if (!["user", "assistant", "tool", "summary"].includes(role)) {
+      return total;
+    }
+    return total + estimateLocalTokens(entry.content);
+  }, 0);
+}
+
+function estimateSummaryTokensByRoles(entries = history, roles = []) {
+  const activeRoles = new Set(Array.isArray(roles) ? roles : []);
+  return (entries || []).reduce((total, entry) => {
+    const role = String(entry?.role || "").trim();
+    if (!activeRoles.has(role)) {
+      return total;
+    }
+    return total + estimateLocalTokens(entry.content);
+  }, 0);
+}
+
+function getSummaryCandidateCount(entries = history) {
+  return (entries || []).filter((entry) => {
+    const role = String(entry?.role || "").trim();
+    if (role === "user") {
+      return true;
+    }
+    if (role !== "assistant") {
+      return false;
+    }
+    return !(Array.isArray(entry?.tool_calls) && entry.tool_calls.length > 0);
+  }).length;
+}
+
+function findLatestSummaryEntry(entries = history) {
+  for (let index = (entries || []).length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    if (entry?.role === "summary") {
+      return entry;
+    }
+  }
+  return null;
+}
+
+function formatSummaryTimestamp(value) {
+  const timestamp = String(value || "").trim();
+  if (!timestamp) {
+    return "—";
+  }
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) {
+    return timestamp;
+  }
+  return date.toLocaleString();
+}
+
+function describeSummaryFailure(status) {
+  const reason = String(status?.reason || "").trim();
+  const stage = String(status?.failure_stage || "").trim();
+  const detail = String(status?.failure_detail || "").trim();
+
+  if (reason === "mode_never") {
+    return "Auto summary is disabled by settings.";
+  }
+  if (reason === "below_threshold") {
+    const tokenGap = Number(status?.token_gap || 0);
+    return tokenGap > 0
+      ? `Below threshold by ${fmt(tokenGap)} counted tokens.`
+      : "Still below the summary trigger threshold.";
+  }
+  if (reason === "no_source_messages") {
+    return "There are no older unsummarized user or assistant messages left to compress.";
+  }
+  if (reason === "no_prompt_messages") {
+    return "Candidate messages existed, but all of them were empty or invalid after prompt sanitization.";
+  }
+  if (reason === "locked") {
+    return "Another summary pass was already running, so this turn skipped a duplicate summary attempt.";
+  }
+  if (reason !== "summary_generation_failed") {
+    return detail || "Waiting for the next completed assistant turn to evaluate summary conditions.";
+  }
+
+  if (stage === "context_too_large") {
+    return "The provider rejected the summary request because the summary prompt itself exceeded the model context limit.";
+  }
+  if (stage === "invalid_message_sequence") {
+    return "The provider rejected the summary prompt because the message sequence was invalid.";
+  }
+  if (stage === "tool_call_unexpected") {
+    return "The model attempted a tool-style response during summary generation, so the result was rejected for safety.";
+  }
+  if (stage === "empty_output") {
+    return "The provider returned no assistant summary content.";
+  }
+  if (stage === "too_short") {
+    return "The provider returned a summary that was too short to keep as reliable compressed context.";
+  }
+  if (stage === "provider_error") {
+    return "The provider returned an error while generating the summary.";
+  }
+  return detail || "The summary attempt failed validation, so no messages were compressed.";
+}
+
+function renderSummaryInspector() {
+  if (!summaryInspectorBadge || !summaryInspectorHeadline) {
+    return;
+  }
+
+  const mode = getSummaryModeValue();
+  const effectiveTrigger = getEffectiveSummaryTriggerValue();
+  const currentEstimate = estimateSummaryTriggerTokens(history);
+  const localCandidateCount = getSummaryCandidateCount(history);
+  const batchSize = getSummaryBatchValue();
+  const latestSummary = findLatestSummaryEntry(history);
+  const lastSummaryMeta = latestSummary?.metadata && typeof latestSummary.metadata === "object"
+    ? latestSummary.metadata
+    : null;
+  const canUndoLatestSummary = Boolean(currentConvId && Number.isInteger(Number(latestSummary?.id)) && lastSummaryMeta?.is_summary);
+  const remaining = Math.max(0, effectiveTrigger - currentEstimate);
+  const overBy = Math.max(0, currentEstimate - effectiveTrigger);
+  const latestServerCheck = Number(latestSummaryStatus?.visible_token_count || 0);
+  const candidateCount = Number(latestSummaryStatus?.candidate_message_count || localCandidateCount);
+  const emptyMessageCount = Number(latestSummaryStatus?.empty_message_count || 0);
+  const returnedTextLength = Number(latestSummaryStatus?.returned_text_length || 0);
+  const serverToolTokens = Number(latestSummaryStatus?.tool_token_count || 0);
+  const toolTokenEstimate = serverToolTokens || estimateSummaryTokensByRoles(history, ["tool"]);
+  const userAssistantTokenEstimate = Number(latestSummaryStatus?.user_assistant_token_count || estimateSummaryTokensByRoles(history, ["user", "assistant"]));
+  const mergedAssistantCount = Number(latestSummaryStatus?.merged_assistant_message_count || 0);
+  const skippedErrorCount = Number(latestSummaryStatus?.skipped_error_message_count || 0);
+  const promptMessageCount = Number(latestSummaryStatus?.prompt_message_count || 0);
+  const usedMaxSteps = Number(latestSummaryStatus?.used_max_steps || 1);
+
+  let badgeTone = "muted";
+  let badgeText = "Waiting";
+  let headline = "Start chatting to see when automatic summary will run.";
+
+  if (mode === "never") {
+    badgeTone = "warning";
+    badgeText = "Disabled";
+    headline = "Auto summary is disabled. Long chats will keep growing until you re-enable it.";
+  } else if (!currentConvId) {
+    badgeTone = "muted";
+    badgeText = "Idle";
+    headline = "Auto summary watches each conversation after messages are saved.";
+  } else if (latestSummaryStatus?.reason === "summary_generation_failed") {
+    badgeTone = "error";
+    badgeText = "Failed";
+    headline = describeSummaryFailure(latestSummaryStatus);
+  } else if (latestSummaryStatus?.reason === "locked") {
+    badgeTone = "warning";
+    badgeText = "Busy";
+    headline = "A summary pass was already in progress for this conversation, so this turn skipped a duplicate run.";
+  } else if (currentEstimate >= effectiveTrigger) {
+    badgeTone = "accent";
+    badgeText = "Ready";
+    headline = "This conversation is large enough for auto summary. The next completed turn can compress older user and assistant messages.";
+  } else if (latestSummary) {
+    badgeTone = "success";
+    badgeText = "Tracked";
+    headline = "This conversation has already been summarized before and is being monitored for the next pass.";
+  } else {
+    badgeTone = "muted";
+    badgeText = "Tracking";
+    headline = `Current conversation is ${fmt(remaining)} estimated tokens below the next auto-summary pass.`;
+  }
+
+  summaryInspectorBadge.dataset.tone = badgeTone;
+  summaryInspectorBadge.textContent = badgeText;
+  summaryInspectorHeadline.textContent = headline;
+  summaryInspectorCurrent.textContent = fmt(currentEstimate);
+  summaryInspectorTrigger.textContent = fmt(effectiveTrigger);
+  summaryInspectorNext.textContent = `${Math.min(candidateCount, batchSize)} / ${fmt(batchSize)} msgs`;
+  summaryInspectorGap.textContent = overBy > 0 ? `${fmt(overBy)} over` : `${fmt(remaining)} left`;
+  if (summaryInspectorCandidates) {
+    summaryInspectorCandidates.textContent = fmt(candidateCount);
+  }
+  if (summaryInspectorEmpty) {
+    summaryInspectorEmpty.textContent = fmt(emptyMessageCount);
+  }
+  if (summaryInspectorToolTokens) {
+    summaryInspectorToolTokens.textContent = fmt(toolTokenEstimate);
+  }
+  if (summaryInspectorOutput) {
+    summaryInspectorOutput.textContent = returnedTextLength > 0 ? `${fmt(returnedTextLength)} chars` : "—";
+  }
+
+  const detailParts = [
+    "Counts user, assistant, tool, and summary history toward the summary trigger, while ignoring assistant tool-call placeholders.",
+    "Does not count runtime system prompt, RAG context, or final-answer instructions.",
+    "Only the oldest unsummarized user and assistant messages are compressed; tool history remains part of the trigger count.",
+  ];
+  if (latestServerCheck > 0) {
+    detailParts.push(`Last server-side check saw ${fmt(latestServerCheck)} counted tokens.`);
+  }
+  if (mergedAssistantCount > 0) {
+    detailParts.push(`Merged ${fmt(mergedAssistantCount)} consecutive assistant blocks before sending the summary prompt.`);
+  }
+  if (skippedErrorCount > 0) {
+    detailParts.push(`Skipped ${fmt(skippedErrorCount)} assistant error placeholders during prompt cleanup.`);
+  }
+  summaryInspectorDetail.textContent = detailParts.join(" ");
+
+  if (summaryInspectorReason) {
+    const reasonParts = [];
+    if (latestSummaryStatus) {
+      reasonParts.push(describeSummaryFailure(latestSummaryStatus));
+      if (promptMessageCount > 0) {
+        reasonParts.push(`Prompt payload used ${fmt(promptMessageCount)} cleaned history messages.`);
+      }
+      if (usedMaxSteps > 0) {
+        reasonParts.push(`Summary generation runs with max_steps=${fmt(usedMaxSteps)}.`);
+      }
+      const failureDetail = String(latestSummaryStatus.failure_detail || "").trim();
+      if (failureDetail && failureDetail !== describeSummaryFailure(latestSummaryStatus)) {
+        reasonParts.push(failureDetail);
+      }
+    } else {
+      reasonParts.push("The latest summary decision will appear here after each completed assistant turn.");
+    }
+    summaryInspectorReason.textContent = reasonParts.join(" ");
+  }
+
+  if (lastSummaryMeta?.is_summary) {
+    const generatedAt = formatSummaryTimestamp(lastSummaryMeta.generated_at);
+    const coveredCount = Number(lastSummaryMeta.covered_message_count || 0);
+    const summaryModel = String(lastSummaryMeta.summary_model || latestSummaryStatus?.summary_model || "—").trim() || "—";
+    summaryInspectorLast.textContent = `Last pass: ${fmt(coveredCount)} messages compressed on ${generatedAt} using ${summaryModel}.`;
+  } else if (latestSummaryStatus?.reason === "summary_generation_failed") {
+    const checkedAt = formatSummaryTimestamp(latestSummaryStatus.checked_at);
+    summaryInspectorLast.textContent = `Last attempt: failed on ${checkedAt}. No messages were deleted because failed summaries are never applied.`;
+  } else if (latestSummaryStatus?.reason === "below_threshold") {
+    summaryInspectorLast.textContent = "No summary pass was needed on the latest turn because the conversation stayed below the trigger.";
+  } else if (latestSummaryStatus?.reason === "mode_never") {
+    summaryInspectorLast.textContent = "No summary pass will run while summary mode is set to Never.";
+  } else {
+    summaryInspectorLast.textContent = "No summary pass has run in this conversation yet.";
+  }
+
+  if (summaryUndoBtn) {
+    summaryUndoBtn.disabled = !canUndoLatestSummary;
+    summaryUndoBtn.title = canUndoLatestSummary
+      ? "Restore the messages covered by the latest summary."
+      : "No summary is available to undo in this conversation.";
+  }
 }
 
 function openStats() {
@@ -1706,6 +2022,7 @@ async function openConversation(id) {
 
   resetTokenStats();
   history = [];
+  latestSummaryStatus = null;
   currentConvId = id;
   currentConvTitle = String(data.conversation?.title || "New Chat").trim() || "New Chat";
   syncModelSelectors(data.conversation.model);
@@ -1737,6 +2054,7 @@ function startNewChat() {
   currentConvId = null;
   currentConvTitle = "New Chat";
   history = [];
+  latestSummaryStatus = null;
   streamingCanvasDocuments = [];
   activeCanvasDocumentId = null;
   clearEditTarget();
@@ -2129,14 +2447,17 @@ maxStepsEl.addEventListener("input", () => {
 
 summaryModeEl.addEventListener("change", () => {
   setSettingsStatus("Unsaved changes", "warning");
+  renderSummaryInspector();
 });
 
 summaryTriggerEl.addEventListener("input", () => {
   setSettingsStatus("Unsaved changes", "warning");
+  renderSummaryInspector();
 });
 
 summaryBatchEl.addEventListener("input", () => {
   setSettingsStatus("Unsaved changes", "warning");
+  renderSummaryInspector();
 });
 
 fetchThresholdEl.addEventListener("input", () => {
@@ -2211,6 +2532,9 @@ function applySettingsToForm() {
   summaryModeEl.value = appSettings.chat_summary_mode || "auto";
   summaryTriggerEl.value = String(appSettings.chat_summary_trigger_token_count || 80000);
   summaryBatchEl.value = String(appSettings.chat_summary_batch_size || 20);
+  if (summarySkipFirstEl) summarySkipFirstEl.value = String(appSettings.summary_skip_first ?? 2);
+  if (summarySkipLastEl) summarySkipLastEl.value = String(appSettings.summary_skip_last ?? 1);
+  if (summaryDynamicBatchEl) summaryDynamicBatchEl.checked = appSettings.summary_dynamic_batch !== false;
   fetchThresholdEl.value = String(appSettings.fetch_url_token_threshold || 3500);
   fetchAggressivenessEl.value = String(appSettings.fetch_url_clip_aggressiveness || 50);
   applySelectedTools(appSettings.active_tools || []);
@@ -2223,6 +2547,7 @@ function applySettingsToForm() {
   updateRagSensitivityHint();
   autoResize(preferencesEl);
   renderScratchpad();
+  renderSummaryInspector();
 }
 
 async function refreshSettings() {
@@ -2239,6 +2564,9 @@ async function refreshSettings() {
     appSettings.chat_summary_mode = data.chat_summary_mode || "auto";
     appSettings.chat_summary_trigger_token_count = data.chat_summary_trigger_token_count || 80000;
     appSettings.chat_summary_batch_size = data.chat_summary_batch_size || 20;
+    appSettings.summary_skip_first = data.summary_skip_first ?? 2;
+    appSettings.summary_skip_last = data.summary_skip_last ?? 1;
+    appSettings.summary_dynamic_batch = data.summary_dynamic_batch !== false;
     appSettings.fetch_url_token_threshold = data.fetch_url_token_threshold || 3500;
     appSettings.fetch_url_clip_aggressiveness = data.fetch_url_clip_aggressiveness ?? 50;
     appSettings.active_tools = Array.isArray(data.active_tools) ? data.active_tools : [];
@@ -2251,8 +2579,10 @@ async function refreshSettings() {
     }
     applySettingsToForm();
     applyFeatureAvailability();
+    renderSummaryInspector();
   } catch (_) {
     renderScratchpad();
+    renderSummaryInspector();
   }
 }
 
@@ -2298,6 +2628,9 @@ async function saveSettings() {
     chat_summary_mode: summaryModeEl.value || "auto",
     chat_summary_trigger_token_count: parseInt(summaryTriggerEl.value, 10) || 80000,
     chat_summary_batch_size: parseInt(summaryBatchEl.value, 10) || 20,
+    summary_skip_first: summarySkipFirstEl ? parseInt(summarySkipFirstEl.value, 10) || 0 : 2,
+    summary_skip_last: summarySkipLastEl ? parseInt(summarySkipLastEl.value, 10) || 0 : 1,
+    summary_dynamic_batch: summaryDynamicBatchEl ? summaryDynamicBatchEl.checked : true,
     fetch_url_token_threshold: parseInt(fetchThresholdEl.value, 10) || 3500,
     fetch_url_clip_aggressiveness: parseInt(fetchAggressivenessEl.value, 10) || 50,
     active_tools: getSelectedTools(),
@@ -2328,6 +2661,9 @@ async function saveSettings() {
     appSettings.chat_summary_mode = data.chat_summary_mode || "auto";
     appSettings.chat_summary_trigger_token_count = data.chat_summary_trigger_token_count || 80000;
     appSettings.chat_summary_batch_size = data.chat_summary_batch_size || 20;
+    appSettings.summary_skip_first = data.summary_skip_first ?? 2;
+    appSettings.summary_skip_last = data.summary_skip_last ?? 1;
+    appSettings.summary_dynamic_batch = data.summary_dynamic_batch !== false;
     appSettings.fetch_url_token_threshold = data.fetch_url_token_threshold || 3500;
     appSettings.fetch_url_clip_aggressiveness = data.fetch_url_clip_aggressiveness ?? 50;
     appSettings.active_tools = Array.isArray(data.active_tools) ? data.active_tools : [];
@@ -2349,6 +2685,103 @@ async function saveSettings() {
 }
 
 settingsSaveBtn.addEventListener("click", saveSettings);
+
+if (summaryNowBtn) {
+  summaryNowBtn.addEventListener("click", async () => {
+    if (!currentConvId) {
+      showToast("No active conversation to summarize.", "warning");
+      return;
+    }
+    summaryNowBtn.disabled = true;
+    summaryNowBtn.textContent = "Summarizing…";
+    try {
+      const response = await fetch(`/api/conversations/${currentConvId}/summarize`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ force: true }),
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || "Failed to summarize.");
+      }
+      if (data.applied) {
+        if (Array.isArray(data.messages)) {
+          history = data.messages.map(normalizeHistoryEntry);
+          rebuildTokenStatsFromHistory();
+          renderConversationHistory();
+        }
+        const coveredCount = Number(data.covered_message_count || 0);
+        showToast(
+          coveredCount > 0
+            ? `${coveredCount} message${coveredCount === 1 ? " was" : "s were"} summarized.`
+            : "Summary completed.",
+          "success"
+        );
+        latestSummaryStatus = { applied: true, reason: "applied", failure_stage: null, failure_detail: "Manual summary completed." };
+      } else {
+        showToast(data.failure_detail || data.reason || "Summary was not applied.", "warning");
+        latestSummaryStatus = { applied: false, reason: data.reason, failure_detail: data.failure_detail };
+      }
+      renderSummaryInspector();
+    } catch (error) {
+      showToast(error.message, "error");
+    } finally {
+      summaryNowBtn.disabled = false;
+      summaryNowBtn.textContent = "Summarize now";
+    }
+  });
+}
+
+if (summaryUndoBtn) {
+  summaryUndoBtn.addEventListener("click", async () => {
+    const latestSummary = findLatestSummaryEntry(history);
+    const summaryId = Number(latestSummary?.id || 0);
+    if (!currentConvId || !summaryId) {
+      showToast("No summary is available to undo.", "warning");
+      return;
+    }
+
+    summaryUndoBtn.disabled = true;
+    summaryUndoBtn.textContent = "Restoring…";
+    try {
+      const response = await fetch(`/api/conversations/${currentConvId}/summaries/${summaryId}/undo`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || "Failed to undo summary.");
+      }
+
+      if (Array.isArray(data.messages)) {
+        history = data.messages.map(normalizeHistoryEntry);
+        rebuildTokenStatsFromHistory();
+        renderConversationHistory();
+      }
+
+      latestSummaryStatus = {
+        applied: false,
+        reason: "summary_undone",
+        failure_stage: null,
+        failure_detail: "The latest summary was reverted and the covered messages were restored.",
+      };
+      const restoredCount = Number(data.restored_message_count || 0);
+      showToast(
+        restoredCount > 0
+          ? `${restoredCount} message${restoredCount === 1 ? " was" : "s were"} restored.`
+          : "Summary was undone.",
+        "success"
+      );
+      renderSummaryInspector();
+    } catch (error) {
+      showToast(error.message || "Failed to undo summary.", "error");
+      renderSummaryInspector();
+    } finally {
+      summaryUndoBtn.textContent = "Undo last summary";
+      renderSummaryInspector();
+    }
+  });
+}
 
 inputEl.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey) {
@@ -3655,7 +4088,13 @@ async function sendMessage(options = {}) {
         rebuildTokenStatsFromHistory();
         renderConversationHistory();
         renderCanvasPanel();
+      } else if (event.type === "conversation_summary_status") {
+        latestSummaryStatus = event && typeof event === "object" ? { ...event } : null;
+        renderSummaryInspector();
       } else if (event.type === "conversation_summary_applied") {
+        latestSummaryStatus = event && typeof event === "object"
+          ? { ...event, applied: true, reason: "applied", failure_stage: null, failure_detail: "Summary completed successfully." }
+          : { applied: true, reason: "applied", failure_stage: null, failure_detail: "Summary completed successfully." };
         const coveredCount = Number(event.covered_message_count || 0);
         const mode = String(event.mode || "auto").trim() || "auto";
         const tokenCount = Number(event.visible_token_count || 0);
