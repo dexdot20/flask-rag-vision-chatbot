@@ -112,7 +112,7 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(payload["max_steps"], 5)
         self.assertTrue(payload["rag_auto_inject"])
         self.assertEqual(payload["chat_summary_mode"], "auto")
-        self.assertEqual(payload["chat_summary_trigger_token_count"], 6000)
+        self.assertEqual(payload["chat_summary_trigger_token_count"], 80000)
         self.assertEqual(payload["chat_summary_batch_size"], 20)
         self.assertEqual(payload["fetch_url_token_threshold"], 3500)
         self.assertEqual(payload["fetch_url_clip_aggressiveness"], 50)
@@ -2429,7 +2429,7 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn("tool_result", [event["type"] for event in events])
         self.assertIn({"type": "answer_delta", "text": "Recovered answer"}, events)
 
-    def test_run_agent_stream_suppresses_native_pre_tool_text_from_answer_and_preserves_history(self):
+    def test_run_agent_stream_streams_native_pre_tool_text_live_and_preserves_history(self):
         captured_calls = []
 
         def fake_create(model, messages, stream, stream_options=None, tools=None, tool_choice=None):
@@ -2463,7 +2463,7 @@ class AppRoutesTestCase(unittest.TestCase):
 
         answer_texts = [event["text"] for event in events if event["type"] == "answer_delta"]
         combined_answer = "".join(answer_texts)
-        self.assertNotIn("Okay, I will check now.", combined_answer)
+        self.assertIn("Okay, I will check now.", combined_answer)
         self.assertIn("Here is the result.", combined_answer)
 
         self.assertGreaterEqual(len(captured_calls), 2, "Expected at least 2 model calls")
@@ -2474,6 +2474,37 @@ class AppRoutesTestCase(unittest.TestCase):
             len(pre_tool_contents) > 0,
             "Pre-tool narrative text must be injected as an assistant message for the next turn",
         )
+
+    def test_run_agent_stream_emits_short_pre_tool_text_without_waiting_for_threshold(self):
+        responses = [
+            iter(
+                [
+                    self._stream_chunk(content="Hi"),
+                    self._tool_call_chunk("search_web", {"queries": ["test"]}),
+                    self._stream_chunk(
+                        usage=SimpleNamespace(prompt_tokens=5, completion_tokens=20, total_tokens=25)
+                    ),
+                ]
+            ),
+            iter(
+                [
+                    self._stream_chunk(content="Final answer."),
+                    self._stream_chunk(
+                        usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5, total_tokens=15)
+                    ),
+                ]
+            ),
+        ]
+
+        with patch("agent.client.chat.completions.create", side_effect=responses), patch(
+            "agent.search_web_tool",
+            return_value=[{"title": "R", "url": "https://example.com", "snippet": "S"}],
+        ):
+            events = list(run_agent_stream([{"role": "user", "content": "Test"}], "deepseek-chat", 2, ["search_web"]))
+
+        answer_deltas = [event["text"] for event in events if event["type"] == "answer_delta"]
+        self.assertEqual(answer_deltas[0], "Hi")
+        self.assertIn("Final answer.", answer_deltas)
 
     def test_run_agent_stream_streams_plain_answer_chunks_live(self):
         responses = [
@@ -2867,6 +2898,74 @@ class AppRoutesTestCase(unittest.TestCase):
         )
         self.assertEqual(visible_rows[1]["content"], '{"ok":true}')
         self.assertEqual(deleted_count, 5)
+
+    def test_chat_summary_rejects_error_summary_without_deleting_messages(self):
+        conversation_id = self._create_conversation()
+        dense_message = " ".join(["history"] * 120)
+        save_app_settings(
+            {
+                "user_preferences": "",
+                "max_steps": "1",
+                "active_tools": "[]",
+                "rag_auto_inject": "false",
+                "chat_summary_mode": "auto",
+                "chat_summary_trigger_token_count": "1000",
+                "chat_summary_batch_size": "5",
+            }
+        )
+
+        with get_db() as conn:
+            for index in range(12):
+                conn.execute(
+                    "INSERT INTO messages (conversation_id, role, content, metadata) VALUES (?, 'user', ?, ?)",
+                    (conversation_id, f"Seed {index + 1} {dense_message}", None),
+                )
+
+        failing_summary = {
+            "content": FINAL_ANSWER_ERROR_TEXT,
+            "reasoning_content": "",
+            "usage": None,
+            "tool_results": [],
+            "errors": [FINAL_ANSWER_ERROR_TEXT],
+        }
+        fake_events = iter(
+            [
+                {"type": "answer_start"},
+                {"type": "answer_delta", "text": "Live answer"},
+                {"type": "tool_capture", "tool_results": []},
+                {"type": "done"},
+            ]
+        )
+
+        with patch("routes.chat.collect_agent_response", return_value=failing_summary), patch(
+            "routes.chat.run_agent_stream", return_value=fake_events
+        ), patch("routes.chat.sync_conversations_to_rag_safe"):
+            response = self.client.post(
+                "/chat",
+                json={
+                    "conversation_id": conversation_id,
+                    "model": "deepseek-chat",
+                    "user_content": f"Latest {dense_message}",
+                    "messages": [{"role": "user", "content": f"Latest {dense_message}"}],
+                },
+            )
+            events = [json.loads(line) for line in response.get_data(as_text=True).strip().splitlines()]
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(any(event["type"] == "conversation_summary_applied" for event in events))
+
+        with get_db() as conn:
+            visible_rows = conn.execute(
+                "SELECT role FROM messages WHERE conversation_id = ? AND deleted_at IS NULL ORDER BY position, id",
+                (conversation_id,),
+            ).fetchall()
+            deleted_count = conn.execute(
+                "SELECT COUNT(*) AS count FROM messages WHERE conversation_id = ? AND deleted_at IS NOT NULL",
+                (conversation_id,),
+            ).fetchone()["count"]
+
+        self.assertEqual(deleted_count, 0)
+        self.assertEqual([row["role"] for row in visible_rows][-2:], ["user", "assistant"])
 
     def test_chat_can_create_multiple_summary_passes_without_resummarizing_old_ones(self):
         conversation_id = self._create_conversation()

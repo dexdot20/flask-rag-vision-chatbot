@@ -8,7 +8,7 @@ from threading import Lock
 
 from flask import Response, jsonify, request, stream_with_context
 
-from agent import collect_agent_response, run_agent_stream
+from agent import FINAL_ANSWER_ERROR_TEXT, FINAL_ANSWER_MISSING_TEXT, collect_agent_response, run_agent_stream
 from canvas_service import (
     create_canvas_document,
     create_canvas_runtime_state,
@@ -159,7 +159,8 @@ def build_summary_prompt_messages(source_messages: list[dict], user_preferences:
         "Preserve user goals, constraints, important facts, decisions, promises, unresolved questions, names, numbers, and preferences that later turns may rely on. "
         "Prefer short paragraphs or a few compact bullets. If helpful, start with a one-line overview, then include only the most useful follow-up details. "
         "Do not mention tool internals unless they materially affect future replies. "
-        "Do not use markdown headings, tables, or code fences. Return only the summary text."
+        "Do not use markdown headings, tables, or code fences. "
+        "You MUST NOT call any tools or functions. Respond only with plain text. Return only the summary text."
     )
     user_pref_text = (user_preferences or "").strip()
     if user_pref_text:
@@ -202,6 +203,7 @@ def maybe_create_conversation_summary(
     settings: dict,
     fetch_url_token_threshold: int,
     fetch_url_clip_aggressiveness: int,
+    exclude_message_ids: set[int] | None = None,
 ) -> dict:
     summary_lock = _get_summary_lock(conversation_id)
     if not summary_lock.acquire(blocking=False):
@@ -233,6 +235,11 @@ def maybe_create_conversation_summary(
             }
 
         source_messages = get_unsummarized_visible_messages(canonical_messages, limit=batch_size)
+        if exclude_message_ids:
+            source_messages = [
+                m for m in source_messages
+                if int(m.get("id") or 0) not in exclude_message_ids
+            ]
         if not source_messages:
             return {
                 "applied": False,
@@ -247,13 +254,15 @@ def maybe_create_conversation_summary(
         result = collect_agent_response(
             prompt_messages,
             summary_model,
-            1,
+            0,
             [],
             fetch_url_token_threshold=fetch_url_token_threshold,
             fetch_url_clip_aggressiveness=fetch_url_clip_aggressiveness,
         )
         summary_text = (result.get("content") or "").strip()
-        if len(summary_text) < SUMMARY_MIN_TEXT_LENGTH:
+        summary_errors = result.get("errors") or []
+        is_error_text = summary_text.startswith(FINAL_ANSWER_ERROR_TEXT) or summary_text.startswith(FINAL_ANSWER_MISSING_TEXT)
+        if len(summary_text) < SUMMARY_MIN_TEXT_LENGTH or summary_errors or is_error_text:
             return {
                 "applied": False,
                 "messages": canonical_messages,
@@ -862,6 +871,10 @@ def register_chat_routes(app) -> None:
                 ) + "\n"
 
             if conv_id and (persisted_user_message_id is not None or persisted_assistant_message_id is not None):
+                current_turn_ids = {
+                    i for i in [persisted_user_message_id, persisted_assistant_message_id]
+                    if i is not None
+                }
                 summary_future = SUMMARY_EXECUTOR.submit(
                     maybe_create_conversation_summary,
                     conv_id,
@@ -869,6 +882,7 @@ def register_chat_routes(app) -> None:
                     settings,
                     fetch_url_token_threshold,
                     fetch_url_clip_aggressiveness,
+                    current_turn_ids,
                 )
                 yield json.dumps(
                     {

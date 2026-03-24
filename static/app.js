@@ -2209,7 +2209,7 @@ function applySettingsToForm() {
   preferencesEl.value = appSettings.user_preferences || "";
   maxStepsEl.value = String(appSettings.max_steps || 5);
   summaryModeEl.value = appSettings.chat_summary_mode || "auto";
-  summaryTriggerEl.value = String(appSettings.chat_summary_trigger_token_count || 6000);
+  summaryTriggerEl.value = String(appSettings.chat_summary_trigger_token_count || 80000);
   summaryBatchEl.value = String(appSettings.chat_summary_batch_size || 20);
   fetchThresholdEl.value = String(appSettings.fetch_url_token_threshold || 3500);
   fetchAggressivenessEl.value = String(appSettings.fetch_url_clip_aggressiveness || 50);
@@ -2237,7 +2237,7 @@ async function refreshSettings() {
     appSettings.scratchpad = data.scratchpad || "";
     appSettings.max_steps = data.max_steps || 5;
     appSettings.chat_summary_mode = data.chat_summary_mode || "auto";
-    appSettings.chat_summary_trigger_token_count = data.chat_summary_trigger_token_count || 6000;
+    appSettings.chat_summary_trigger_token_count = data.chat_summary_trigger_token_count || 80000;
     appSettings.chat_summary_batch_size = data.chat_summary_batch_size || 20;
     appSettings.fetch_url_token_threshold = data.fetch_url_token_threshold || 3500;
     appSettings.fetch_url_clip_aggressiveness = data.fetch_url_clip_aggressiveness ?? 50;
@@ -2296,7 +2296,7 @@ async function saveSettings() {
     user_preferences: preferencesEl.value.trim(),
     max_steps: parseInt(maxStepsEl.value, 10) || 5,
     chat_summary_mode: summaryModeEl.value || "auto",
-    chat_summary_trigger_token_count: parseInt(summaryTriggerEl.value, 10) || 6000,
+    chat_summary_trigger_token_count: parseInt(summaryTriggerEl.value, 10) || 80000,
     chat_summary_batch_size: parseInt(summaryBatchEl.value, 10) || 20,
     fetch_url_token_threshold: parseInt(fetchThresholdEl.value, 10) || 3500,
     fetch_url_clip_aggressiveness: parseInt(fetchAggressivenessEl.value, 10) || 50,
@@ -2326,7 +2326,7 @@ async function saveSettings() {
     appSettings.scratchpad = data.scratchpad || "";
     appSettings.max_steps = data.max_steps || 5;
     appSettings.chat_summary_mode = data.chat_summary_mode || "auto";
-    appSettings.chat_summary_trigger_token_count = data.chat_summary_trigger_token_count || 6000;
+    appSettings.chat_summary_trigger_token_count = data.chat_summary_trigger_token_count || 80000;
     appSettings.chat_summary_batch_size = data.chat_summary_batch_size || 20;
     appSettings.fetch_url_token_threshold = data.fetch_url_token_threshold || 3500;
     appSettings.fetch_url_clip_aggressiveness = data.fetch_url_clip_aggressiveness ?? 50;
