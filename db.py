@@ -4,26 +4,36 @@ import json
 import os
 import sqlite3
 from pathlib import Path
+from typing import Iterable
 from uuid import uuid4
 
 from flask import current_app, has_app_context
 
+from canvas_service import extract_canvas_documents
 from config import (
     CACHE_TTL_HOURS,
     CHAT_SUMMARY_BATCH_SIZE,
-    CHAT_SUMMARY_TRIGGER_MESSAGE_COUNT,
+    CHAT_SUMMARY_ALLOWED_MODES,
+    CHAT_SUMMARY_MODE,
+    CHAT_SUMMARY_TRIGGER_TOKEN_COUNT,
     CONTENT_MAX_CHARS,
     DB_PATH,
     DEFAULT_ACTIVE_TOOL_NAMES,
     DEFAULT_SETTINGS,
-    FETCH_SUMMARY_TOKEN_THRESHOLD,
+    DOCUMENT_STORAGE_DIR,
     FETCH_RAW_TOOL_RESULT_MAX_TEXT_CHARS,
+    FETCH_SUMMARY_TOKEN_THRESHOLD,
     IMAGE_STORAGE_DIR,
     MAX_SCRATCHPAD_LENGTH,
+    RAG_CONTEXT_SIZE_PRESETS,
+    RAG_DEFAULT_CONTEXT_SIZE_PRESET,
+    RAG_DEFAULT_SENSITIVITY_PRESET,
     RAG_ENABLED,
+    RAG_SENSITIVITY_PRESETS,
     RAG_TOOL_RESULT_MAX_TEXT_CHARS,
     RAG_TOOL_RESULT_SUMMARY_MAX_CHARS,
 )
+from token_utils import estimate_text_tokens
 
 _db_path = DB_PATH
 MESSAGE_USAGE_BREAKDOWN_KEYS = (
@@ -55,8 +65,10 @@ def get_db():
     db_dir = os.path.dirname(db_path)
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
@@ -84,6 +96,7 @@ def init_db() -> None:
                 prompt_tokens     INTEGER,
                 completion_tokens INTEGER,
                 total_tokens      INTEGER,
+                deleted_at        TEXT,
                 created_at        TEXT    NOT NULL DEFAULT (datetime('now')),
                 FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
             );
@@ -133,8 +146,22 @@ def init_db() -> None:
                    )
                  WHERE id = NEW.id;
             END;
+            CREATE TABLE IF NOT EXISTS file_assets (
+                file_id          TEXT PRIMARY KEY,
+                conversation_id  INTEGER NOT NULL,
+                message_id       INTEGER,
+                filename         TEXT NOT NULL,
+                mime_type        TEXT NOT NULL,
+                storage_path     TEXT NOT NULL,
+                extracted_text   TEXT,
+                created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
+                FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE SET NULL
+            );
             CREATE INDEX IF NOT EXISTS idx_image_assets_conversation_created
             ON image_assets(conversation_id, created_at, image_id);
+            CREATE INDEX IF NOT EXISTS idx_file_assets_conversation_created
+            ON file_assets(conversation_id, created_at, file_id);
             """
         )
 
@@ -179,11 +206,22 @@ def ensure_messages_position_column() -> None:
         )
 
 
+def ensure_messages_deleted_at_column() -> None:
+    with get_db() as conn:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
+        if "deleted_at" not in columns:
+            conn.execute("ALTER TABLE messages ADD COLUMN deleted_at TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_conversation_deleted_position ON messages(conversation_id, deleted_at, position, id)"
+        )
+
+
 def initialize_database() -> None:
     init_db()
     ensure_messages_metadata_column()
     ensure_messages_tool_history_columns()
     ensure_messages_position_column()
+    ensure_messages_deleted_at_column()
 
 
 def _guess_extension_for_mime_type(mime_type: str) -> str:
@@ -389,6 +427,148 @@ def delete_image_asset(image_id: str, conversation_id: int | None = None) -> boo
         except OSError:
             pass
     return True
+
+
+# --- File asset CRUD ---------------------------------------------------
+
+def _guess_extension_for_document_mime(mime_type: str) -> str:
+    normalized = str(mime_type or "").strip().lower()
+    return {
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+        "application/pdf": ".pdf",
+        "text/plain": ".txt",
+        "text/csv": ".csv",
+        "text/markdown": ".md",
+    }.get(normalized, "")
+
+
+def create_file_asset(conversation_id: int, filename: str, mime_type: str, doc_bytes: bytes, extracted_text: str | None = None) -> dict:
+    normalized_filename = os.path.basename(str(filename or "").strip())[:255]
+    normalized_mime_type = str(mime_type or "").strip().lower()[:120]
+    if not conversation_id:
+        raise ValueError("conversation_id is required to persist a file.")
+    if not normalized_filename:
+        raise ValueError("filename is required.")
+    if not doc_bytes:
+        raise ValueError("doc_bytes is required.")
+
+    file_id = uuid4().hex
+    extension = _guess_extension_for_document_mime(normalized_mime_type)
+    relative_path = os.path.join(file_id[:2], f"{file_id}{extension}")
+    absolute_path = os.path.join(DOCUMENT_STORAGE_DIR, relative_path)
+    os.makedirs(os.path.dirname(absolute_path), exist_ok=True)
+
+    with open(absolute_path, "wb") as handle:
+        handle.write(doc_bytes)
+
+    with get_db() as conn:
+        conn.execute(
+            """INSERT INTO file_assets (
+                   file_id, conversation_id, filename, mime_type, storage_path, extracted_text
+               ) VALUES (?, ?, ?, ?, ?, ?)""",
+            (file_id, conversation_id, normalized_filename, normalized_mime_type, absolute_path, extracted_text),
+        )
+        row = conn.execute(
+            """SELECT file_id, conversation_id, message_id, filename, mime_type,
+                      storage_path, extracted_text, created_at
+               FROM file_assets WHERE file_id = ?""",
+            (file_id,),
+        ).fetchone()
+    return _file_asset_row_to_dict(row)
+
+
+def update_file_asset(file_id: str, *, message_id: int | None = None) -> dict | None:
+    normalized_id = str(file_id or "").strip()
+    if not normalized_id:
+        return None
+    assignments = []
+    params = []
+    if message_id is not None:
+        assignments.append("message_id = ?")
+        params.append(int(message_id))
+    if assignments:
+        with get_db() as conn:
+            conn.execute(
+                f"UPDATE file_assets SET {', '.join(assignments)} WHERE file_id = ?",
+                (*params, normalized_id),
+            )
+    return get_file_asset(normalized_id)
+
+
+def _file_asset_row_to_dict(row) -> dict | None:
+    if not row:
+        return None
+    return {
+        "file_id": row["file_id"],
+        "conversation_id": row["conversation_id"],
+        "message_id": row["message_id"],
+        "filename": row["filename"],
+        "mime_type": row["mime_type"],
+        "storage_path": row["storage_path"],
+        "extracted_text": row["extracted_text"],
+        "created_at": row["created_at"],
+    }
+
+
+def get_file_asset(file_id: str, conversation_id: int | None = None) -> dict | None:
+    normalized_id = str(file_id or "").strip()
+    if not normalized_id:
+        return None
+    query = (
+        "SELECT file_id, conversation_id, message_id, filename, mime_type, storage_path, extracted_text, created_at "
+        "FROM file_assets WHERE file_id = ?"
+    )
+    params = [normalized_id]
+    if conversation_id is not None:
+        query += " AND conversation_id = ?"
+        params.append(int(conversation_id))
+    with get_db() as conn:
+        row = conn.execute(query, tuple(params)).fetchone()
+    return _file_asset_row_to_dict(row)
+
+
+def delete_file_asset(file_id: str, conversation_id: int | None = None) -> bool:
+    asset = get_file_asset(file_id, conversation_id=conversation_id)
+    if not asset:
+        return False
+    with get_db() as conn:
+        conn.execute("DELETE FROM file_assets WHERE file_id = ?", (asset["file_id"],))
+    storage_path = str(asset.get("storage_path") or "").strip()
+    if storage_path:
+        try:
+            os.remove(storage_path)
+        except (FileNotFoundError, OSError):
+            pass
+    return True
+
+
+def delete_conversation_file_assets(conversation_id: int) -> list[str]:
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT storage_path FROM file_assets WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchall()
+        conn.execute("DELETE FROM file_assets WHERE conversation_id = ?", (conversation_id,))
+
+    deleted_paths = []
+    for row in rows:
+        storage_path = str(row["storage_path"] or "").strip()
+        if not storage_path:
+            continue
+        try:
+            os.remove(storage_path)
+            deleted_paths.append(storage_path)
+        except (FileNotFoundError, OSError):
+            continue
+        parent = Path(storage_path).parent
+        root = Path(DOCUMENT_STORAGE_DIR)
+        while parent != root and parent.exists():
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+            parent = parent.parent
+    return deleted_paths
 
 
 def parse_message_metadata(raw_metadata) -> dict:
@@ -773,11 +953,21 @@ def serialize_message_metadata(metadata: dict | None) -> str | None:
         "covers_to_position",
         "covered_message_count",
         "trigger_threshold",
+        "trigger_token_count",
+        "visible_token_count",
         "summary_batch_size",
     ):
         normalized = _coerce_non_negative_int(metadata.get(key))
         if normalized is not None:
             cleaned[key] = normalized
+
+    summary_mode = str(metadata.get("summary_mode") or "").strip().lower()
+    if summary_mode in CHAT_SUMMARY_ALLOWED_MODES:
+        cleaned["summary_mode"] = summary_mode
+
+    summary_model = str(metadata.get("summary_model") or "").strip()
+    if summary_model:
+        cleaned["summary_model"] = summary_model[:120]
 
     covered_message_ids = metadata.get("covered_message_ids")
     if isinstance(covered_message_ids, list):
@@ -809,6 +999,28 @@ def serialize_message_metadata(metadata: dict | None) -> str | None:
     if clarification_response:
         cleaned["clarification_response"] = clarification_response
 
+    canvas_documents = extract_canvas_documents(metadata)
+    if canvas_documents or metadata.get("canvas_cleared") is True:
+        cleaned["canvas_documents"] = canvas_documents
+    if metadata.get("canvas_cleared") is True:
+        cleaned["canvas_cleared"] = True
+
+    file_id = (metadata.get("file_id") or "").strip()
+    file_name = (metadata.get("file_name") or "").strip()
+    file_mime_type = (metadata.get("file_mime_type") or "").strip()
+    file_context_block = (metadata.get("file_context_block") or "").strip()
+
+    if file_id:
+        cleaned["file_id"] = file_id[:64]
+    if file_name:
+        cleaned["file_name"] = file_name[:255]
+    if file_mime_type:
+        cleaned["file_mime_type"] = file_mime_type[:120]
+    if metadata.get("file_text_truncated") is True:
+        cleaned["file_text_truncated"] = True
+    if file_context_block:
+        cleaned["file_context_block"] = file_context_block[:CONTENT_MAX_CHARS]
+
     if not cleaned:
         return None
     return json.dumps(cleaned, ensure_ascii=False)
@@ -837,6 +1049,7 @@ def message_row_to_dict(row) -> dict:
         "completion_tokens": row["completion_tokens"],
         "total_tokens": row["total_tokens"],
         "usage": usage,
+        "deleted_at": row["deleted_at"] if "deleted_at" in row_keys else None,
     }
 
 
@@ -1000,17 +1213,56 @@ def get_rag_auto_inject_enabled(settings: dict | None = None) -> bool:
     return str(raw_value).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def get_chat_summary_trigger_message_count(settings: dict | None = None) -> int:
+def get_rag_sensitivity(settings: dict | None = None) -> str:
     source = settings if settings is not None else get_app_settings()
-    raw_value = source.get(
-        "chat_summary_trigger_message_count",
-        DEFAULT_SETTINGS["chat_summary_trigger_message_count"],
-    )
+    raw_value = str(source.get("rag_sensitivity", DEFAULT_SETTINGS["rag_sensitivity"]) or "").strip().lower()
+    if raw_value in RAG_SENSITIVITY_PRESETS:
+        return raw_value
+    return RAG_DEFAULT_SENSITIVITY_PRESET
+
+
+def get_rag_context_size(settings: dict | None = None) -> str:
+    source = settings if settings is not None else get_app_settings()
+    raw_value = str(source.get("rag_context_size", DEFAULT_SETTINGS["rag_context_size"]) or "").strip().lower()
+    if raw_value in RAG_CONTEXT_SIZE_PRESETS:
+        return raw_value
+    return RAG_DEFAULT_CONTEXT_SIZE_PRESET
+
+
+def get_rag_auto_inject_top_k(settings: dict | None = None) -> int:
+    return int(RAG_CONTEXT_SIZE_PRESETS[get_rag_context_size(settings)])
+
+
+def get_tool_memory_auto_inject_enabled(settings: dict | None = None) -> bool:
+    if not RAG_ENABLED:
+        return False
+    source = settings if settings is not None else get_app_settings()
+    raw_value = source.get("tool_memory_auto_inject", DEFAULT_SETTINGS["tool_memory_auto_inject"])
+    return str(raw_value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def get_chat_summary_mode(settings: dict | None = None) -> str:
+    source = settings if settings is not None else get_app_settings()
+    raw_value = str(source.get("chat_summary_mode", DEFAULT_SETTINGS["chat_summary_mode"]) or "").strip().lower()
+    if raw_value in CHAT_SUMMARY_ALLOWED_MODES:
+        return raw_value
+    fallback = CHAT_SUMMARY_MODE if CHAT_SUMMARY_MODE in CHAT_SUMMARY_ALLOWED_MODES else "auto"
+    return fallback
+
+
+def get_chat_summary_trigger_token_count(settings: dict | None = None) -> int:
+    source = settings if settings is not None else get_app_settings()
+    raw_value = source.get("chat_summary_trigger_token_count")
+    if raw_value in (None, ""):
+        raw_value = source.get(
+            "chat_summary_trigger_message_count",
+            DEFAULT_SETTINGS["chat_summary_trigger_token_count"],
+        )
     try:
         value = int(raw_value)
     except (TypeError, ValueError):
-        value = CHAT_SUMMARY_TRIGGER_MESSAGE_COUNT
-    return max(10, min(500, value))
+        value = CHAT_SUMMARY_TRIGGER_TOKEN_COUNT
+    return max(1_000, min(200_000, value))
 
 
 def get_chat_summary_batch_size(settings: dict | None = None) -> int:
@@ -1067,8 +1319,6 @@ def insert_message(
 ) -> int:
     normalized_role = str(role or "").strip()
     normalized_content = content if isinstance(content, str) else str(content or "")
-    if position is None:
-        position = get_next_message_position(conn, conversation_id)
     cursor = conn.execute(
         """INSERT INTO messages (
                conversation_id, position, role, content, metadata, tool_calls, tool_call_id,
@@ -1090,48 +1340,71 @@ def insert_message(
     return int(cursor.lastrowid)
 
 
-def get_conversation_message_rows(conn: sqlite3.Connection, conversation_id: int) -> list[sqlite3.Row]:
-    return conn.execute(
+def get_conversation_message_rows(
+    conn: sqlite3.Connection,
+    conversation_id: int,
+    include_deleted: bool = False,
+) -> list[sqlite3.Row]:
+    query = (
         """SELECT id, position, role, content, metadata, tool_calls, tool_call_id,
-                  prompt_tokens, completion_tokens, total_tokens
+                  prompt_tokens, completion_tokens, total_tokens, deleted_at
            FROM messages
-           WHERE conversation_id = ?
-           ORDER BY position, id""",
-        (conversation_id,),
-    ).fetchall()
+           WHERE conversation_id = ?"""
+    )
+    params: list[object] = [conversation_id]
+    if not include_deleted:
+        query += " AND deleted_at IS NULL"
+    query += " ORDER BY position, id"
+    return conn.execute(query, tuple(params)).fetchall()
 
 
-def get_conversation_messages(conversation_id: int) -> list[dict]:
+def get_conversation_messages(conversation_id: int, include_deleted: bool = False) -> list[dict]:
     with get_db() as conn:
-        rows = get_conversation_message_rows(conn, conversation_id)
+        rows = get_conversation_message_rows(conn, conversation_id, include_deleted=include_deleted)
     return [message_row_to_dict(row) for row in rows]
 
 
-def count_unsummarized_visible_messages(messages: list[dict]) -> int:
-    count = 0
+def soft_delete_messages(
+    conn: sqlite3.Connection,
+    conversation_id: int,
+    message_ids: Iterable[int],
+    deleted_at: str,
+) -> None:
+    normalized_ids = [int(message_id) for message_id in message_ids if int(message_id) > 0]
+    if not normalized_ids:
+        return
+    placeholders = ", ".join("?" for _ in normalized_ids)
+    conn.execute(
+        f"UPDATE messages SET deleted_at = ? WHERE conversation_id = ? AND id IN ({placeholders}) AND deleted_at IS NULL",
+        (deleted_at, conversation_id, *normalized_ids),
+    )
+
+
+def count_visible_message_tokens(messages: list[dict]) -> int:
+    total = 0
     for message in messages:
         if not isinstance(message, dict):
             continue
         role = str(message.get("role") or "").strip()
-        if role not in VISIBLE_CHAT_ROLES:
+        if role not in VISIBLE_CHAT_ROLES or role == "summary":
             continue
-        metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
-        if metadata.get("is_summary") is True or role == "summary":
-            continue
-        count += 1
-    return count
+        total += estimate_text_tokens(str(message.get("content") or ""))
+    return total
 
 
 def get_unsummarized_visible_messages(messages: list[dict], limit: int | None = None) -> list[dict]:
     selected = []
-    for message in messages:
+    ordered_messages = sorted(
+        (message for message in messages if isinstance(message, dict)),
+        key=lambda message: (int(message.get("position") or 0), int(message.get("id") or 0)),
+    )
+    for message in ordered_messages:
         if not isinstance(message, dict):
             continue
         role = str(message.get("role") or "").strip()
         if role not in VISIBLE_CHAT_ROLES:
             continue
-        metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
-        if metadata.get("is_summary") is True or role == "summary":
+        if role == "summary":
             continue
         selected.append(message)
         if limit is not None and len(selected) >= limit:

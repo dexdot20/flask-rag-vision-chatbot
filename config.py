@@ -67,6 +67,17 @@ OCR_ALLOWED_IMAGE_TYPES = {
     "image/jpeg",
     "image/webp",
 }
+
+DOCUMENT_ALLOWED_MIME_TYPES = {
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/pdf",
+    "text/plain",
+    "text/csv",
+    "text/markdown",
+}
+DOCUMENT_MAX_BYTES = 20 * 1024 * 1024
+DOCUMENT_MAX_TEXT_CHARS = 50_000
+DOCUMENT_STORAGE_DIR = (os.getenv("DOCUMENT_STORAGE_DIR") or os.path.join(BASE_DIR, "data", "documents")).strip()
 OCR_ATTENTION_IMPL = (os.getenv("QWEN_VL_ATTENTION") or "").strip() or None
 OCR_MAX_NEW_TOKENS = max(128, min(4096, _parse_int_env("QWEN_VL_MAX_NEW_TOKENS", 768)))
 OCR_MIN_PIXELS = max(28 * 28, _parse_int_env("QWEN_VL_MIN_PIXELS", 256 * 28 * 28))
@@ -88,8 +99,11 @@ FETCH_SUMMARY_MAX_CHARS = max(2000, min(CONTENT_MAX_CHARS, _parse_int_env("FETCH
 FETCH_SUMMARY_GENERAL_TOP_K = max(1, min(6, _parse_int_env("FETCH_SUMMARY_GENERAL_TOP_K", 3)))
 FETCH_SUMMARY_QUERY_TOP_K = max(1, min(8, _parse_int_env("FETCH_SUMMARY_QUERY_TOP_K", 4)))
 FETCH_SUMMARY_EXCERPT_MAX_CHARS = max(200, min(1200, _parse_int_env("FETCH_SUMMARY_EXCERPT_MAX_CHARS", 500)))
-CHAT_SUMMARY_TRIGGER_MESSAGE_COUNT = max(10, min(500, _parse_int_env("CHAT_SUMMARY_TRIGGER_MESSAGE_COUNT", 40)))
+CHAT_SUMMARY_TRIGGER_TOKEN_COUNT = max(1_000, min(200_000, _parse_int_env("CHAT_SUMMARY_TRIGGER_TOKEN_COUNT", 6_000)))
 CHAT_SUMMARY_BATCH_SIZE = max(5, min(100, _parse_int_env("CHAT_SUMMARY_BATCH_SIZE", 20)))
+CHAT_SUMMARY_MODE = (os.getenv("CHAT_SUMMARY_MODE") or "auto").strip().lower()
+CHAT_SUMMARY_MODEL = (os.getenv("CHAT_SUMMARY_MODEL") or "deepseek-chat").strip() or "deepseek-chat"
+CHAT_SUMMARY_ALLOWED_MODES = {"auto", "never", "aggressive"}
 
 DEFAULT_ACTIVE_TOOL_NAMES = [
     "append_scratchpad",
@@ -97,10 +111,16 @@ DEFAULT_ACTIVE_TOOL_NAMES = [
     "ask_clarifying_question",
     "image_explain",
     "search_knowledge_base",
+    "search_tool_memory",
     "search_web",
     "fetch_url",
     "search_news_ddgs",
     "search_news_google",
+    "create_canvas_document",
+    "rewrite_canvas_document",
+    "replace_canvas_lines",
+    "insert_canvas_lines",
+    "delete_canvas_lines",
 ]
 
 PRIVATE_NETWORKS = [
@@ -122,10 +142,21 @@ RAG_AUTO_INJECT_TOP_K = max(1, min(8, _parse_int_env("RAG_AUTO_INJECT_TOP_K", 5)
 RAG_SEARCH_DEFAULT_TOP_K = max(1, min(12, _parse_int_env("RAG_SEARCH_DEFAULT_TOP_K", 5)))
 RAG_AUTO_INJECT_THRESHOLD = max(0.0, min(1.0, _parse_float_env("RAG_AUTO_INJECT_THRESHOLD", 0.35)))
 RAG_SEARCH_MIN_SIMILARITY = max(0.0, min(1.0, _parse_float_env("RAG_SEARCH_MIN_SIMILARITY", 0.2)))
+RAG_SENSITIVITY_PRESETS = {
+    "flexible": 0.20,
+    "normal": 0.35,
+    "strict": 0.55,
+}
+RAG_CONTEXT_SIZE_PRESETS = {
+    "small": 2,
+    "medium": 5,
+    "large": 8,
+}
 RAG_SOURCE_CONVERSATION = "conversation"
 RAG_SOURCE_TOOL_RESULT = "tool_result"
-RAG_SUPPORTED_SOURCE_TYPES = {RAG_SOURCE_CONVERSATION, RAG_SOURCE_TOOL_RESULT}
-RAG_SUPPORTED_CATEGORIES = {RAG_SOURCE_CONVERSATION, RAG_SOURCE_TOOL_RESULT}
+RAG_SOURCE_TOOL_MEMORY = "tool_memory"
+RAG_SUPPORTED_SOURCE_TYPES = {RAG_SOURCE_CONVERSATION, RAG_SOURCE_TOOL_RESULT, RAG_SOURCE_TOOL_MEMORY}
+RAG_SUPPORTED_CATEGORIES = {RAG_SOURCE_CONVERSATION, RAG_SOURCE_TOOL_RESULT, RAG_SOURCE_TOOL_MEMORY}
 RAG_TOOL_RESULT_MAX_TEXT_CHARS = 12_000
 RAG_TOOL_RESULT_SUMMARY_MAX_CHARS = 300
 FETCH_RAW_TOOL_RESULT_MAX_TEXT_CHARS = max(
@@ -137,16 +168,43 @@ RAG_DISABLED_INGEST_ERROR = (
 )
 RAG_DISABLED_FEATURE_ERROR = "RAG is disabled in configuration. Set RAG_ENABLED=true to use it."
 VISION_DISABLED_FEATURE_ERROR = "Vision is disabled in configuration. Set VISION_ENABLED=true to use it."
+
+
+def _nearest_preset_name(value: float, presets: dict[str, float | int], fallback: str) -> str:
+    if fallback not in presets:
+        raise ValueError("Fallback preset must exist.")
+    try:
+        numeric_value = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    return min(presets, key=lambda name: abs(float(presets[name]) - numeric_value))
+
+
+RAG_DEFAULT_SENSITIVITY_PRESET = _nearest_preset_name(
+    RAG_AUTO_INJECT_THRESHOLD,
+    RAG_SENSITIVITY_PRESETS,
+    "normal",
+)
+RAG_DEFAULT_CONTEXT_SIZE_PRESET = _nearest_preset_name(
+    RAG_AUTO_INJECT_TOP_K,
+    RAG_CONTEXT_SIZE_PRESETS,
+    "medium",
+)
+
 DEFAULT_SETTINGS = {
     "user_preferences": "",
     "scratchpad": "",
     "max_steps": "5",
     "active_tools": json.dumps(DEFAULT_ACTIVE_TOOL_NAMES, ensure_ascii=False),
     "rag_auto_inject": "true",
+    "rag_sensitivity": RAG_DEFAULT_SENSITIVITY_PRESET,
+    "rag_context_size": RAG_DEFAULT_CONTEXT_SIZE_PRESET,
+    "tool_memory_auto_inject": "true",
     "fetch_url_token_threshold": str(FETCH_SUMMARY_TOKEN_THRESHOLD),
     "fetch_url_clip_aggressiveness": "50",
-    "chat_summary_trigger_message_count": str(CHAT_SUMMARY_TRIGGER_MESSAGE_COUNT),
+    "chat_summary_trigger_token_count": str(CHAT_SUMMARY_TRIGGER_TOKEN_COUNT),
     "chat_summary_batch_size": str(CHAT_SUMMARY_BATCH_SIZE),
+    "chat_summary_mode": CHAT_SUMMARY_MODE if CHAT_SUMMARY_MODE in CHAT_SUMMARY_ALLOWED_MODES else "auto",
 }
 
 

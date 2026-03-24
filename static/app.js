@@ -13,31 +13,38 @@ const bootstrapData = (() => {
 const messagesEl = document.getElementById("messages");
 const inputEl = document.getElementById("user-input");
 const imageInputEl = document.getElementById("image-input");
+const docInputEl = document.getElementById("doc-input");
 const attachBtn = document.getElementById("attach-btn");
 const attachmentPreviewEl = document.getElementById("attachment-preview");
 const preferencesEl = document.getElementById("preferences-input");
-const scratchpadOutputEl = document.getElementById("scratchpad-output");
-const scratchpadInputEl = document.getElementById("scratchpad-input");
-const scratchpadAdminBlockEl = document.getElementById("scratchpad-admin-block");
+const scratchpadListEl = document.getElementById("scratchpad-list");
+const scratchpadAddBtn = document.getElementById("scratchpad-add-btn");
+const scratchpadCountEl = document.getElementById("scratchpad-count");
 const maxStepsEl = document.getElementById("max-steps-input");
+const summaryModeEl = document.getElementById("summary-mode-select");
 const summaryTriggerEl = document.getElementById("summary-trigger-input");
 const summaryBatchEl = document.getElementById("summary-batch-input");
 const fetchThresholdEl = document.getElementById("fetch-threshold-input");
 const fetchAggressivenessEl = document.getElementById("fetch-aggressiveness-input");
 const ragAutoInjectEl = document.getElementById("rag-auto-inject-toggle");
+const ragInjectOptionsEl = document.getElementById("rag-inject-options");
+const ragSensitivityEl = document.getElementById("rag-sensitivity-select");
+const ragSensitivityHintEl = document.getElementById("rag-sensitivity-hint");
+const ragContextSizeEl = document.getElementById("rag-context-size-select");
+const toolMemoryAutoInjectEl = document.getElementById("tool-memory-auto-inject-toggle");
+const toolMemoryDisabledNoteEl = document.getElementById("tool-memory-disabled-note");
 const toolToggleEls = Array.from(document.querySelectorAll("#tool-toggles input[type='checkbox']"));
 const kbSyncBtn = document.getElementById("kb-sync-btn");
-const kbSyncAllBtn = document.getElementById("kb-sync-all-btn");
 const kbStatusEl = document.getElementById("kb-status");
 const kbDocumentsListEl = document.getElementById("kb-documents-list");
 const cancelBtn = document.getElementById("cancel-btn");
 const settingsBtn = document.getElementById("settings-btn");
+const exportBtn = document.getElementById("export-btn");
 const fixBtn = document.getElementById("fix-btn");
 const sendBtn = document.getElementById("send-btn");
 const settingsSaveBtn = document.getElementById("settings-save-btn");
 const modelSel = document.getElementById("model-select");
 const mobileModelSel = document.getElementById("mobile-model-select");
-const clearBtn = document.getElementById("clear-btn");
 const emptyState = document.getElementById("empty-state");
 const errorArea = document.getElementById("error-area");
 const editBanner = document.getElementById("edit-banner");
@@ -47,6 +54,21 @@ const settingsPanel = document.getElementById("settings-panel");
 const settingsOverlay = document.getElementById("settings-overlay");
 const settingsClose = document.getElementById("settings-close");
 const settingsStatus = document.getElementById("settings-status");
+const canvasBtn = document.getElementById("canvas-btn");
+const canvasPanel = document.getElementById("canvas-panel");
+const canvasOverlay = document.getElementById("canvas-overlay");
+const canvasClose = document.getElementById("canvas-close");
+const canvasSearchInput = document.getElementById("canvas-search-input");
+const canvasSubtitle = document.getElementById("canvas-subtitle");
+const canvasStatus = document.getElementById("canvas-status");
+const canvasEmptyState = document.getElementById("canvas-empty-state");
+const canvasDocumentEl = document.getElementById("canvas-document");
+const canvasDocumentTabsEl = document.getElementById("canvas-document-tabs");
+const canvasCopyBtn = document.getElementById("canvas-copy-btn");
+const canvasDownloadHtmlBtn = document.getElementById("canvas-download-html-btn");
+const canvasDownloadMdBtn = document.getElementById("canvas-download-md-btn");
+const canvasDownloadPdfBtn = document.getElementById("canvas-download-pdf-btn");
+const canvasBtnIndicator = document.getElementById("canvas-btn-indicator");
 const tokensBtn = document.getElementById("tokens-btn");
 const tokensBadge = document.getElementById("tokens-badge");
 const statsPanel = document.getElementById("stats-panel");
@@ -62,25 +84,60 @@ const mobileToolsPanel = document.getElementById("mobile-tools-panel");
 const mobileToolsOverlay = document.getElementById("mobile-tools-overlay");
 const mobileToolsClose = document.getElementById("mobile-tools-close");
 const mobileSettingsBtn = document.getElementById("mobile-settings-btn");
+const mobileExportBtn = document.getElementById("mobile-export-btn");
 const mobileTokensBtn = document.getElementById("mobile-tokens-btn");
-const mobileClearBtn = document.getElementById("mobile-clear-btn");
+const exportPanel = document.getElementById("export-panel");
+const exportOverlay = document.getElementById("export-overlay");
+const exportClose = document.getElementById("export-close");
+const exportSubtitle = document.getElementById("export-subtitle");
+const exportStatus = document.getElementById("export-status");
+const conversationExportMdBtn = document.getElementById("conversation-export-md-btn");
+const conversationExportDocxBtn = document.getElementById("conversation-export-docx-btn");
+const conversationExportPdfBtn = document.getElementById("conversation-export-pdf-btn");
 
 let history = [];
 let isStreaming = false;
 let isFixing = false;
 let currentConvId = null;
+let currentConvTitle = "New Chat";
 let activeAbortController = null;
 let selectedImageFile = null;
+let selectedDocumentFile = null;
 let editingMessageId = null;
+let activeCanvasDocumentId = null;
+let streamingCanvasDocuments = [];
+let canvasHasUnreadUpdates = false;
+let lastCanvasTriggerEl = null;
+let lastExportTriggerEl = null;
 const appSettings = bootstrapData.settings || {};
 const featureFlags = bootstrapData.features || appSettings.features || {};
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const ALLOWED_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
+const MAX_DOCUMENT_BYTES = 20 * 1024 * 1024;
+const ALLOWED_DOCUMENT_TYPES = new Set([
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/pdf",
+  "text/plain",
+  "text/csv",
+  "text/markdown",
+]);
+const DOCUMENT_EXTENSIONS = new Set([".docx", ".pdf", ".txt", ".csv", ".md"]);
+function isDocumentFile(file) {
+  if (ALLOWED_DOCUMENT_TYPES.has(file.type)) return true;
+  const ext = (file.name || "").toLowerCase().match(/\.[^.]+$/);
+  return ext ? DOCUMENT_EXTENSIONS.has(ext[0]) : false;
+}
 const ragDisabledNoteEl = document.getElementById("rag-disabled-note");
 const visionDisabledNoteEl = document.getElementById("vision-disabled-note");
+const RAG_SENSITIVITY_HINTS = {
+  flexible: "Flexible: lower threshold around 0.20, so the system injects broader matches.",
+  normal: "Normal: balanced matching with an approximate threshold of 0.35.",
+  strict: "Strict: higher threshold around 0.55, so only stronger matches are injected.",
+};
 
 const markdownEngine = globalThis.marked || null;
 const sanitizer = globalThis.DOMPurify || null;
+const highlighter = globalThis.hljs || null;
 const SIDEBAR_STORAGE_KEY = "chatbot.sidebarOpen";
 
 if (markdownEngine && typeof markdownEngine.use === "function") {
@@ -88,6 +145,31 @@ if (markdownEngine && typeof markdownEngine.use === "function") {
     breaks: true,
     gfm: true,
   });
+  if (highlighter) {
+    markdownEngine.use({
+      renderer: {
+        // Compatible with both marked v4 (code: string, language: string)
+        // and marked v5+ (code: token object with .text and .lang properties).
+        code(tokenOrCode, languageHint) {
+          const isToken = tokenOrCode !== null && typeof tokenOrCode === "object";
+          const codeText = isToken ? String(tokenOrCode.text || "") : String(tokenOrCode || "");
+          const rawLang = isToken ? (tokenOrCode.lang || null) : (languageHint || null);
+          const lang = rawLang && highlighter.getLanguage(rawLang) ? rawLang : null;
+          let highlighted;
+          try {
+            highlighted = lang
+              ? highlighter.highlight(codeText, { language: lang }).value
+              : highlighter.highlightAuto(codeText).value;
+          } catch (_) {
+            highlighted = escHtml(codeText);
+          }
+          const langClass = lang ? ` language-${lang}` : "";
+          const langLabel = lang ? `<span class="canvas-code-lang">${lang}</span>` : "";
+          return `<pre>${langLabel}<code class="hljs${langClass}">${highlighted}</code></pre>\n`;
+        },
+      },
+    });
+  }
 }
 
 function sanitizeHtml(html) {
@@ -106,9 +188,566 @@ function closeUnclosedCodeFences(text) {
 function renderMarkdown(text) {
   const rawText = closeUnclosedCodeFences(String(text || ""));
   if (markdownEngine && typeof markdownEngine.parse === "function") {
-    return sanitizeHtml(markdownEngine.parse(rawText));
+    try {
+      return sanitizeHtml(markdownEngine.parse(rawText));
+    } catch (_) {
+      // Fall through to plain-text fallback if the markdown engine throws.
+    }
   }
   return sanitizeHtml(escHtml(rawText).replace(/\n/g, "<br>"));
+}
+
+function renderStreamingMarkdown(text) {
+  const rawText = closeUnclosedCodeFences(String(text || ""));
+  const lines = rawText.split("\n");
+  const htmlParts = [];
+  let paragraphLines = [];
+  let listType = null;
+  let codeFence = null;
+  let codeLines = [];
+  let tableHeader = null;
+  let tableAlignments = null;
+  let tableRows = [];
+
+  const splitTableCells = (line) => {
+    const trimmed = String(line || "").trim();
+    if (!trimmed.includes("|")) {
+      return [];
+    }
+    return trimmed
+      .replace(/^\|/, "")
+      .replace(/\|$/, "")
+      .split("|")
+      .map((cell) => cell.trim());
+  };
+
+  const getTableAlignments = (line) => {
+    const cells = splitTableCells(line);
+    if (!cells.length) {
+      return null;
+    }
+
+    const alignments = [];
+    for (const cell of cells) {
+      if (!/^:?-{3,}:?$/.test(cell)) {
+        return null;
+      }
+      if (cell.startsWith(":" ) && cell.endsWith(":")) {
+        alignments.push("center");
+      } else if (cell.endsWith(":")) {
+        alignments.push("right");
+      } else if (cell.startsWith(":")) {
+        alignments.push("left");
+      } else {
+        alignments.push("");
+      }
+    }
+    return alignments;
+  };
+
+  const renderInlineStreamingMarkdown = (value) => {
+    let html = escHtml(String(value || ""));
+    html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
+    html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    html = html.replace(/__([^_]+)__/g, "<strong>$1</strong>");
+    html = html.replace(/\*([^*]+)\*/g, "<em>$1</em>");
+    html = html.replace(/_([^_]+)_/g, "<em>$1</em>");
+    html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+    return html;
+  };
+
+  const flushParagraph = () => {
+    if (!paragraphLines.length) {
+      return;
+    }
+    htmlParts.push(`<p>${paragraphLines.map((line) => renderInlineStreamingMarkdown(line)).join("<br>")}</p>`);
+    paragraphLines = [];
+  };
+
+  const closeList = () => {
+    if (!listType) {
+      return;
+    }
+    htmlParts.push(listType === "ol" ? "</ol>" : "</ul>");
+    listType = null;
+  };
+
+  const flushTable = () => {
+    if (!tableHeader || !tableAlignments) {
+      tableHeader = null;
+      tableAlignments = null;
+      tableRows = [];
+      return;
+    }
+
+    const renderTableCell = (tagName, value, index) => {
+      const alignment = tableAlignments[index] || "";
+      const alignAttr = alignment ? ` style="text-align: ${alignment}"` : "";
+      return `<${tagName}${alignAttr}>${renderInlineStreamingMarkdown(value)}</${tagName}>`;
+    };
+
+    htmlParts.push("<table>");
+    htmlParts.push(`<thead><tr>${tableHeader.map((cell, index) => renderTableCell("th", cell, index)).join("")}</tr></thead>`);
+    if (tableRows.length) {
+      htmlParts.push("<tbody>");
+      for (const row of tableRows) {
+        htmlParts.push(`<tr>${row.map((cell, index) => renderTableCell("td", cell, index)).join("")}</tr>`);
+      }
+      htmlParts.push("</tbody>");
+    }
+    htmlParts.push("</table>");
+    tableHeader = null;
+    tableAlignments = null;
+    tableRows = [];
+  };
+
+  const flushCodeFence = () => {
+    if (!codeFence) {
+      return;
+    }
+    const langClass = codeFence ? ` class="language-${escHtml(codeFence)}"` : "";
+    htmlParts.push(`<pre><code${langClass}>${escHtml(codeLines.join("\n"))}</code></pre>`);
+    codeFence = null;
+    codeLines = [];
+  };
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const fenceMatch = line.match(/^```\s*(\S+)?\s*$/);
+    if (fenceMatch) {
+      flushParagraph();
+      closeList();
+      flushTable();
+      if (codeFence !== null) {
+        flushCodeFence();
+      } else {
+        codeFence = fenceMatch[1] || "";
+      }
+      continue;
+    }
+
+    if (codeFence !== null) {
+      codeLines.push(line);
+      continue;
+    }
+
+    if (!line.trim()) {
+      flushParagraph();
+      closeList();
+      flushTable();
+      continue;
+    }
+
+    if (tableHeader && tableAlignments) {
+      const rowCells = splitTableCells(line);
+      if (rowCells.length) {
+        tableRows.push(rowCells);
+        continue;
+      }
+      flushTable();
+    }
+
+    const nextLine = lines[index + 1] || "";
+    const headerCells = splitTableCells(line);
+    const alignments = getTableAlignments(nextLine);
+    if (headerCells.length >= 2 && alignments && alignments.length === headerCells.length) {
+      flushParagraph();
+      closeList();
+      tableHeader = headerCells;
+      tableAlignments = alignments;
+      tableRows = [];
+      index += 1;
+      continue;
+    }
+
+    const headingMatch = line.match(/^(#{1,6})\s+(.*)$/);
+    if (headingMatch) {
+      flushParagraph();
+      closeList();
+      flushTable();
+      const level = headingMatch[1].length;
+      htmlParts.push(`<h${level}>${renderInlineStreamingMarkdown(headingMatch[2])}</h${level}>`);
+      continue;
+    }
+
+    const unorderedMatch = line.match(/^\s*[-*+]\s+(.*)$/);
+    if (unorderedMatch) {
+      flushParagraph();
+      flushTable();
+      if (listType !== "ul") {
+        closeList();
+        htmlParts.push("<ul>");
+        listType = "ul";
+      }
+      htmlParts.push(`<li>${renderInlineStreamingMarkdown(unorderedMatch[1])}</li>`);
+      continue;
+    }
+
+    const orderedMatch = line.match(/^\s*\d+\.\s+(.*)$/);
+    if (orderedMatch) {
+      flushParagraph();
+      flushTable();
+      if (listType !== "ol") {
+        closeList();
+        htmlParts.push("<ol>");
+        listType = "ol";
+      }
+      htmlParts.push(`<li>${renderInlineStreamingMarkdown(orderedMatch[1])}</li>`);
+      continue;
+    }
+
+    closeList();
+    flushTable();
+    paragraphLines.push(line);
+  }
+
+  flushParagraph();
+  closeList();
+  flushTable();
+  flushCodeFence();
+  return htmlParts.join("");
+}
+
+function getCanvasDocuments(metadata) {
+  if (!metadata || typeof metadata !== "object" || !Array.isArray(metadata.canvas_documents)) {
+    return [];
+  }
+
+  return metadata.canvas_documents
+    .filter((document) => document && typeof document === "object")
+    .map((document) => ({
+      id: String(document.id || "").trim(),
+      title: String(document.title || "Canvas").trim() || "Canvas",
+      format: String(document.format || "markdown").trim() || "markdown",
+      content: String(document.content || ""),
+      line_count: Number.isInteger(Number(document.line_count)) ? Number(document.line_count) : String(document.content || "").split("\n").length,
+      source_message_id: Number.isInteger(Number(document.source_message_id)) ? Number(document.source_message_id) : null,
+    }))
+    .filter((document) => document.id);
+}
+
+function getCanvasDocumentCollection(entries = history) {
+  if (streamingCanvasDocuments.length) {
+    return streamingCanvasDocuments;
+  }
+
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const message = entries[index];
+    if (message?.metadata && message.metadata.canvas_cleared === true) {
+      return [];
+    }
+    const documents = getCanvasDocuments(message?.metadata);
+    if (!documents.length) {
+      continue;
+    }
+    return documents;
+  }
+
+  return [];
+}
+
+function getActiveCanvasDocument(entries = history) {
+  const documents = getCanvasDocumentCollection(entries);
+  if (!documents.length) {
+    return null;
+  }
+
+  const preferredId = String(activeCanvasDocumentId || "").trim();
+  if (preferredId) {
+    const matched = documents.find((document) => document.id === preferredId);
+    if (matched) {
+      return matched;
+    }
+  }
+
+  return documents[documents.length - 1];
+}
+
+function setCanvasStatus(message, tone = "muted") {
+  if (!canvasStatus) {
+    return;
+  }
+  canvasStatus.textContent = String(message || "").trim() || "Canvas idle";
+  canvasStatus.dataset.tone = tone;
+}
+
+function escapeRegExp(text) {
+  return String(text || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function setCanvasAttention(enabled) {
+  canvasHasUnreadUpdates = Boolean(enabled);
+  if (canvasBtnIndicator) {
+    canvasBtnIndicator.hidden = !canvasHasUnreadUpdates;
+  }
+}
+
+function setExportStatus(message, tone = "muted") {
+  if (!exportStatus) {
+    return;
+  }
+  exportStatus.textContent = String(message || "").trim() || "Export idle";
+  exportStatus.dataset.tone = tone;
+}
+
+function updateExportPanel() {
+  if (!exportSubtitle) {
+    return;
+  }
+  exportSubtitle.textContent = currentConvId
+    ? `Current conversation: ${currentConvTitle || `Chat #${currentConvId}`}`
+    : "Open or create a conversation before exporting.";
+}
+
+function isCanvasOpen() {
+  return Boolean(canvasPanel?.classList.contains("open"));
+}
+
+function getCanvasFocusableElements() {
+  if (!canvasPanel) {
+    return [];
+  }
+  return Array.from(
+    canvasPanel.querySelectorAll(
+      'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+    )
+  ).filter((element) => !element.hasAttribute("hidden") && element.getAttribute("aria-hidden") !== "true");
+}
+
+function applyCanvasSearchHighlight(query) {
+  if (!canvasDocumentEl) {
+    return 0;
+  }
+
+  const normalizedQuery = String(query || "").trim();
+  if (!normalizedQuery) {
+    return 0;
+  }
+
+  const pattern = escapeRegExp(normalizedQuery);
+  const selectorMatcher = new RegExp(pattern, "i");
+  const walker = document.createTreeWalker(canvasDocumentEl, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      const parentName = node.parentNode?.nodeName;
+      if (!node.textContent?.trim()) {
+        return NodeFilter.FILTER_REJECT;
+      }
+      if (parentName === "SCRIPT" || parentName === "STYLE" || parentName === "MARK") {
+        return NodeFilter.FILTER_REJECT;
+      }
+      return selectorMatcher.test(node.textContent) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+    },
+  });
+
+  const textNodes = [];
+  let currentNode;
+  while ((currentNode = walker.nextNode())) {
+    textNodes.push(currentNode);
+  }
+
+  let matchCount = 0;
+  textNodes.forEach((textNode) => {
+    const source = textNode.textContent || "";
+    const fragment = document.createDocumentFragment();
+    const highlightMatcher = new RegExp(pattern, "gi");
+    let lastIndex = 0;
+
+    source.replace(highlightMatcher, (matched, offset) => {
+      if (offset > lastIndex) {
+        fragment.appendChild(document.createTextNode(source.slice(lastIndex, offset)));
+      }
+      const mark = document.createElement("mark");
+      mark.textContent = matched;
+      fragment.appendChild(mark);
+      lastIndex = offset + matched.length;
+      matchCount += 1;
+      return matched;
+    });
+
+    if (lastIndex < source.length) {
+      fragment.appendChild(document.createTextNode(source.slice(lastIndex)));
+    }
+
+    textNode.parentNode.replaceChild(fragment, textNode);
+  });
+
+  return matchCount;
+}
+
+function renderCanvasPanel() {
+  if (!canvasDocumentEl || !canvasEmptyState || !canvasSubtitle) {
+    return;
+  }
+
+  const documents = getCanvasDocumentCollection();
+  const activeDocument = getActiveCanvasDocument();
+  const searchTerm = String(canvasSearchInput?.value || "").trim();
+  if (!activeDocument) {
+    canvasSubtitle.textContent = "No canvas document yet.";
+    canvasEmptyState.hidden = false;
+    canvasDocumentEl.hidden = true;
+    canvasDocumentEl.innerHTML = "";
+    if (canvasDocumentTabsEl) {
+      canvasDocumentTabsEl.hidden = true;
+      canvasDocumentTabsEl.innerHTML = "";
+    }
+    if (canvasCopyBtn) {
+      canvasCopyBtn.disabled = true;
+    }
+    if (canvasDownloadHtmlBtn) {
+      canvasDownloadHtmlBtn.disabled = true;
+    }
+    if (canvasDownloadMdBtn) {
+      canvasDownloadMdBtn.disabled = true;
+    }
+    if (canvasDownloadPdfBtn) {
+      canvasDownloadPdfBtn.disabled = true;
+    }
+    return;
+  }
+
+  activeCanvasDocumentId = activeDocument.id;
+  canvasSubtitle.textContent = `${documents.length} doc${documents.length === 1 ? "" : "s"} · ${activeDocument.title} · ${activeDocument.line_count} lines`;
+  canvasEmptyState.hidden = true;
+  canvasDocumentEl.hidden = false;
+  canvasDocumentEl.innerHTML = renderMarkdown(activeDocument.content);
+  if (canvasDocumentTabsEl) {
+    canvasDocumentTabsEl.hidden = documents.length <= 1;
+    canvasDocumentTabsEl.innerHTML = "";
+    documents.forEach((entry) => {
+      const button = globalThis.document.createElement("button");
+      button.type = "button";
+      button.className = `canvas-document-tab${entry.id === activeCanvasDocumentId ? " active" : ""}`;
+      button.textContent = entry.title;
+      button.title = `${entry.title} · ${entry.line_count} lines`;
+      button.addEventListener("click", () => {
+        activeCanvasDocumentId = entry.id;
+        renderCanvasPanel();
+      });
+      canvasDocumentTabsEl.appendChild(button);
+    });
+  }
+  const matchCount = applyCanvasSearchHighlight(searchTerm);
+  if (canvasCopyBtn) {
+    canvasCopyBtn.disabled = false;
+  }
+  if (canvasDownloadHtmlBtn) {
+    canvasDownloadHtmlBtn.disabled = false;
+  }
+  if (canvasDownloadMdBtn) {
+    canvasDownloadMdBtn.disabled = false;
+  }
+  if (canvasDownloadPdfBtn) {
+    canvasDownloadPdfBtn.disabled = false;
+  }
+
+  if (searchTerm) {
+    setCanvasStatus(matchCount ? `${matchCount} match${matchCount === 1 ? "" : "es"} found.` : "No matches found.", matchCount ? "muted" : "warning");
+  }
+}
+
+function openCanvas() {
+  closeMobileTools();
+  closeSettings();
+  closeStats();
+  closeExportPanel();
+  canvasPanel?.classList.add("open");
+  canvasOverlay?.classList.add("open");
+  canvasPanel?.setAttribute("aria-hidden", "false");
+  lastCanvasTriggerEl = document.activeElement instanceof HTMLElement ? document.activeElement : canvasBtn;
+  setCanvasAttention(false);
+  renderCanvasPanel();
+  canvasClose?.focus();
+}
+
+function closeCanvas() {
+  canvasPanel?.classList.remove("open");
+  canvasOverlay?.classList.remove("open");
+  canvasPanel?.setAttribute("aria-hidden", "true");
+  if (lastCanvasTriggerEl && typeof lastCanvasTriggerEl.focus === "function") {
+    lastCanvasTriggerEl.focus();
+  }
+}
+
+function openExportPanel() {
+  closeMobileTools();
+  closeSettings();
+  closeStats();
+  closeCanvas();
+  updateExportPanel();
+  exportPanel?.classList.add("open");
+  exportOverlay?.classList.add("open");
+  exportPanel?.setAttribute("aria-hidden", "false");
+  lastExportTriggerEl = document.activeElement instanceof HTMLElement ? document.activeElement : exportBtn;
+  exportClose?.focus();
+}
+
+function closeExportPanel() {
+  exportPanel?.classList.remove("open");
+  exportOverlay?.classList.remove("open");
+  exportPanel?.setAttribute("aria-hidden", "true");
+  if (lastExportTriggerEl && typeof lastExportTriggerEl.focus === "function") {
+    lastExportTriggerEl.focus();
+  }
+}
+
+async function downloadConversation(format) {
+  if (!currentConvId) {
+    setExportStatus("Conversation is not available yet.", "warning");
+    return;
+  }
+
+  setExportStatus(`Preparing ${format.toUpperCase()} export…`, "muted");
+  try {
+    const response = await fetch(`/api/conversations/${currentConvId}/export?format=${encodeURIComponent(format)}`);
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(payload.error || "Conversation export failed.");
+    }
+
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `${currentConvTitle || "conversation"}.${format}`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+    setExportStatus(`${format.toUpperCase()} download is ready.`, "success");
+  } catch (error) {
+    setExportStatus(error.message || "Conversation export failed.", "danger");
+  }
+}
+
+async function downloadCanvasDocument(format) {
+  const canvasDocument = getActiveCanvasDocument();
+  if (!canvasDocument || !currentConvId) {
+    setCanvasStatus("Canvas document is not available yet.", "warning");
+    return;
+  }
+
+  setCanvasStatus(`Preparing ${format.toUpperCase()} download…`, "muted");
+  try {
+    const response = await fetch(`/api/conversations/${currentConvId}/canvas/export?format=${encodeURIComponent(format)}&document_id=${encodeURIComponent(canvasDocument.id)}`);
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(payload.error || "Canvas export failed.");
+    }
+
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `${canvasDocument.title}.${format}`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+    setCanvasStatus(`${format.toUpperCase()} download is ready.`, "success");
+  } catch (error) {
+    setCanvasStatus(error.message || "Canvas export failed.", "danger");
+  }
 }
 
 function renderBubbleWithCursor(bubbleEl, text) {
@@ -116,33 +755,26 @@ function renderBubbleWithCursor(bubbleEl, text) {
     return;
   }
 
+  bubbleEl.classList.add("streaming-text");
+
+  const cursorMarker = "\uE000STREAMCURSOR\uE001";
+  let html = renderStreamingMarkdown(text + cursorMarker);
+
+  html = html.replace(
+    cursorMarker,
+    '<span class="stream-cursor">▋</span>'
+  );
+
+  bubbleEl.innerHTML = html;
+}
+
+function renderBubbleMarkdown(bubbleEl, text) {
+  if (!bubbleEl) {
+    return;
+  }
+
+  bubbleEl.classList.remove("streaming-text");
   bubbleEl.innerHTML = renderMarkdown(text);
-  bubbleEl.querySelectorAll(".stream-cursor").forEach((node) => node.remove());
-
-  const cursor = document.createElement("span");
-  cursor.className = "stream-cursor";
-  cursor.textContent = "▋";
-
-  let lastNode = bubbleEl.lastChild;
-  while (lastNode && lastNode.lastChild) {
-    if (lastNode.nodeType === Node.ELEMENT_NODE) {
-      const tag = lastNode.tagName.toLowerCase();
-      if (['hr', 'br', 'img', 'area', 'base', 'col', 'embed', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr'].includes(tag)) {
-        break;
-      }
-    }
-    lastNode = lastNode.lastChild;
-  }
-
-  if (lastNode && lastNode.nodeType === Node.ELEMENT_NODE && lastNode.tagName.toLowerCase() === "br") {
-    lastNode.parentNode.insertBefore(cursor, lastNode);
-  } else if (lastNode && lastNode.nodeType === Node.ELEMENT_NODE) {
-    lastNode.appendChild(cursor);
-  } else if (lastNode && lastNode.parentNode) {
-    lastNode.parentNode.insertBefore(cursor, lastNode.nextSibling);
-  } else {
-    bubbleEl.appendChild(cursor);
-  }
 }
 
 const INPUT_BREAKDOWN_ORDER = [
@@ -360,23 +992,27 @@ function buildAssistantMetadata({
   tool_trace = null,
   toolResults = [],
   tool_results = null,
+  canvasDocuments = [],
+  canvas_documents = null,
   usage = null,
   pendingClarification = null,
   pending_clarification = null,
 } = {}) {
   const normalizedToolTrace = Array.isArray(tool_trace) ? tool_trace : toolTrace;
   const normalizedToolResults = Array.isArray(tool_results) ? tool_results : toolResults;
+  const normalizedCanvasDocuments = Array.isArray(canvas_documents) ? canvas_documents : canvasDocuments;
   const normalizedPendingClarification = pending_clarification && typeof pending_clarification === "object"
     ? pending_clarification
     : pendingClarification && typeof pendingClarification === "object"
       ? pendingClarification
       : null;
 
-  return reasoning || usage || normalizedToolResults.length || normalizedToolTrace.length || normalizedPendingClarification
+  return reasoning || usage || normalizedToolResults.length || normalizedToolTrace.length || normalizedCanvasDocuments.length || normalizedPendingClarification
     ? {
         ...(reasoning ? { reasoning_content: reasoning } : {}),
         ...(normalizedToolTrace.length ? { tool_trace: normalizedToolTrace } : {}),
         ...(normalizedToolResults.length ? { tool_results: normalizedToolResults } : {}),
+        ...(normalizedCanvasDocuments.length ? { canvas_documents: normalizedCanvasDocuments } : {}),
         ...(normalizedPendingClarification ? { pending_clarification: normalizedPendingClarification } : {}),
         ...(usage ? { usage } : {}),
       }
@@ -408,20 +1044,25 @@ function normalizeClarificationQuestion(question, index) {
     options: [],
   };
 
-  if (Array.isArray(question.options)) {
-    normalized.options = question.options
-      .filter((option) => option && typeof option === "object")
-      .map((option) => ({
-        label: String(option.label || option.value || "").trim(),
-        value: String(option.value || option.label || "").trim(),
-        description: String(option.description || "").trim(),
-      }))
-      .filter((option) => option.label && option.value);
-  }
-
-  if (["single_select", "multi_select"].includes(inputType) && !normalized.options.length) {
-    return null;
-  }
+  const rawOptions = Array.isArray(question.options) ? question.options : [];
+  normalized.options = rawOptions
+    .map((option) => {
+      if (!option || typeof option !== "object") {
+        return null;
+      }
+      const optionLabel = String(option.label || option.value || "").trim();
+      const optionValue = String(option.value || option.label || "").trim();
+      const optionDescription = String(option.description || "").trim();
+      if (!optionLabel || !optionValue) {
+        return null;
+      }
+      return {
+        label: optionLabel,
+        value: optionValue,
+        ...(optionDescription ? { description: optionDescription } : {}),
+      };
+    })
+    .filter(Boolean);
 
   return normalized;
 }
@@ -627,6 +1268,29 @@ function createMessageActions(messageId) {
   return actions;
 }
 
+function createAssistantCanvasActions(metadata) {
+  const documents = getCanvasDocuments(metadata);
+  if (!documents.length) {
+    return null;
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "msg-actions";
+
+  const openBtn = document.createElement("button");
+  openBtn.type = "button";
+  openBtn.className = "msg-action-btn";
+  openBtn.textContent = "Open canvas";
+  openBtn.addEventListener("click", () => {
+    activeCanvasDocumentId = documents[documents.length - 1].id;
+    openCanvas();
+    setCanvasStatus("Canvas ready.", "muted");
+  });
+
+  actions.appendChild(openBtn);
+  return actions;
+}
+
 function renderConversationHistory() {
   const fragment = document.createDocumentFragment();
   fragment.appendChild(emptyState);
@@ -683,7 +1347,7 @@ function createAssistantStreamingGroup() {
 
   const asstBubble = document.createElement("div");
   asstBubble.className = "bubble thinking cursor";
-  asstBubble.textContent = "Thinking…";
+  asstBubble.textContent = "Working...";
 
   asstGroup.appendChild(metaRow);
   asstGroup.appendChild(stepLog);
@@ -727,6 +1391,8 @@ function fmt(value) {
 function openStats() {
   closeMobileTools();
   closeSettings();
+  closeCanvas();
+  closeExportPanel();
   statsPanel.classList.add("open");
   statsOverlay.classList.add("open");
 }
@@ -739,6 +1405,8 @@ function closeStats() {
 function openSettings() {
   closeMobileTools();
   closeStats();
+  closeCanvas();
+  closeExportPanel();
   settingsPanel.classList.add("open");
   settingsOverlay.classList.add("open");
   void refreshSettings();
@@ -752,6 +1420,8 @@ function closeSettings() {
 function openMobileTools() {
   closeSettings();
   closeStats();
+  closeCanvas();
+  closeExportPanel();
   mobileToolsPanel?.classList.add("open");
   mobileToolsOverlay?.classList.add("open");
   mobileToolsBtn?.setAttribute("aria-expanded", "true");
@@ -817,14 +1487,6 @@ function updateSidebarToggleLabel(isOpen) {
   }
   sidebarToggleBtn.setAttribute("aria-expanded", String(Boolean(isOpen)));
   sidebarToggleBtn.title = isOpen ? "Hide conversations" : "Show conversations";
-  const labelEl = sidebarToggleBtn.querySelector(".sidebar-toggle__label");
-  const iconEl = sidebarToggleBtn.querySelector(".sidebar-toggle__icon");
-  if (labelEl) {
-    labelEl.textContent = isOpen ? "Conversations" : "Open conversations";
-  }
-  if (iconEl) {
-    iconEl.textContent = isOpen ? "☰" : "☰";
-  }
 }
 
 function setSidebarOpen(isOpen, persist = true) {
@@ -852,6 +1514,63 @@ statsOverlay.addEventListener("click", closeStats);
 settingsBtn.addEventListener("click", openSettings);
 settingsClose.addEventListener("click", closeSettings);
 settingsOverlay.addEventListener("click", closeSettings);
+if (canvasBtn) {
+  canvasBtn.addEventListener("click", openCanvas);
+}
+if (canvasClose) {
+  canvasClose.addEventListener("click", closeCanvas);
+}
+if (canvasOverlay) {
+  canvasOverlay.addEventListener("click", closeCanvas);
+}
+if (exportBtn) {
+  exportBtn.addEventListener("click", openExportPanel);
+}
+if (mobileExportBtn) {
+  mobileExportBtn.addEventListener("click", openExportPanel);
+}
+if (exportClose) {
+  exportClose.addEventListener("click", closeExportPanel);
+}
+if (exportOverlay) {
+  exportOverlay.addEventListener("click", closeExportPanel);
+}
+if (conversationExportMdBtn) {
+  conversationExportMdBtn.addEventListener("click", () => downloadConversation("md"));
+}
+if (conversationExportDocxBtn) {
+  conversationExportDocxBtn.addEventListener("click", () => downloadConversation("docx"));
+}
+if (conversationExportPdfBtn) {
+  conversationExportPdfBtn.addEventListener("click", () => downloadConversation("pdf"));
+}
+if (canvasCopyBtn) {
+  canvasCopyBtn.addEventListener("click", async () => {
+    const document = getActiveCanvasDocument();
+    if (!document || !navigator.clipboard) {
+      setCanvasStatus("Clipboard is not available.", "warning");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(document.content || "");
+      setCanvasStatus("Canvas copied to clipboard.", "success");
+    } catch (_) {
+      setCanvasStatus("Copy failed.", "danger");
+    }
+  });
+}
+if (canvasDownloadHtmlBtn) {
+  canvasDownloadHtmlBtn.addEventListener("click", () => downloadCanvasDocument("html"));
+}
+if (canvasDownloadMdBtn) {
+  canvasDownloadMdBtn.addEventListener("click", () => downloadCanvasDocument("md"));
+}
+if (canvasDownloadPdfBtn) {
+  canvasDownloadPdfBtn.addEventListener("click", () => downloadCanvasDocument("pdf"));
+}
+if (canvasSearchInput) {
+  canvasSearchInput.addEventListener("input", () => renderCanvasPanel());
+}
 if (sidebarToggleBtn) {
   sidebarToggleBtn.addEventListener("click", toggleSidebar);
 }
@@ -885,12 +1604,6 @@ if (mobileTokensBtn) {
     closeMobileTools();
   });
 }
-if (mobileClearBtn) {
-  mobileClearBtn.addEventListener("click", () => {
-    startNewChat();
-    closeMobileTools();
-  });
-}
 if (modelSel) {
   modelSel.addEventListener("change", () => syncModelSelectors(modelSel.value));
 }
@@ -907,9 +1620,37 @@ window.addEventListener("resize", () => {
 
 window.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
+    if (isCanvasOpen()) {
+      if (canvasSearchInput?.value) {
+        canvasSearchInput.value = "";
+        renderCanvasPanel();
+        setCanvasStatus("Canvas search cleared.", "muted");
+      } else {
+        closeCanvas();
+      }
+      return;
+    }
     if (mobileToolsPanel?.classList.contains("open")) {
       closeMobileTools();
       return;
+    }
+  }
+  if (event.key === "Tab" && isCanvasOpen()) {
+    const focusable = getCanvasFocusableElements();
+    if (!focusable.length) {
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    const activeElement = document.activeElement;
+    if (event.shiftKey && activeElement === first) {
+      event.preventDefault();
+      last.focus();
+      return;
+    }
+    if (!event.shiftKey && activeElement === last) {
+      event.preventDefault();
+      first.focus();
     }
   }
   if (event.key === "Escape" && !document.body.classList.contains("sidebar-collapsed") && isMobileViewport()) {
@@ -926,6 +1667,9 @@ async function loadSidebar() {
     return;
   }
   list.forEach((conversation) => {
+    if (conversation.id === currentConvId) {
+      currentConvTitle = String(conversation.title || "New Chat").trim() || "New Chat";
+    }
     const item = document.createElement("div");
     item.className = "sidebar-item" + (conversation.id === currentConvId ? " active" : "");
     item.dataset.id = conversation.id;
@@ -963,11 +1707,16 @@ async function openConversation(id) {
   resetTokenStats();
   history = [];
   currentConvId = id;
+  currentConvTitle = String(data.conversation?.title || "New Chat").trim() || "New Chat";
   syncModelSelectors(data.conversation.model);
   clearEditTarget();
 
   history = Array.isArray(data.messages) ? data.messages.map(normalizeHistoryEntry) : [];
+  streamingCanvasDocuments = [];
+  activeCanvasDocumentId = getActiveCanvasDocument(history)?.id || null;
   renderConversationHistory();
+  renderCanvasPanel();
+  updateExportPanel();
   rebuildTokenStatsFromHistory();
 
   loadSidebar();
@@ -986,11 +1735,16 @@ async function deleteConversation(id) {
 
 function startNewChat() {
   currentConvId = null;
+  currentConvTitle = "New Chat";
   history = [];
+  streamingCanvasDocuments = [];
+  activeCanvasDocumentId = null;
   clearEditTarget();
   clearSelectedImage();
   resetTokenStats();
   renderConversationHistory();
+  renderCanvasPanel();
+  updateExportPanel();
   errorArea.innerHTML = "";
   loadSidebar();
   inputEl.focus();
@@ -1166,17 +1920,22 @@ function ensureToolStepSection(stepLog, stepSections, step, maxSteps) {
 
 function createToolStepItem(toolName) {
   const config = getToolUiConfig(toolName);
-  const item = document.createElement("div");
+  const item = document.createElement("details");
   item.className = "step-item step-running";
+  item.open = true;
   item.innerHTML = [
-    '<div class="step-item-icon"></div>',
-    '<div class="step-item-body">',
-    '  <div class="step-item-top">',
-    '    <span class="step-status-badge"></span>',
-    '    <span class="step-item-label"></span>',
-    '    <span class="step-time"></span>',
+    '<summary class="step-item-summary">',
+    '  <div class="step-item-icon"></div>',
+    '  <div class="step-item-body">',
+    '    <div class="step-item-top">',
+    '      <span class="step-status-badge"></span>',
+    '      <span class="step-item-label"></span>',
+    '      <span class="step-time"></span>',
+    "    </div>",
+    '    <div class="step-title"></div>',
     "  </div>",
-    '  <div class="step-title"></div>',
+    "</summary>",
+    '<div class="step-item-content">',
     '  <div class="step-detail"></div>',
     '  <div class="step-meta"></div>',
     '  <div class="step-summary"></div>',
@@ -1198,6 +1957,7 @@ function setToolStepState(item, payload) {
 
   item.classList.remove("step-running", "step-done", "step-error");
   item.classList.add(`step-${state}`);
+  item.open = state !== "done";
 
   const badge = item.querySelector(".step-status-badge");
   const label = item.querySelector(".step-item-label");
@@ -1234,6 +1994,120 @@ function autoResize(element) {
   element.style.height = element.scrollHeight + "px";
 }
 
+function normalizeScratchpadNote(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function readScratchpadNotesFromList() {
+  if (!scratchpadListEl) {
+    return [];
+  }
+
+  const notes = [];
+  const seen = new Set();
+  for (const input of scratchpadListEl.querySelectorAll(".scratchpad-note-input")) {
+    const note = normalizeScratchpadNote(input.value);
+    if (!note || seen.has(note)) {
+      continue;
+    }
+    seen.add(note);
+    notes.push(note);
+  }
+
+  return notes;
+}
+
+function updateScratchpadCount() {
+  if (!scratchpadCountEl) {
+    return;
+  }
+
+  const count = readScratchpadNotesFromList().length;
+  scratchpadCountEl.textContent = count === 1 ? "1 note" : `${count} notes`;
+}
+
+function setScratchpadEmptyState() {
+  if (!scratchpadListEl) {
+    return;
+  }
+
+  scratchpadListEl.replaceChildren();
+  const emptyState = document.createElement("div");
+  emptyState.className = "scratchpad-empty-state";
+  emptyState.textContent = "No scratchpad entries yet. Add a note to get started.";
+  scratchpadListEl.append(emptyState);
+  updateScratchpadCount();
+}
+
+function createScratchpadNoteRow(note = "") {
+  const row = document.createElement("div");
+  row.className = "scratchpad-note-row";
+
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "settings-text scratchpad-note-input";
+  input.placeholder = "One durable note";
+  input.value = note;
+  input.addEventListener("input", () => {
+    setSettingsStatus("Unsaved changes", "warning");
+    updateScratchpadCount();
+  });
+
+  const removeBtn = document.createElement("button");
+  removeBtn.type = "button";
+  removeBtn.className = "btn-ghost btn-ghost--danger scratchpad-note-remove";
+  removeBtn.textContent = "Remove";
+  removeBtn.addEventListener("click", () => {
+    row.remove();
+    if (!scratchpadListEl || !scratchpadListEl.querySelector(".scratchpad-note-row")) {
+      setScratchpadEmptyState();
+    } else {
+      updateScratchpadCount();
+    }
+    setSettingsStatus("Unsaved changes", "warning");
+  });
+
+  row.append(input, removeBtn);
+  return row;
+}
+
+function renderScratchpadList(notes) {
+  if (!scratchpadListEl) {
+    return;
+  }
+
+  const noteList = Array.isArray(notes) ? notes : [];
+  scratchpadListEl.replaceChildren();
+
+  if (!noteList.length) {
+    setScratchpadEmptyState();
+    return;
+  }
+
+  for (const note of noteList) {
+    scratchpadListEl.append(createScratchpadNoteRow(note));
+  }
+
+  updateScratchpadCount();
+}
+
+function addScratchpadNote(note = "") {
+  if (!scratchpadListEl) {
+    return;
+  }
+
+  const emptyState = scratchpadListEl.querySelector(".scratchpad-empty-state");
+  if (emptyState) {
+    emptyState.remove();
+  }
+
+  const row = createScratchpadNoteRow(note);
+  scratchpadListEl.append(row);
+  row.querySelector(".scratchpad-note-input")?.focus();
+  updateScratchpadCount();
+  setSettingsStatus("Unsaved changes", "warning");
+}
+
 inputEl.addEventListener("input", () => {
   autoResize(inputEl);
 });
@@ -1243,14 +2117,17 @@ preferencesEl.addEventListener("input", () => {
   autoResize(preferencesEl);
 });
 
-if (scratchpadInputEl) {
-  scratchpadInputEl.addEventListener("input", () => {
-    setSettingsStatus("Unsaved changes", "warning");
-    autoResize(scratchpadInputEl);
+if (scratchpadAddBtn) {
+  scratchpadAddBtn.addEventListener("click", () => {
+    addScratchpadNote();
   });
 }
 
 maxStepsEl.addEventListener("input", () => {
+  setSettingsStatus("Unsaved changes", "warning");
+});
+
+summaryModeEl.addEventListener("change", () => {
   setSettingsStatus("Unsaved changes", "warning");
 });
 
@@ -1274,6 +2151,21 @@ ragAutoInjectEl.addEventListener("change", () => {
   setSettingsStatus("Unsaved changes", "warning");
 });
 
+ragSensitivityEl.addEventListener("change", () => {
+  updateRagSensitivityHint();
+  setSettingsStatus("Unsaved changes", "warning");
+});
+
+ragContextSizeEl.addEventListener("change", () => {
+  setSettingsStatus("Unsaved changes", "warning");
+});
+
+if (toolMemoryAutoInjectEl) {
+  toolMemoryAutoInjectEl.addEventListener("change", () => {
+    setSettingsStatus("Unsaved changes", "warning");
+  });
+}
+
 toolToggleEls.forEach((element) => {
   element.addEventListener("change", () => {
     setSettingsStatus("Unsaved changes", "warning");
@@ -1292,26 +2184,43 @@ function applySelectedTools(selected) {
 }
 
 function renderScratchpad() {
-  if (!scratchpadOutputEl) {
+  if (!scratchpadListEl) {
     return;
   }
-  const scratchpad = String(appSettings.scratchpad || "").trim();
-  scratchpadOutputEl.textContent = scratchpad || "No scratchpad entries yet.";
-  if (scratchpadInputEl) {
-    scratchpadInputEl.value = appSettings.scratchpad || "";
-    autoResize(scratchpadInputEl);
+  const notes = String(appSettings.scratchpad || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .split("\n")
+    .map((line) => normalizeScratchpadNote(line))
+    .filter((line) => line.length > 0);
+
+  renderScratchpadList(notes);
+}
+
+function updateRagSensitivityHint() {
+  if (!ragSensitivityHintEl || !ragSensitivityEl) {
+    return;
   }
+  const sensitivity = ragSensitivityEl.value || "normal";
+  ragSensitivityHintEl.textContent = RAG_SENSITIVITY_HINTS[sensitivity] || RAG_SENSITIVITY_HINTS.normal;
 }
 
 function applySettingsToForm() {
   preferencesEl.value = appSettings.user_preferences || "";
   maxStepsEl.value = String(appSettings.max_steps || 5);
-  summaryTriggerEl.value = String(appSettings.chat_summary_trigger_message_count || 40);
+  summaryModeEl.value = appSettings.chat_summary_mode || "auto";
+  summaryTriggerEl.value = String(appSettings.chat_summary_trigger_token_count || 6000);
   summaryBatchEl.value = String(appSettings.chat_summary_batch_size || 20);
   fetchThresholdEl.value = String(appSettings.fetch_url_token_threshold || 3500);
   fetchAggressivenessEl.value = String(appSettings.fetch_url_clip_aggressiveness || 50);
   applySelectedTools(appSettings.active_tools || []);
   ragAutoInjectEl.checked = Boolean(featureFlags.rag_enabled ? appSettings.rag_auto_inject : false);
+  ragSensitivityEl.value = appSettings.rag_sensitivity || "normal";
+  ragContextSizeEl.value = appSettings.rag_context_size || "medium";
+  if (toolMemoryAutoInjectEl) {
+    toolMemoryAutoInjectEl.checked = Boolean(featureFlags.rag_enabled ? appSettings.tool_memory_auto_inject : false);
+  }
+  updateRagSensitivityHint();
   autoResize(preferencesEl);
   renderScratchpad();
 }
@@ -1327,12 +2236,16 @@ async function refreshSettings() {
     appSettings.user_preferences = data.user_preferences || "";
     appSettings.scratchpad = data.scratchpad || "";
     appSettings.max_steps = data.max_steps || 5;
-    appSettings.chat_summary_trigger_message_count = data.chat_summary_trigger_message_count || 40;
+    appSettings.chat_summary_mode = data.chat_summary_mode || "auto";
+    appSettings.chat_summary_trigger_token_count = data.chat_summary_trigger_token_count || 6000;
     appSettings.chat_summary_batch_size = data.chat_summary_batch_size || 20;
     appSettings.fetch_url_token_threshold = data.fetch_url_token_threshold || 3500;
     appSettings.fetch_url_clip_aggressiveness = data.fetch_url_clip_aggressiveness ?? 50;
     appSettings.active_tools = Array.isArray(data.active_tools) ? data.active_tools : [];
     appSettings.rag_auto_inject = Boolean(data.rag_auto_inject);
+    appSettings.rag_sensitivity = data.rag_sensitivity || "normal";
+    appSettings.rag_context_size = data.rag_context_size || "medium";
+    appSettings.tool_memory_auto_inject = Boolean(data.tool_memory_auto_inject);
     if (data.features && typeof data.features === "object") {
       Object.assign(featureFlags, data.features);
     }
@@ -1346,11 +2259,14 @@ async function refreshSettings() {
 function applyFeatureAvailability() {
   const ragEnabled = Boolean(featureFlags.rag_enabled);
   const visionEnabled = Boolean(featureFlags.vision_enabled);
-  const scratchpadAdminEditing = Boolean(featureFlags.scratchpad_admin_editing);
 
   ragAutoInjectEl.disabled = !ragEnabled;
+  ragSensitivityEl.disabled = !ragEnabled;
+  ragContextSizeEl.disabled = !ragEnabled;
+  if (ragInjectOptionsEl) {
+    ragInjectOptionsEl.classList.toggle("is-disabled", !ragEnabled);
+  }
   kbSyncBtn.disabled = !ragEnabled;
-  kbSyncAllBtn.disabled = !ragEnabled;
   if (ragDisabledNoteEl) {
     ragDisabledNoteEl.hidden = ragEnabled;
   }
@@ -1358,7 +2274,14 @@ function applyFeatureAvailability() {
     setKbStatus("RAG disabled in .env", "warning");
   }
 
-  attachBtn.hidden = !visionEnabled;
+  if (toolMemoryAutoInjectEl) {
+    toolMemoryAutoInjectEl.disabled = !ragEnabled;
+  }
+  if (toolMemoryDisabledNoteEl) {
+    toolMemoryDisabledNoteEl.hidden = ragEnabled;
+  }
+
+  attachBtn.hidden = false;
   imageInputEl.disabled = !visionEnabled;
   if (visionDisabledNoteEl) {
     visionDisabledNoteEl.hidden = visionEnabled;
@@ -1366,29 +2289,24 @@ function applyFeatureAvailability() {
   if (!visionEnabled) {
     clearSelectedImage();
   }
-
-  if (scratchpadAdminBlockEl) {
-    scratchpadAdminBlockEl.hidden = !scratchpadAdminEditing;
-  }
-  if (scratchpadInputEl) {
-    scratchpadInputEl.disabled = !scratchpadAdminEditing;
-  }
 }
 
 async function saveSettings() {
   const payload = {
     user_preferences: preferencesEl.value.trim(),
     max_steps: parseInt(maxStepsEl.value, 10) || 5,
-    chat_summary_trigger_message_count: parseInt(summaryTriggerEl.value, 10) || 40,
+    chat_summary_mode: summaryModeEl.value || "auto",
+    chat_summary_trigger_token_count: parseInt(summaryTriggerEl.value, 10) || 6000,
     chat_summary_batch_size: parseInt(summaryBatchEl.value, 10) || 20,
     fetch_url_token_threshold: parseInt(fetchThresholdEl.value, 10) || 3500,
     fetch_url_clip_aggressiveness: parseInt(fetchAggressivenessEl.value, 10) || 50,
     active_tools: getSelectedTools(),
     rag_auto_inject: featureFlags.rag_enabled ? ragAutoInjectEl.checked : false,
+    rag_sensitivity: ragSensitivityEl.value || "normal",
+    rag_context_size: ragContextSizeEl.value || "medium",
+    tool_memory_auto_inject: featureFlags.rag_enabled && toolMemoryAutoInjectEl ? toolMemoryAutoInjectEl.checked : false,
+    scratchpad: readScratchpadNotesFromList().join("\n"),
   };
-  if (featureFlags.scratchpad_admin_editing && scratchpadInputEl) {
-    payload.scratchpad = scratchpadInputEl.value;
-  }
 
   setSettingsStatus("Saving…");
   settingsSaveBtn.disabled = true;
@@ -1407,12 +2325,16 @@ async function saveSettings() {
     appSettings.user_preferences = data.user_preferences || "";
     appSettings.scratchpad = data.scratchpad || "";
     appSettings.max_steps = data.max_steps || 5;
-    appSettings.chat_summary_trigger_message_count = data.chat_summary_trigger_message_count || 40;
+    appSettings.chat_summary_mode = data.chat_summary_mode || "auto";
+    appSettings.chat_summary_trigger_token_count = data.chat_summary_trigger_token_count || 6000;
     appSettings.chat_summary_batch_size = data.chat_summary_batch_size || 20;
     appSettings.fetch_url_token_threshold = data.fetch_url_token_threshold || 3500;
     appSettings.fetch_url_clip_aggressiveness = data.fetch_url_clip_aggressiveness ?? 50;
     appSettings.active_tools = Array.isArray(data.active_tools) ? data.active_tools : [];
     appSettings.rag_auto_inject = Boolean(data.rag_auto_inject);
+    appSettings.rag_sensitivity = data.rag_sensitivity || "normal";
+    appSettings.rag_context_size = data.rag_context_size || "medium";
+    appSettings.tool_memory_auto_inject = Boolean(data.tool_memory_auto_inject);
     if (data.features && typeof data.features === "object") {
       Object.assign(featureFlags, data.features);
     }
@@ -1458,26 +2380,35 @@ fixBtn.addEventListener("click", () => {
     fixMessage();
   }
 });
-clearBtn.addEventListener("click", startNewChat);
 attachBtn.addEventListener("click", () => {
-  if (!isStreaming && !isFixing && Boolean(featureFlags.vision_enabled)) {
-    imageInputEl.click();
-  }
+  if (isStreaming || isFixing) return;
+  imageInputEl.click();
+});
+
+attachBtn.addEventListener("contextmenu", (e) => {
+  if (isStreaming || isFixing) return;
+  e.preventDefault();
+  docInputEl.click();
 });
 kbSyncBtn.addEventListener("click", syncKnowledgeBaseConversations);
-kbSyncAllBtn.addEventListener("click", syncKnowledgeBaseConversations);
 
 imageInputEl.addEventListener("change", () => {
-  if (!featureFlags.vision_enabled) {
-    clearSelectedImage();
-    return;
-  }
   const file = imageInputEl.files && imageInputEl.files[0];
   if (!file) {
     return;
   }
+  if (isDocumentFile(file)) {
+    imageInputEl.value = "";
+    handleDocumentSelection(file);
+    return;
+  }
+  if (!featureFlags.vision_enabled) {
+    showError("Image uploads are disabled. Only documents can be attached.");
+    clearSelectedImage();
+    return;
+  }
   if (!ALLOWED_IMAGE_TYPES.has(file.type)) {
-    showError("Unsupported image type. Upload PNG, JPG or WEBP.");
+    showError("Unsupported file type. Upload PNG, JPG, WEBP images or DOCX, PDF, TXT, CSV, MD documents.");
     clearSelectedImage();
     return;
   }
@@ -1487,8 +2418,31 @@ imageInputEl.addEventListener("change", () => {
     return;
   }
   selectedImageFile = file;
+  clearSelectedDocument();
   renderAttachmentPreview();
 });
+
+docInputEl.addEventListener("change", () => {
+  const file = docInputEl.files && docInputEl.files[0];
+  if (!file) return;
+  handleDocumentSelection(file);
+});
+
+function handleDocumentSelection(file) {
+  if (!isDocumentFile(file)) {
+    showError("Unsupported document type. Upload DOCX, PDF, TXT, CSV or MD.");
+    clearSelectedDocument();
+    return;
+  }
+  if (file.size > MAX_DOCUMENT_BYTES) {
+    showError("Document is too large. Upload a maximum of 20 MB.");
+    clearSelectedDocument();
+    return;
+  }
+  selectedDocumentFile = file;
+  clearSelectedImage();
+  renderAttachmentPreview();
+}
 
 function resetTokenStats() {
   tokenTurns.length = 0;
@@ -1501,7 +2455,7 @@ function setStreaming(active) {
   cancelBtn.style.display = active ? "" : "none";
   fixBtn.disabled = active;
   inputEl.disabled = active;
-  attachBtn.disabled = active || !Boolean(featureFlags.vision_enabled);
+  attachBtn.disabled = active;
 }
 
 function setFixing(active) {
@@ -1509,14 +2463,18 @@ function setFixing(active) {
   sendBtn.disabled = active;
   fixBtn.disabled = active;
   inputEl.disabled = active;
-  attachBtn.disabled = active || !Boolean(featureFlags.vision_enabled);
+  attachBtn.disabled = active;
 }
 
-function showError(message) {
-  errorArea.innerHTML = `<div class="error-toast">${escHtml(String(message || "An unexpected error occurred."))}</div>`;
+function showToast(message, tone = "error") {
+  errorArea.innerHTML = `<div class="error-toast" data-tone="${escHtml(String(tone || "error"))}">${escHtml(String(message || "An unexpected event occurred."))}</div>`;
   setTimeout(() => {
     errorArea.innerHTML = "";
   }, 5000);
+}
+
+function showError(message) {
+  showToast(message, "error");
 }
 
 function setKbStatus(message, tone = "muted") {
@@ -1607,7 +2565,6 @@ async function syncKnowledgeBaseConversations() {
   }
   setKbStatus("Syncing conversations into RAG…");
   kbSyncBtn.disabled = true;
-  kbSyncAllBtn.disabled = true;
   try {
     const response = await fetch("/api/rag/sync-conversations", {
       method: "POST",
@@ -1624,7 +2581,6 @@ async function syncKnowledgeBaseConversations() {
     setKbStatus(error.message, "error");
   } finally {
     kbSyncBtn.disabled = false;
-    kbSyncAllBtn.disabled = false;
   }
 }
 
@@ -1644,32 +2600,75 @@ function clearSelectedImage() {
   renderAttachmentPreview();
 }
 
+function clearSelectedDocument() {
+  selectedDocumentFile = null;
+  docInputEl.value = "";
+  renderAttachmentPreview();
+}
+
+function clearAllAttachments() {
+  selectedImageFile = null;
+  selectedDocumentFile = null;
+  imageInputEl.value = "";
+  docInputEl.value = "";
+  renderAttachmentPreview();
+}
+
 function renderAttachmentPreview() {
-  if (!selectedImageFile) {
+  if (!selectedImageFile && !selectedDocumentFile) {
     attachmentPreviewEl.hidden = true;
     attachmentPreviewEl.innerHTML = "";
     return;
   }
 
   attachmentPreviewEl.hidden = false;
-  attachmentPreviewEl.innerHTML =
-    `<div class="attachment-chip">` +
-      `<span class="attachment-chip__icon">🖼️</span>` +
-      `<span class="attachment-chip__meta">` +
-        `<strong>${escHtml(selectedImageFile.name)}</strong>` +
-        `<small>Ready for Qwen vision analysis · ${formatFileSize(selectedImageFile.size)}</small>` +
-      `</span>` +
-      `<button type="button" class="attachment-chip__remove" title="Remove image">×</button>` +
-    `</div>`;
 
-  attachmentPreviewEl.querySelector(".attachment-chip__remove").addEventListener("click", clearSelectedImage);
+  if (selectedImageFile) {
+    attachmentPreviewEl.innerHTML =
+      `<div class="attachment-chip">` +
+        `<span class="attachment-chip__icon">🖼️</span>` +
+        `<span class="attachment-chip__meta">` +
+          `<strong>${escHtml(selectedImageFile.name)}</strong>` +
+          `<small>Ready for Qwen vision analysis · ${formatFileSize(selectedImageFile.size)}</small>` +
+        `</span>` +
+        `<button type="button" class="attachment-chip__remove" title="Remove image">×</button>` +
+      `</div>`;
+    attachmentPreviewEl.querySelector(".attachment-chip__remove").addEventListener("click", clearAllAttachments);
+  } else if (selectedDocumentFile) {
+    const ext = (selectedDocumentFile.name || "").split(".").pop().toUpperCase() || "FILE";
+    attachmentPreviewEl.innerHTML =
+      `<div class="attachment-chip">` +
+        `<span class="attachment-chip__icon">📄</span>` +
+        `<span class="attachment-chip__meta">` +
+          `<strong>${escHtml(selectedDocumentFile.name)}</strong>` +
+          `<small>${ext} document · ${formatFileSize(selectedDocumentFile.size)} · Will open in Canvas</small>` +
+        `</span>` +
+        `<button type="button" class="attachment-chip__remove" title="Remove document">×</button>` +
+      `</div>`;
+    attachmentPreviewEl.querySelector(".attachment-chip__remove").addEventListener("click", clearAllAttachments);
+  }
 }
 
 function appendAttachmentBadge(group, metadata) {
   const imageName = metadata && metadata.image_name;
-  if (!imageName) {
+  const fileName = metadata && metadata.file_name;
+  if (!imageName && !fileName) {
     return;
   }
+
+  if (fileName) {
+    const fileId = metadata.file_id ? String(metadata.file_id).trim() : "";
+    const label = fileId ? `${fileName} · ${fileId}` : fileName;
+    const badge = document.createElement("div");
+    badge.className = "message-attachment";
+    badge.innerHTML =
+      `<span class="message-attachment__icon">📄</span>` +
+      `<span class="message-attachment__name">${escHtml(label)}</span>` +
+      `<span class="message-attachment__state">Document uploaded · Canvas</span>`;
+    group.appendChild(badge);
+    return;
+  }
+
   const imageId = metadata && metadata.image_id ? String(metadata.image_id).trim() : "";
   const hasVisionContext = metadata && (metadata.ocr_text || metadata.vision_summary || metadata.assistant_guidance);
   const stateLabel = hasVisionContext ? "Qwen vision context added" : "Image to be processed";
@@ -2110,14 +3109,20 @@ function createMessageGroup(role, text, metadata = null, options = {}) {
   metaRow.appendChild(label);
   if (role === "user" && options.editable) {
     metaRow.appendChild(createMessageActions(options.messageId));
+  } else if (role === "assistant") {
+    const canvasActions = createAssistantCanvasActions(metadata);
+    if (canvasActions) {
+      metaRow.appendChild(canvasActions);
+    }
   }
 
   const bubble = document.createElement("div");
   bubble.className = "bubble";
   const hasImage = Boolean(metadata && metadata.image_name);
-  const displayText = text || (hasImage ? "Image uploaded." : "");
+  const hasDocument = Boolean(metadata && metadata.file_name);
+  const displayText = text || (hasImage ? "Image uploaded." : hasDocument ? "Document uploaded." : "");
 
-  if ((role === "assistant" || role === "summary") && text !== "Thinking…") {
+  if ((role === "assistant" || role === "summary") && text !== "Working…") {
     bubble.innerHTML = renderMarkdown(text);
   } else {
     bubble.textContent = displayText;
@@ -2147,8 +3152,24 @@ function appendGroup(role, text, metadata = null, options = {}) {
   return group;
 }
 
+let scrollToBottomFrame = null;
+
 function scrollToBottom() {
-  messagesEl.scrollTop = messagesEl.scrollHeight;
+  if (scrollToBottomFrame !== null) {
+    return;
+  }
+
+  const flushScroll = () => {
+    scrollToBottomFrame = null;
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  };
+
+  if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
+    scrollToBottomFrame = window.requestAnimationFrame(flushScroll);
+    return;
+  }
+
+  scrollToBottomFrame = window.setTimeout(flushScroll, 16);
 }
 
 async function fixMessage() {
@@ -2195,7 +3216,8 @@ async function sendMessage(options = {}) {
     : null;
   const text = forcedText || inputEl.value.trim();
   const pendingImage = selectedImageFile;
-  if (!text && !pendingImage) {
+  const pendingDocument = selectedDocumentFile;
+  if (!text && !pendingImage && !pendingDocument) {
     return;
   }
 
@@ -2212,7 +3234,7 @@ async function sendMessage(options = {}) {
   errorArea.innerHTML = "";
   inputEl.value = "";
   inputEl.style.height = "auto";
-  clearSelectedImage();
+  clearAllAttachments();
 
   if (!currentConvId) {
     const response = await fetch("/api/conversations", {
@@ -2222,10 +3244,16 @@ async function sendMessage(options = {}) {
     });
     const conversation = await response.json();
     currentConvId = conversation.id;
+    currentConvTitle = String(conversation.title || "New Chat").trim() || "New Chat";
     loadSidebar();
+    updateExportPanel();
   }
 
-  let userMetadata = pendingImage ? { image_name: pendingImage.name } : null;
+  let userMetadata = pendingImage
+    ? { image_name: pendingImage.name }
+    : pendingDocument
+      ? { file_name: pendingDocument.name }
+      : null;
   if (forcedMetadata) {
     userMetadata = {
       ...(userMetadata || {}),
@@ -2245,7 +3273,7 @@ async function sendMessage(options = {}) {
       return;
     }
 
-    if (!pendingImage) {
+    if (!pendingImage && !pendingDocument) {
       userMetadata = editingEntry.metadata || null;
     }
 
@@ -2288,12 +3316,44 @@ async function sendMessage(options = {}) {
   const stepSections = {};
   const assistantTraceByKey = {};
   let latestStepInfo = { step: 1, maxSteps: null };
+  let pendingAnswerRenderFrame = null;
+
+  const scheduleAnswerRender = () => {
+    if (pendingAnswerRenderFrame !== null) {
+      return;
+    }
+
+    const flushRender = () => {
+      pendingAnswerRenderFrame = null;
+      renderBubbleWithCursor(asstBubble, fullAnswer);
+      scrollToBottom();
+    };
+
+    if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
+      pendingAnswerRenderFrame = window.requestAnimationFrame(flushRender);
+      return;
+    }
+
+    pendingAnswerRenderFrame = window.setTimeout(flushRender, 16);
+  };
+
+  const flushAnswerRender = () => {
+    if (pendingAnswerRenderFrame !== null) {
+      if (typeof window !== "undefined" && typeof window.cancelAnimationFrame === "function") {
+        window.cancelAnimationFrame(pendingAnswerRenderFrame);
+      } else {
+        window.clearTimeout(pendingAnswerRenderFrame);
+      }
+      pendingAnswerRenderFrame = null;
+    }
+    renderBubbleWithCursor(asstBubble, fullAnswer);
+  };
 
   try {
     const requestMessages = buildRequestMessagesFromHistory();
 
     let response;
-    if (pendingImage) {
+    if (pendingImage || pendingDocument) {
       const formData = new FormData();
       formData.append("messages", JSON.stringify(requestMessages));
       formData.append("model", modelSel.value);
@@ -2302,7 +3362,12 @@ async function sendMessage(options = {}) {
       if (editedMessageId !== null) {
         formData.append("edited_message_id", String(editedMessageId));
       }
-      formData.append("image", pendingImage);
+      if (pendingImage) {
+        formData.append("image", pendingImage);
+      }
+      if (pendingDocument) {
+        formData.append("document", pendingDocument);
+      }
 
       response = await fetch("/chat", {
         method: "POST",
@@ -2349,6 +3414,18 @@ async function sendMessage(options = {}) {
           };
           updateAttachmentBadge(userGroup, lastMessage.metadata);
           updateVisionDetails(userGroup, lastMessage.metadata);
+        }
+        scrollToBottom();
+      } else if (event.type === "document_processed") {
+        const lastMessage = history[history.length - 1];
+        if (lastMessage && lastMessage.role === "user") {
+          lastMessage.metadata = {
+            ...(lastMessage.metadata || {}),
+            file_id: event.file_id,
+            file_name: event.file_name,
+            file_mime_type: event.file_mime_type,
+          };
+          appendAttachmentBadge(userGroup, lastMessage.metadata);
         }
         scrollToBottom();
       } else if (event.type === "step_update") {
@@ -2509,22 +3586,27 @@ async function sendMessage(options = {}) {
         }
         rawAnswer = syncedAnswer;
         fullAnswer = rawAnswer;
+        if (pendingAnswerRenderFrame !== null) {
+          flushAnswerRender();
+        }
         asstBubble.classList.remove("thinking");
         asstBubble.classList.remove("cursor");
-        asstBubble.innerHTML = renderMarkdown(fullAnswer);
+        renderBubbleMarkdown(asstBubble, fullAnswer);
         scrollToBottom();
       } else if (event.type === "answer_delta") {
         rawAnswer += event.text || "";
         fullAnswer = rawAnswer;
-        renderBubbleWithCursor(asstBubble, fullAnswer);
-        scrollToBottom();
+        scheduleAnswerRender();
       } else if (event.type === "clarification_request") {
         pendingClarification = event.clarification && typeof event.clarification === "object" ? event.clarification : null;
         rawAnswer = String(event.text || "").trim();
         fullAnswer = rawAnswer;
+        if (pendingAnswerRenderFrame !== null) {
+          flushAnswerRender();
+        }
         asstBubble.classList.remove("thinking");
         asstBubble.classList.remove("cursor");
-        asstBubble.innerHTML = renderMarkdown(fullAnswer);
+        renderBubbleMarkdown(asstBubble, fullAnswer);
         scrollToBottom();
       } else if (event.type === "usage") {
         latestUsage = normalizeUsagePayload(event);
@@ -2538,11 +3620,60 @@ async function sendMessage(options = {}) {
           ? event.messages.map(normalizeHistoryEntry).filter((item) => item.role === "assistant" || item.role === "tool")
           : [];
         assistantToolHistory.push(...nextToolHistory);
+      } else if (event.type === "canvas_sync") {
+        streamingCanvasDocuments = Array.isArray(event.documents) ? event.documents.map((document) => ({
+          id: String(document.id || "").trim(),
+          title: String(document.title || "Canvas").trim() || "Canvas",
+          format: String(document.format || "markdown").trim() || "markdown",
+          content: String(document.content || ""),
+          line_count: Number.isInteger(Number(document.line_count)) ? Number(document.line_count) : String(document.content || "").split("\n").length,
+        })).filter((document) => document.id) : [];
+        if (streamingCanvasDocuments.length) {
+          const activeStillExists = streamingCanvasDocuments.some((document) => document.id === activeCanvasDocumentId);
+          activeCanvasDocumentId = activeStillExists
+            ? activeCanvasDocumentId
+            : streamingCanvasDocuments[streamingCanvasDocuments.length - 1].id;
+          renderCanvasPanel();
+          if (event.auto_open && !isCanvasOpen()) {
+            openCanvas();
+            setCanvasStatus("Document opened in Canvas.", "success");
+          } else if (isCanvasOpen()) {
+            setCanvasStatus("Canvas updated.", "success");
+          } else {
+            setCanvasAttention(true);
+            setCanvasStatus("Canvas updated. Open the panel to review.", "success");
+          }
+        } else if (event.cleared) {
+          activeCanvasDocumentId = null;
+          renderCanvasPanel();
+          if (isCanvasOpen()) {
+            closeCanvas();
+          }
+          setCanvasAttention(false);
+          setCanvasStatus("Canvas cleared.", "success");
+        }
       } else if (event.type === "history_sync") {
         receivedHistorySync = true;
         history = Array.isArray(event.messages) ? event.messages.map(normalizeHistoryEntry) : [];
+        streamingCanvasDocuments = [];
+        activeCanvasDocumentId = getActiveCanvasDocument(history)?.id || null;
         rebuildTokenStatsFromHistory();
         renderConversationHistory();
+        renderCanvasPanel();
+      } else if (event.type === "conversation_summary_applied") {
+        const coveredCount = Number(event.covered_message_count || 0);
+        const mode = String(event.mode || "auto").trim() || "auto";
+        const tokenCount = Number(event.visible_token_count || 0);
+        const parts = [
+          coveredCount > 0
+            ? `${coveredCount} older message${coveredCount === 1 ? " was" : "s were"} summarized`
+            : "Conversation summary updated",
+        ];
+        parts.push(`mode: ${mode}`);
+        if (tokenCount > 0) {
+          parts.push(`visible tokens: ${tokenCount}`);
+        }
+        showToast(parts.join(" • "), "success");
       } else if (event.type === "message_ids") {
         persistedMessageIds = event;
       } else if (event.type === "done") {
@@ -2550,8 +3681,11 @@ async function sendMessage(options = {}) {
       }
     });
 
+    if (pendingAnswerRenderFrame !== null) {
+      flushAnswerRender();
+    }
     asstBubble.classList.remove("cursor");
-    asstBubble.innerHTML = renderMarkdown(fullAnswer);
+    renderBubbleMarkdown(asstBubble, fullAnswer);
     const assistantEntry = {
       id: null,
       role: "assistant",
@@ -2561,6 +3695,7 @@ async function sendMessage(options = {}) {
         reasoning: rawReasoning,
         tool_trace: assistantToolTrace,
         tool_results: assistantToolResults,
+        canvas_documents: streamingCanvasDocuments,
         usage: latestUsage,
         pending_clarification: pendingClarification,
       }),
@@ -2578,9 +3713,12 @@ async function sendMessage(options = {}) {
       loadSidebar();
     }
   } catch (error) {
+    if (pendingAnswerRenderFrame !== null) {
+      flushAnswerRender();
+    }
     if (fullAnswer.trim()) {
       asstBubble.classList.remove("cursor");
-      asstBubble.innerHTML = renderMarkdown(fullAnswer);
+      renderBubbleMarkdown(asstBubble, fullAnswer);
 
       const assistantEntry = {
         id: null,
@@ -2591,6 +3729,7 @@ async function sendMessage(options = {}) {
           reasoning: rawReasoning,
           tool_trace: assistantToolTrace,
           tool_results: assistantToolResults,
+          canvas_documents: streamingCanvasDocuments,
           usage: latestUsage,
           pending_clarification: pendingClarification,
         }),
@@ -2643,4 +3782,5 @@ const initialSidebarPref = readSidebarPreference();
 setSidebarOpen(initialSidebarPref === null ? !isMobileViewport() : initialSidebarPref, false);
 syncModelSelectors(modelSel ? modelSel.value : "");
 loadSidebar();
+updateExportPanel();
 loadKnowledgeBaseDocuments();

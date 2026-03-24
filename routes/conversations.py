@@ -1,7 +1,15 @@
 from __future__ import annotations
 
-from flask import jsonify, request
+import re
 
+from flask import Response, jsonify, request
+
+from canvas_service import build_html_download, build_markdown_download, build_pdf_download, find_latest_canvas_document
+from conversation_export import (
+    build_conversation_docx_download,
+    build_conversation_markdown_download,
+    build_conversation_pdf_download,
+)
 from config import (
     AVAILABLE_MODEL_IDS,
     RAG_DISABLED_FEATURE_ERROR,
@@ -11,7 +19,7 @@ from config import (
     RAG_SOURCE_CONVERSATION,
     RAG_SOURCE_TOOL_RESULT,
 )
-from db import delete_conversation_image_assets, get_conversation_message_rows, get_db, message_row_to_dict
+from db import delete_conversation_file_assets, delete_conversation_image_assets, get_conversation_message_rows, get_db, message_row_to_dict
 from rag import delete_source as rag_delete_source
 from rag_service import (
     conversation_rag_source_key,
@@ -21,9 +29,27 @@ from rag_service import (
     get_rag_document_record,
     list_rag_documents_db,
     search_knowledge_base_tool,
+    sync_conversations_to_rag_safe,
     sync_conversations_to_rag,
 )
 from routes.request_utils import normalize_model_id
+
+
+def _sanitize_download_filename(value: str, fallback: str = "canvas") -> str:
+    normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value or "").strip()).strip("-._")
+    return normalized[:80] or fallback
+
+
+def _load_conversation_payload(conv_id: int):
+    with get_db() as conn:
+        conversation = conn.execute(
+            "SELECT * FROM conversations WHERE id = ?",
+            (conv_id,),
+        ).fetchone()
+        if not conversation:
+            return None, None
+        messages = [message_row_to_dict(message) for message in get_conversation_message_rows(conn, conv_id)]
+    return conversation, messages
 
 
 def register_conversation_routes(app) -> None:
@@ -35,7 +61,7 @@ def register_conversation_routes(app) -> None:
                 SELECT c.id, c.title, c.model, c.updated_at,
                        COUNT(m.id) AS message_count
                 FROM conversations c
-                LEFT JOIN messages m ON m.conversation_id = c.id
+                  LEFT JOIN messages m ON m.conversation_id = c.id AND m.deleted_at IS NULL
                 GROUP BY c.id
                 ORDER BY c.updated_at DESC
                 """
@@ -55,28 +81,95 @@ def register_conversation_routes(app) -> None:
                 (title, model),
             )
             conversation_id = cursor.lastrowid
+        if RAG_ENABLED:
+            sync_conversations_to_rag_safe(conversation_id=conversation_id)
         return jsonify({"id": conversation_id, "title": title, "model": model}), 201
 
     @app.route("/api/conversations/<int:conv_id>", methods=["GET"])
     def get_conversation(conv_id):
-        with get_db() as conn:
-            conversation = conn.execute(
-                "SELECT * FROM conversations WHERE id = ?",
-                (conv_id,),
-            ).fetchone()
-            if not conversation:
-                return jsonify({"error": "Not found."}), 404
-            messages = get_conversation_message_rows(conn, conv_id)
+        conversation, messages = _load_conversation_payload(conv_id)
+        if not conversation:
+            return jsonify({"error": "Not found."}), 404
         return jsonify(
             {
                 "conversation": dict(conversation),
-                "messages": [message_row_to_dict(message) for message in messages],
+                "messages": messages,
             }
+        )
+
+    @app.route("/api/conversations/<int:conv_id>/export", methods=["GET"])
+    def export_conversation(conv_id):
+        format_name = str(request.args.get("format") or "md").strip().lower()
+        conversation, messages = _load_conversation_payload(conv_id)
+        if not conversation:
+            return jsonify({"error": "Not found."}), 404
+
+        base_name = _sanitize_download_filename(conversation["title"] or "conversation", fallback="conversation")
+        payload_conversation = dict(conversation)
+        if format_name == "md":
+            payload = build_conversation_markdown_download(payload_conversation, messages)
+            mime_type = "text/markdown; charset=utf-8"
+            filename = f"{base_name}.md"
+        elif format_name == "docx":
+            payload = build_conversation_docx_download(payload_conversation, messages)
+            mime_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            filename = f"{base_name}.docx"
+        elif format_name == "pdf":
+            payload = build_conversation_pdf_download(payload_conversation, messages)
+            mime_type = "application/pdf"
+            filename = f"{base_name}.pdf"
+        else:
+            return jsonify({"error": "format must be md, docx, or pdf."}), 400
+
+        return Response(
+            payload,
+            content_type=mime_type,
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+            },
+        )
+
+    @app.route("/api/conversations/<int:conv_id>/canvas/export", methods=["GET"])
+    def export_canvas_document(conv_id):
+        format_name = str(request.args.get("format") or "md").strip().lower()
+        document_id = str(request.args.get("document_id") or "").strip() or None
+
+        conversation, messages = _load_conversation_payload(conv_id)
+        if not conversation:
+            return jsonify({"error": "Not found."}), 404
+
+        document = find_latest_canvas_document(messages, document_id=document_id)
+        if not document:
+            return jsonify({"error": "Canvas document not found."}), 404
+
+        base_name = _sanitize_download_filename(document.get("title") or conversation["title"] or "canvas")
+        if format_name == "md":
+            payload = build_markdown_download(document)
+            mime_type = "text/markdown; charset=utf-8"
+            filename = f"{base_name}.md"
+        elif format_name == "html":
+            payload = build_html_download(document)
+            mime_type = "text/html; charset=utf-8"
+            filename = f"{base_name}.html"
+        elif format_name == "pdf":
+            payload = build_pdf_download(document)
+            mime_type = "application/pdf"
+            filename = f"{base_name}.pdf"
+        else:
+            return jsonify({"error": "format must be md, html, or pdf."}), 400
+
+        return Response(
+            payload,
+            content_type=mime_type,
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+            },
         )
 
     @app.route("/api/conversations/<int:conv_id>", methods=["DELETE"])
     def delete_conversation(conv_id):
         delete_conversation_image_assets(conv_id)
+        delete_conversation_file_assets(conv_id)
         with get_db() as conn:
             conn.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
         if RAG_ENABLED:
@@ -95,6 +188,8 @@ def register_conversation_routes(app) -> None:
                 "UPDATE conversations SET title = ?, updated_at = datetime('now') WHERE id = ?",
                 (title, conv_id),
             )
+        if RAG_ENABLED:
+            sync_conversations_to_rag_safe(conversation_id=conv_id)
         return jsonify({"id": conv_id, "title": title})
 
     @app.route("/api/rag/documents", methods=["GET"])
@@ -139,7 +234,7 @@ def register_conversation_routes(app) -> None:
 
         try:
             ensure_supported_rag_sources(force=True)
-            synced = sync_conversations_to_rag(conversation_id=conversation_id)
+            synced = sync_conversations_to_rag(conversation_id=conversation_id, force=True)
         except Exception as exc:
             return jsonify({"error": str(exc)}), 500
 

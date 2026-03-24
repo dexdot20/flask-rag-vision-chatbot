@@ -18,8 +18,8 @@ def _resolve_device() -> str:
     requested = (os.getenv("BGE_M3_DEVICE") or "").strip().lower()
     try:
         import torch
-    except Exception:
-        raise RuntimeError("CUDA is required for the RAG embedder, but torch could not be imported.")
+    except Exception as exc:
+        raise RuntimeError("CUDA is required for the RAG embedder, but torch could not be imported.") from exc
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for the RAG embedder. No CUDA-capable GPU was detected.")

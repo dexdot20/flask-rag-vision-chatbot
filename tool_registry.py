@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 
 from config import RAG_ENABLED
 
@@ -140,7 +141,8 @@ TOOL_SPECS = [
                 "Use this instead of guessing when important requirements are missing. "
                 "Ask only the smallest set of questions needed to continue. "
                 "When the user asks you to ask questions first, this is the required tool. "
-                "When you call this tool, it must be the only tool call in that assistant message and you must wait for the user's reply before answering."
+                "When you call this tool, it must be the only tool call in that assistant message and you must wait for the user's reply before answering. "
+                "Each questions item must be an object with id, label, and input_type; example: {\"id\":\"scope\",\"label\":\"Which scope?\",\"input_type\":\"text\"}."
             ),
         },
     },
@@ -213,6 +215,38 @@ TOOL_SPECS = [
             "purpose": "Searches the internal RAG knowledge base built from files, URLs, notes, and conversations.",
             "inputs": {"query": "semantic search query", "category": "optional category", "top_k": "1-12 results"},
             "guidance": "Use at most a few focused searches and synthesize from returned chunks instead of retrying near-duplicate queries.",
+        },
+    },
+    {
+        "name": "search_tool_memory",
+        "description": (
+            "Search past web tool results stored from previous conversations. "
+            "Use this before making a new web request when you suspect the topic was already researched. "
+            "This searches remembered results from fetch_url, search_web, and news tools."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Semantic search query for past web tool results.",
+                },
+                "top_k": {
+                    "type": "integer",
+                    "description": "Maximum number of remembered results to retrieve (1-10).",
+                    "minimum": 1,
+                    "maximum": 10,
+                },
+            },
+            "required": ["query"],
+        },
+        "prompt": {
+            "purpose": "Searches memory of past web searches, URL fetches, and news lookups.",
+            "inputs": {"query": "semantic search query", "top_k": "1-10 results"},
+            "guidance": (
+                "Use before making a new web request if similar research may already exist. "
+                "If high-similarity results already answer the question, reuse them instead of repeating the search."
+            ),
         },
     },
     {
@@ -330,6 +364,168 @@ TOOL_SPECS = [
             "inputs": {"queries": "1-5 news queries", "lang": "tr|en", "when": "d|w|m|y"},
         },
     },
+    {
+        "name": "create_canvas_document",
+        "description": (
+            "Create or replace the active canvas document for the current conversation. "
+            "Use this when the user asks for a structured draft, outline, plan, article, note, or any long-form artifact that should stay editable."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "Document title shown in the canvas panel."
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Full markdown content for the new canvas document."
+                },
+                "format": {
+                    "type": "string",
+                    "enum": ["markdown"],
+                    "description": "Canvas document format. Only markdown is currently supported."
+                }
+            },
+            "required": ["title", "content"]
+        },
+        "prompt": {
+            "purpose": "Creates an editable canvas document attached to the conversation.",
+            "inputs": {
+                "title": "document title",
+                "content": "full markdown body",
+                "format": "currently markdown"
+            },
+            "guidance": (
+                "Use this when the user would benefit from a persistent artifact that can be revised. "
+                "Prefer creating the document before line-level edits."
+            ),
+        },
+    },
+    {
+        "name": "rewrite_canvas_document",
+        "description": "Rewrite the full active canvas document while keeping the same document id.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "The full replacement markdown content."
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Optional replacement title."
+                },
+                "document_id": {
+                    "type": "string",
+                    "description": "Optional target canvas document id. Defaults to the active document."
+                }
+            },
+            "required": ["content"]
+        },
+        "prompt": {
+            "purpose": "Replaces the full content of an existing canvas document.",
+            "inputs": {"content": "full markdown body", "title": "optional title", "document_id": "optional target id"},
+        },
+    },
+    {
+        "name": "replace_canvas_lines",
+        "description": "Replace a 1-based inclusive line range inside the active canvas document.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "start_line": {"type": "integer", "minimum": 1, "description": "1-based first line to replace."},
+                "end_line": {"type": "integer", "minimum": 1, "description": "1-based last line to replace."},
+                "lines": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Replacement lines without trailing newline characters."
+                },
+                "document_id": {
+                    "type": "string",
+                    "description": "Optional target canvas document id. Defaults to the active document."
+                }
+            },
+            "required": ["start_line", "end_line", "lines"]
+        },
+        "prompt": {
+            "purpose": "Replaces specific lines in the canvas document.",
+            "inputs": {"start_line": "first line", "end_line": "last line", "lines": "replacement lines", "document_id": "optional target id"},
+        },
+    },
+    {
+        "name": "insert_canvas_lines",
+        "description": "Insert one or more lines into the active canvas document after a given line number.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "after_line": {"type": "integer", "minimum": 0, "description": "Insert after this 1-based line. Use 0 to insert at the top."},
+                "lines": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "New lines without trailing newline characters."
+                },
+                "document_id": {
+                    "type": "string",
+                    "description": "Optional target canvas document id. Defaults to the active document."
+                }
+            },
+            "required": ["after_line", "lines"]
+        },
+        "prompt": {
+            "purpose": "Inserts lines into the canvas document.",
+            "inputs": {"after_line": "insertion point", "lines": "new lines", "document_id": "optional target id"},
+        },
+    },
+    {
+        "name": "delete_canvas_lines",
+        "description": "Delete a 1-based inclusive line range from the active canvas document.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "start_line": {"type": "integer", "minimum": 1, "description": "1-based first line to delete."},
+                "end_line": {"type": "integer", "minimum": 1, "description": "1-based last line to delete."},
+                "document_id": {
+                    "type": "string",
+                    "description": "Optional target canvas document id. Defaults to the active document."
+                }
+            },
+            "required": ["start_line", "end_line"]
+        },
+        "prompt": {
+            "purpose": "Deletes specific lines from the canvas document.",
+            "inputs": {"start_line": "first line", "end_line": "last line", "document_id": "optional target id"},
+        },
+    },
+    {
+        "name": "delete_canvas_document",
+        "description": "Delete a canvas document. Defaults to the active document when document_id is omitted.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "document_id": {
+                    "type": "string",
+                    "description": "Optional target canvas document id. Defaults to the active document."
+                }
+            }
+        },
+        "prompt": {
+            "purpose": "Deletes one canvas document from the current conversation.",
+            "inputs": {"document_id": "optional target id"},
+        },
+    },
+    {
+        "name": "clear_canvas",
+        "description": "Delete all canvas documents for the current conversation.",
+        "parameters": {
+            "type": "object",
+            "properties": {}
+        },
+        "prompt": {
+            "purpose": "Clears all canvas documents from the current conversation.",
+            "inputs": {},
+        },
+    },
 ]
 
 TOOL_SPEC_BY_NAME = {tool["name"]: tool for tool in TOOL_SPECS}
@@ -363,6 +559,15 @@ def get_openai_tool_specs(active_tool_names: list[str]) -> list[dict]:
 
 
 
+def _compact_arg_type(arg_props: dict) -> str:
+    arg_type = arg_props.get("type", "string")
+    if arg_type == "array":
+        item_type = (arg_props.get("items") or {}).get("type", "")
+        if item_type:
+            return f"array[{item_type}]"
+    return arg_type
+
+
 def get_prompt_tool_context(active_tool_names: list[str]) -> list[dict] | None:
     tools = []
     for tool in get_enabled_tool_specs(active_tool_names):
@@ -378,9 +583,20 @@ def get_prompt_tool_context(active_tool_names: list[str]) -> list[dict] | None:
         if use_for:
             entry["use_for"] = use_for
         if properties:
-            entry["arguments"] = list(properties.keys())
-        if required:
-            entry["required"] = required
+            args = {}
+            for arg_name, arg_props in properties.items():
+                parts = [_compact_arg_type(arg_props)]
+                if arg_name in required:
+                    parts.append("required")
+                enum_values = arg_props.get("enum")
+                if enum_values:
+                    parts.append("one of " + json.dumps(enum_values, ensure_ascii=False))
+                desc = str(arg_props.get("description") or "").strip()
+                compact = ", ".join(parts)
+                if desc:
+                    compact += f" — {desc}"
+                args[arg_name] = compact
+            entry["arguments"] = args
         guidance = str(prompt.get("guidance") or "").strip()
         if guidance:
             entry["guidance"] = guidance

@@ -8,6 +8,7 @@ import random
 import re
 import socket
 import unicodedata
+import warnings
 import xml.etree.ElementTree as ET
 from io import BytesIO
 from urllib.parse import quote as url_quote
@@ -17,6 +18,7 @@ import requests as http_requests
 from bs4 import BeautifulSoup
 from ddgs import DDGS
 from pypdf import PdfReader
+from urllib3.exceptions import InsecureRequestWarning
 
 from config import (
     CONTENT_MAX_CHARS,
@@ -423,6 +425,11 @@ def _append_fetch_warning(result: dict, warning: str):
     result["fetch_warning"] = warning
 
 
+def _should_retry_without_ssl_verification(exc: Exception) -> bool:
+    text = str(exc or "").lower()
+    return "certificate verify failed" in text or "sslcertverificationerror" in text
+
+
 def fetch_url_tool(url: str) -> dict:
     safe, reason = _is_safe_url(url)
     if not safe:
@@ -446,13 +453,29 @@ def fetch_url_tool(url: str) -> dict:
                 proxy_map = _requests_proxy_dict(proxy)
                 if proxy_map:
                     session.proxies.update(proxy_map)
-                resp = session.get(
-                    url,
-                    timeout=FETCH_TIMEOUT,
-                    headers=headers,
-                    stream=True,
-                    allow_redirects=True,
-                )
+                bypassed_ssl_verification = False
+                try:
+                    resp = session.get(
+                        url,
+                        timeout=FETCH_TIMEOUT,
+                        headers=headers,
+                        stream=True,
+                        allow_redirects=True,
+                    )
+                except http_requests.exceptions.SSLError as exc:
+                    if not _should_retry_without_ssl_verification(exc):
+                        raise
+                    bypassed_ssl_verification = True
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", InsecureRequestWarning)
+                        resp = session.get(
+                            url,
+                            timeout=FETCH_TIMEOUT,
+                            headers=headers,
+                            stream=True,
+                            allow_redirects=True,
+                            verify=False,
+                        )
                 raw = b""
                 partial_error = None
                 try:
@@ -468,6 +491,12 @@ def fetch_url_tool(url: str) -> dict:
                         raise
 
                 result = _build_fetch_result_from_response(resp, raw, url, partial_error=partial_error)
+                if bypassed_ssl_verification:
+                    result["ssl_verification_bypassed"] = True
+                    _append_fetch_warning(
+                        result,
+                        "SSL certificate verification failed; retried without certificate verification",
+                    )
                 if resp.status_code >= 400:
                     _append_fetch_warning(result, f"HTTP {resp.status_code} returned by origin")
                     if resp.status_code in _FETCH_RETRYABLE_STATUS_CODES and not _has_useful_fetch_content(result):

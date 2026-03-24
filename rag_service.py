@@ -2,16 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 
 from config import (
-    RAG_AUTO_INJECT_THRESHOLD,
-    RAG_AUTO_INJECT_TOP_K,
     RAG_DISABLED_FEATURE_ERROR,
     RAG_ENABLED,
     RAG_SEARCH_DEFAULT_TOP_K,
     RAG_SEARCH_MIN_SIMILARITY,
     RAG_SOURCE_CONVERSATION,
+    RAG_SOURCE_TOOL_MEMORY,
     RAG_SOURCE_TOOL_RESULT,
     RAG_SUPPORTED_CATEGORIES,
     RAG_SUPPORTED_SOURCE_TYPES,
@@ -33,6 +33,8 @@ from rag import (
 )
 
 _rag_sources_verified = False
+CATEGORY_TOOL_MEMORY = RAG_SOURCE_TOOL_MEMORY
+logger = logging.getLogger(__name__)
 
 
 def _require_rag_enabled() -> None:
@@ -68,6 +70,11 @@ def build_rag_source_key(source_type: str, source_name: str) -> str:
     return f"src-{digest}"
 
 
+def _build_rag_sync_signature(payload) -> str:
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(serialized.encode("utf-8")).hexdigest()
+
+
 def _conversation_rag_source_name(source_type: str, conversation_id: int, title: str) -> str:
     title = str(title or "Untitled")[:80]
     return f"{source_type}:{conversation_id}:{title}"
@@ -75,6 +82,12 @@ def _conversation_rag_source_name(source_type: str, conversation_id: int, title:
 
 def conversation_rag_source_key(source_type: str, conversation_id: int) -> str:
     return build_rag_source_key(source_type, str(conversation_id))
+
+
+def build_tool_memory_source_key(tool_name: str, args_hash: str) -> str:
+    normalized_tool_name = normalize_category(tool_name) or "tool"
+    normalized_args_hash = str(args_hash or "").strip() or "unknown"
+    return build_rag_source_key(RAG_SOURCE_TOOL_MEMORY, f"{normalized_tool_name}:{normalized_args_hash}")
 
 
 def build_tool_result_record_content(entry: dict, index: int) -> str:
@@ -192,7 +205,7 @@ def list_rag_documents_db() -> list[dict]:
 def get_rag_document_record(source_key: str):
     with get_db() as conn:
         return conn.execute(
-            "SELECT source_key, source_name, source_type FROM rag_documents WHERE source_key = ?",
+            "SELECT source_key, source_name, source_type, metadata, updated_at FROM rag_documents WHERE source_key = ?",
             (source_key,),
         ).fetchone()
 
@@ -207,6 +220,32 @@ def delete_rag_source_record(source_key: str) -> int:
     deleted_chunks = rag_delete_source(source_key)
     delete_rag_document_record(source_key)
     return deleted_chunks
+
+
+def _delete_rag_source_if_present(source_key: str) -> int:
+    existing = get_rag_document_record(source_key)
+    if not existing:
+        return 0
+    return delete_rag_source_record(source_key)
+
+
+def _build_conversation_sync_metadata(conversation: dict, source_key: str, sync_signature: str) -> dict:
+    return {
+        "source_key": source_key,
+        "conversation_id": conversation["conversation_id"],
+        "title": conversation["title"],
+        "sync_signature": sync_signature,
+    }
+
+
+def _conversation_source_needs_sync(source_key: str, sync_signature: str, force: bool = False) -> bool:
+    if force:
+        return True
+    row = get_rag_document_record(source_key)
+    if not row:
+        return True
+    metadata = parse_rag_metadata(row["metadata"])
+    return metadata.get("sync_signature") != sync_signature
 
 
 def _clip_rag_excerpt(text: str, limit: int = 1200) -> str:
@@ -259,17 +298,107 @@ def search_knowledge_base_tool(query: str, category: str | None = None, top_k: i
     }
 
 
-def build_rag_auto_context(query: str, enabled: bool) -> dict | None:
+def upsert_tool_memory_result(tool_name: str, args_preview: str, result_content: str, summary: str = "") -> dict | None:
+    _require_rag_enabled()
+    cleaned_content = _clean_rag_text_block(result_content)
+    if not cleaned_content:
+        return None
+
+    cleaned_tool_name = normalize_category(tool_name) or "tool"
+    cleaned_args_preview = _clean_rag_text_block(args_preview, limit=300)
+    cleaned_summary = _clean_rag_text_block(summary, limit=300)
+    args_basis = cleaned_args_preview or cleaned_tool_name
+    args_hash = hashlib.sha1(json.dumps(args_basis, ensure_ascii=False).encode("utf-8")).hexdigest()[:12]
+    source_key = build_tool_memory_source_key(cleaned_tool_name, args_hash)
+    source_name = cleaned_tool_name if not cleaned_args_preview else f"{cleaned_tool_name}: {cleaned_args_preview[:80]}"
+
+    record_parts = [f"tool:{cleaned_tool_name}"]
+    if cleaned_args_preview:
+        record_parts.append(f"Input: {cleaned_args_preview}")
+    if cleaned_summary:
+        record_parts.append(f"Summary: {cleaned_summary}")
+    record_parts.append(cleaned_content)
+    records = [{"role": "tool_memory", "content": "\n".join(record_parts)}]
+    metadata = {
+        "source_key": source_key,
+        "tool_name": cleaned_tool_name,
+        "args_preview": cleaned_args_preview,
+        "summary": cleaned_summary,
+        "source_type": RAG_SOURCE_TOOL_MEMORY,
+    }
+    chunks = chunks_from_records(
+        records,
+        source_name=source_name,
+        source_type=RAG_SOURCE_TOOL_MEMORY,
+        category=CATEGORY_TOOL_MEMORY,
+        metadata=metadata,
+    )
+    if not chunks:
+        return None
+    return ingest_rag_chunks(
+        source_key=source_key,
+        source_name=source_name,
+        source_type=RAG_SOURCE_TOOL_MEMORY,
+        category=CATEGORY_TOOL_MEMORY,
+        chunks=chunks,
+        metadata=metadata,
+    )
+
+
+def search_tool_memory(query: str, top_k: int = RAG_SEARCH_DEFAULT_TOP_K) -> dict:
+    _require_rag_enabled()
+    query = str(query or "").strip()
+    if not query:
+        return {"query": "", "count": 0, "matches": []}
+
+    ensure_supported_rag_sources()
+    hits = rag_query_chunks(query, top_k=top_k, category=CATEGORY_TOOL_MEMORY)
+    matches = _normalize_rag_hits(query, hits, RAG_SEARCH_MIN_SIMILARITY)
+    return {
+        "query": query,
+        "category": CATEGORY_TOOL_MEMORY,
+        "count": len(matches),
+        "matches": matches,
+    }
+
+
+def build_tool_memory_auto_context(query: str, top_k: int) -> str | None:
+    query = str(query or "").strip()
+    if not query:
+        return None
+    try:
+        results = search_tool_memory(query, top_k=max(1, int(top_k)))
+    except Exception:
+        return None
+
+    matches = results.get("matches") or []
+    if not matches:
+        return None
+
+    sections = []
+    for match in matches:
+        source_name = str(match.get("source_name") or "Tool memory").strip()
+        similarity = match.get("similarity")
+        similarity_text = f"{float(similarity):.2f}" if isinstance(similarity, (int, float)) else "n/a"
+        excerpt = _clip_rag_excerpt(match.get("text", ""), limit=1000)
+        if excerpt:
+            sections.append(f"Source: {source_name}\nSimilarity: {similarity_text}\n{excerpt}")
+    if not sections:
+        return None
+    return "\n\n".join(sections)
+
+
+def build_rag_auto_context(query: str, enabled: bool, threshold: float, top_k: int) -> dict | None:
     query = str(query or "").strip()
     if not RAG_ENABLED or not enabled or not query:
         return None
     try:
         ensure_supported_rag_sources()
-        hits = rag_query_chunks(query, top_k=RAG_AUTO_INJECT_TOP_K)
+        hits = rag_query_chunks(query, top_k=max(1, int(top_k)))
     except Exception:
         return None
 
-    matches = _normalize_rag_hits(query, hits, RAG_AUTO_INJECT_THRESHOLD)
+    matches = _normalize_rag_hits(query, hits, max(0.0, min(1.0, float(threshold))))
     if not matches:
         return None
 
@@ -351,7 +480,7 @@ def get_conversation_records_for_rag(conversation_id: int | None = None) -> list
     return conversations
 
 
-def sync_conversations_to_rag(conversation_id: int | None = None) -> list[dict]:
+def sync_conversations_to_rag(conversation_id: int | None = None, force: bool = False) -> list[dict]:
     _require_rag_enabled()
     ensure_supported_rag_sources()
     synced = []
@@ -363,34 +492,37 @@ def sync_conversations_to_rag(conversation_id: int | None = None) -> list[dict]:
             conversation["conversation_id"],
             conversation["title"],
         )
-        conversation_metadata = {
-            "source_key": conversation_key,
-            "conversation_id": conversation["conversation_id"],
-            "title": conversation["title"],
-        }
+        conversation_signature = _build_rag_sync_signature(
+            {
+                "title": conversation["title"],
+                "messages": conversation["messages"],
+            }
+        )
+        conversation_metadata = _build_conversation_sync_metadata(conversation, conversation_key, conversation_signature)
         if conversation["messages"]:
-            conversation_chunks = chunks_from_records(
-                conversation["messages"],
-                source_name=conversation_name,
-                source_type=RAG_SOURCE_CONVERSATION,
-                category=RAG_SOURCE_CONVERSATION,
-                metadata=conversation_metadata,
-            )
-            if conversation_chunks:
-                synced.append(
-                    ingest_rag_chunks(
-                        source_key=conversation_key,
-                        source_name=conversation_name,
-                        source_type=RAG_SOURCE_CONVERSATION,
-                        category=RAG_SOURCE_CONVERSATION,
-                        chunks=conversation_chunks,
-                        metadata=conversation_metadata,
-                    )
+            if _conversation_source_needs_sync(conversation_key, conversation_signature, force=force):
+                conversation_chunks = chunks_from_records(
+                    conversation["messages"],
+                    source_name=conversation_name,
+                    source_type=RAG_SOURCE_CONVERSATION,
+                    category=RAG_SOURCE_CONVERSATION,
+                    metadata=conversation_metadata,
                 )
-            else:
-                delete_rag_source_record(conversation_key)
+                if conversation_chunks:
+                    synced.append(
+                        ingest_rag_chunks(
+                            source_key=conversation_key,
+                            source_name=conversation_name,
+                            source_type=RAG_SOURCE_CONVERSATION,
+                            category=RAG_SOURCE_CONVERSATION,
+                            chunks=conversation_chunks,
+                            metadata=conversation_metadata,
+                        )
+                    )
+                else:
+                    _delete_rag_source_if_present(conversation_key)
         else:
-            delete_rag_source_record(conversation_key)
+            _delete_rag_source_if_present(conversation_key)
 
         tool_key = conversation_rag_source_key(RAG_SOURCE_TOOL_RESULT, conversation["conversation_id"])
         tool_name = _conversation_rag_source_name(
@@ -398,32 +530,45 @@ def sync_conversations_to_rag(conversation_id: int | None = None) -> list[dict]:
             conversation["conversation_id"],
             conversation["title"],
         )
-        tool_metadata = {
-            "source_key": tool_key,
-            "conversation_id": conversation["conversation_id"],
-            "title": conversation["title"],
-        }
+        tool_signature = _build_rag_sync_signature(
+            {
+                "title": conversation["title"],
+                "tool_results": conversation["tool_results"],
+            }
+        )
+        tool_metadata = _build_conversation_sync_metadata(conversation, tool_key, tool_signature)
         if conversation["tool_results"]:
-            tool_chunks = chunks_from_records(
-                conversation["tool_results"],
-                source_name=tool_name,
-                source_type=RAG_SOURCE_TOOL_RESULT,
-                category=RAG_SOURCE_TOOL_RESULT,
-                metadata=tool_metadata,
-            )
-            if tool_chunks:
-                synced.append(
-                    ingest_rag_chunks(
-                        source_key=tool_key,
-                        source_name=tool_name,
-                        source_type=RAG_SOURCE_TOOL_RESULT,
-                        category=RAG_SOURCE_TOOL_RESULT,
-                        chunks=tool_chunks,
-                        metadata=tool_metadata,
-                    )
+            if _conversation_source_needs_sync(tool_key, tool_signature, force=force):
+                tool_chunks = chunks_from_records(
+                    conversation["tool_results"],
+                    source_name=tool_name,
+                    source_type=RAG_SOURCE_TOOL_RESULT,
+                    category=RAG_SOURCE_TOOL_RESULT,
+                    metadata=tool_metadata,
                 )
-            else:
-                delete_rag_source_record(tool_key)
+                if tool_chunks:
+                    synced.append(
+                        ingest_rag_chunks(
+                            source_key=tool_key,
+                            source_name=tool_name,
+                            source_type=RAG_SOURCE_TOOL_RESULT,
+                            category=RAG_SOURCE_TOOL_RESULT,
+                            chunks=tool_chunks,
+                            metadata=tool_metadata,
+                        )
+                    )
+                else:
+                    _delete_rag_source_if_present(tool_key)
         else:
-            delete_rag_source_record(tool_key)
+            _delete_rag_source_if_present(tool_key)
     return synced
+
+
+def sync_conversations_to_rag_safe(conversation_id: int | None = None, force: bool = False) -> list[dict]:
+    if not RAG_ENABLED:
+        return []
+    try:
+        return sync_conversations_to_rag(conversation_id=conversation_id, force=force)
+    except Exception:
+        logger.exception("Automatic conversation sync failed", extra={"conversation_id": conversation_id, "force": force})
+        return []

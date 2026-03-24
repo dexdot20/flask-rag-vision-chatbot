@@ -1,6 +1,8 @@
 from flask import Flask
 
+from config import RAG_ENABLED
 from db import configure_db_path, initialize_database
+from rag_service import sync_conversations_to_rag_safe
 from routes import preload_dependencies, register_chat_routes, register_conversation_routes, register_page_routes
 
 
@@ -14,6 +16,8 @@ def create_app(database_path: str | None = None) -> Flask:
     register_page_routes(app)
     register_conversation_routes(app)
     register_chat_routes(app)
+    if RAG_ENABLED:
+        sync_conversations_to_rag_safe()
     return app
 
 

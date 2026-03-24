@@ -6,21 +6,28 @@ from flask import jsonify, render_template, request
 
 from config import (
     AVAILABLE_MODELS,
+    CHAT_SUMMARY_ALLOWED_MODES,
     DEFAULT_SETTINGS,
     MAX_USER_PREFERENCES_LENGTH,
+    RAG_CONTEXT_SIZE_PRESETS,
     RAG_ENABLED,
+    RAG_SENSITIVITY_PRESETS,
     get_feature_flags,
 )
 from db import (
-    get_chat_summary_batch_size,
-    get_chat_summary_trigger_message_count,
-    get_fetch_url_clip_aggressiveness,
-    get_fetch_url_token_threshold,
     get_active_tool_names,
     get_app_settings,
+    get_chat_summary_batch_size,
+    get_chat_summary_mode,
+    get_chat_summary_trigger_token_count,
+    get_fetch_url_clip_aggressiveness,
+    get_fetch_url_token_threshold,
     get_rag_auto_inject_enabled,
-    normalize_scratchpad_text,
+    get_rag_context_size,
+    get_rag_sensitivity,
+    get_tool_memory_auto_inject_enabled,
     normalize_active_tool_names,
+    normalize_scratchpad_text,
     save_app_settings,
 )
 
@@ -35,7 +42,11 @@ def register_page_routes(app) -> None:
             "max_steps": int(raw.get("max_steps", DEFAULT_SETTINGS["max_steps"])),
             "active_tools": get_active_tool_names(raw),
             "rag_auto_inject": get_rag_auto_inject_enabled(raw),
-            "chat_summary_trigger_message_count": get_chat_summary_trigger_message_count(raw),
+            "rag_sensitivity": get_rag_sensitivity(raw),
+            "rag_context_size": get_rag_context_size(raw),
+            "tool_memory_auto_inject": get_tool_memory_auto_inject_enabled(raw),
+            "chat_summary_mode": get_chat_summary_mode(raw),
+            "chat_summary_trigger_token_count": get_chat_summary_trigger_token_count(raw),
             "chat_summary_batch_size": get_chat_summary_batch_size(raw),
             "fetch_url_token_threshold": get_fetch_url_token_threshold(raw),
             "fetch_url_clip_aggressiveness": get_fetch_url_clip_aggressiveness(raw),
@@ -57,7 +68,11 @@ def register_page_routes(app) -> None:
                 "max_steps": int(raw.get("max_steps", DEFAULT_SETTINGS["max_steps"])),
                 "active_tools": get_active_tool_names(raw),
                 "rag_auto_inject": get_rag_auto_inject_enabled(raw),
-                "chat_summary_trigger_message_count": get_chat_summary_trigger_message_count(raw),
+                "rag_sensitivity": get_rag_sensitivity(raw),
+                "rag_context_size": get_rag_context_size(raw),
+                "tool_memory_auto_inject": get_tool_memory_auto_inject_enabled(raw),
+                "chat_summary_mode": get_chat_summary_mode(raw),
+                "chat_summary_trigger_token_count": get_chat_summary_trigger_token_count(raw),
                 "chat_summary_batch_size": get_chat_summary_batch_size(raw),
                 "fetch_url_token_threshold": get_fetch_url_token_threshold(raw),
                 "fetch_url_clip_aggressiveness": get_fetch_url_clip_aggressiveness(raw),
@@ -72,7 +87,11 @@ def register_page_routes(app) -> None:
         max_steps_raw = data.get("max_steps")
         active_tools_raw = data.get("active_tools")
         rag_auto_inject = data.get("rag_auto_inject")
-        chat_summary_trigger_raw = data.get("chat_summary_trigger_message_count")
+        rag_sensitivity = data.get("rag_sensitivity")
+        rag_context_size = data.get("rag_context_size")
+        tool_memory_auto_inject = data.get("tool_memory_auto_inject")
+        chat_summary_mode_raw = data.get("chat_summary_mode")
+        chat_summary_trigger_raw = data.get("chat_summary_trigger_token_count")
         chat_summary_batch_raw = data.get("chat_summary_batch_size")
         fetch_url_token_threshold_raw = data.get("fetch_url_token_threshold")
         fetch_url_clip_aggressiveness_raw = data.get("fetch_url_clip_aggressiveness")
@@ -84,6 +103,10 @@ def register_page_routes(app) -> None:
             and max_steps_raw is None
             and active_tools_raw is None
             and rag_auto_inject is None
+            and rag_sensitivity is None
+            and rag_context_size is None
+            and tool_memory_auto_inject is None
+            and chat_summary_mode_raw is None
             and chat_summary_trigger_raw is None
             and chat_summary_batch_raw is None
             and fetch_url_token_threshold_raw is None
@@ -99,8 +122,6 @@ def register_page_routes(app) -> None:
             settings["user_preferences"] = user_preferences.strip()[:MAX_USER_PREFERENCES_LENGTH]
 
         if scratchpad is not None:
-            if not get_feature_flags().get("scratchpad_admin_editing"):
-                return jsonify({"error": "scratchpad is read-only and can only be updated by the AI tool."}), 400
             if not isinstance(scratchpad, str):
                 return jsonify({"error": "Invalid scratchpad."}), 400
             try:
@@ -132,14 +153,42 @@ def register_page_routes(app) -> None:
         elif not RAG_ENABLED:
             settings["rag_auto_inject"] = "false"
 
+        if rag_sensitivity is not None:
+            normalized_rag_sensitivity = str(rag_sensitivity or "").strip().lower()
+            if normalized_rag_sensitivity not in RAG_SENSITIVITY_PRESETS:
+                return jsonify({"error": "rag_sensitivity must be one of flexible, normal, or strict."}), 400
+            settings["rag_sensitivity"] = normalized_rag_sensitivity
+
+        if rag_context_size is not None:
+            normalized_rag_context_size = str(rag_context_size or "").strip().lower()
+            if normalized_rag_context_size not in RAG_CONTEXT_SIZE_PRESETS:
+                return jsonify({"error": "rag_context_size must be one of small, medium, or large."}), 400
+            settings["rag_context_size"] = normalized_rag_context_size
+
+        if tool_memory_auto_inject is not None and RAG_ENABLED:
+            if isinstance(tool_memory_auto_inject, bool):
+                settings["tool_memory_auto_inject"] = "true" if tool_memory_auto_inject else "false"
+            else:
+                settings["tool_memory_auto_inject"] = (
+                    "true" if str(tool_memory_auto_inject).strip().lower() in {"1", "true", "yes", "on"} else "false"
+                )
+        elif not RAG_ENABLED:
+            settings["tool_memory_auto_inject"] = "false"
+
+        if chat_summary_mode_raw is not None:
+            normalized_summary_mode = str(chat_summary_mode_raw or "").strip().lower()
+            if normalized_summary_mode not in CHAT_SUMMARY_ALLOWED_MODES:
+                return jsonify({"error": "chat_summary_mode must be one of auto, never, or aggressive."}), 400
+            settings["chat_summary_mode"] = normalized_summary_mode
+
         if chat_summary_trigger_raw is not None:
             try:
                 chat_summary_trigger = int(chat_summary_trigger_raw)
             except (TypeError, ValueError):
-                return jsonify({"error": "chat_summary_trigger_message_count must be an integer."}), 400
-            if not (10 <= chat_summary_trigger <= 500):
-                return jsonify({"error": "chat_summary_trigger_message_count must be between 10 and 500."}), 400
-            settings["chat_summary_trigger_message_count"] = str(chat_summary_trigger)
+                return jsonify({"error": "chat_summary_trigger_token_count must be an integer."}), 400
+            if not (1_000 <= chat_summary_trigger <= 200_000):
+                return jsonify({"error": "chat_summary_trigger_token_count must be between 1000 and 200000."}), 400
+            settings["chat_summary_trigger_token_count"] = str(chat_summary_trigger)
 
         if chat_summary_batch_raw is not None:
             try:
@@ -149,9 +198,6 @@ def register_page_routes(app) -> None:
             if not (5 <= chat_summary_batch <= 100):
                 return jsonify({"error": "chat_summary_batch_size must be between 5 and 100."}), 400
             settings["chat_summary_batch_size"] = str(chat_summary_batch)
-
-        if get_chat_summary_batch_size(settings) > get_chat_summary_trigger_message_count(settings):
-            return jsonify({"error": "chat_summary_batch_size must be less than or equal to chat_summary_trigger_message_count."}), 400
 
         if fetch_url_token_threshold_raw is not None:
             try:
@@ -179,7 +225,11 @@ def register_page_routes(app) -> None:
                 "max_steps": int(settings["max_steps"]),
                 "active_tools": get_active_tool_names(settings),
                 "rag_auto_inject": get_rag_auto_inject_enabled(settings),
-                "chat_summary_trigger_message_count": get_chat_summary_trigger_message_count(settings),
+                "rag_sensitivity": get_rag_sensitivity(settings),
+                "rag_context_size": get_rag_context_size(settings),
+                "tool_memory_auto_inject": get_tool_memory_auto_inject_enabled(settings),
+                "chat_summary_mode": get_chat_summary_mode(settings),
+                "chat_summary_trigger_token_count": get_chat_summary_trigger_token_count(settings),
                 "chat_summary_batch_size": get_chat_summary_batch_size(settings),
                 "fetch_url_token_threshold": get_fetch_url_token_threshold(settings),
                 "fetch_url_clip_aggressiveness": get_fetch_url_clip_aggressiveness(settings),

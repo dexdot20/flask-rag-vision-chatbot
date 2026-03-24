@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import logging
@@ -8,6 +9,18 @@ import re
 from logging.handlers import RotatingFileHandler
 from uuid import uuid4
 
+from canvas_service import (
+    build_canvas_tool_result,
+    clear_canvas,
+    create_canvas_document,
+    create_canvas_runtime_state,
+    delete_canvas_document,
+    delete_canvas_lines,
+    get_canvas_runtime_documents,
+    insert_canvas_lines,
+    replace_canvas_lines,
+    rewrite_canvas_document,
+)
 from config import (
     AGENT_TRACE_LOG_PATH,
     FETCH_RAW_TOOL_RESULT_MAX_TEXT_CHARS,
@@ -18,14 +31,35 @@ from config import (
     RAG_TOOL_RESULT_SUMMARY_MAX_CHARS,
     client,
 )
-from rag_service import search_knowledge_base_tool
-from db import append_to_scratchpad, replace_scratchpad, read_image_asset_bytes
+from db import append_to_scratchpad, read_image_asset_bytes, replace_scratchpad
+from rag_service import search_knowledge_base_tool, search_tool_memory, upsert_tool_memory_result
 from tool_registry import TOOL_SPEC_BY_NAME, get_openai_tool_specs
+from token_utils import estimate_text_tokens
 from vision import answer_image_question
-from web_tools import fetch_url_tool, search_news_ddgs_tool, search_news_google_tool, search_web_tool
+from web_tools import (
+    fetch_url_tool,
+    search_news_ddgs_tool,
+    search_news_google_tool,
+    search_web_tool,
+)
 
 FINAL_ANSWER_ERROR_TEXT = "The model returned an invalid tool instruction and no final answer could be produced."
 FINAL_ANSWER_MISSING_TEXT = "The model did not produce a final answer in assistant content."
+CANVAS_TOOL_NAMES = {
+    "create_canvas_document",
+    "rewrite_canvas_document",
+    "replace_canvas_lines",
+    "insert_canvas_lines",
+    "delete_canvas_lines",
+    "delete_canvas_document",
+    "clear_canvas",
+}
+WEB_TOOL_NAMES = {
+    "search_web",
+    "fetch_url",
+    "search_news_ddgs",
+    "search_news_google",
+}
 INPUT_BREAKDOWN_KEYS = (
     "system_prompt",
     "user_messages",
@@ -69,26 +103,7 @@ def _empty_input_breakdown() -> dict[str, int]:
 
 
 def _estimate_text_tokens(text: str) -> int:
-    normalized = str(text or "").strip()
-    if not normalized:
-        return 0
-
-    byte_estimate = (len(normalized.encode("utf-8")) + 3) // 4
-    piece_estimate = len(re.findall(r"\w+|[^\w\s]", normalized, re.UNICODE))
-    return max(1, byte_estimate, piece_estimate)
-
-
-def _extract_rag_context_text(payload: dict) -> str:
-    knowledge_base = payload.get("knowledge_base")
-    if not isinstance(knowledge_base, dict):
-        return ""
-
-    auto_injected_context = knowledge_base.get("auto_injected_context")
-    if auto_injected_context in (None, "", [], {}):
-        return ""
-    if isinstance(auto_injected_context, str):
-        return auto_injected_context
-    return json.dumps(auto_injected_context, ensure_ascii=False)
+    return estimate_text_tokens(text)
 
 
 def _estimate_message_breakdown(message: dict) -> dict[str, int]:
@@ -107,26 +122,23 @@ def _estimate_message_breakdown(message: dict) -> dict[str, int]:
     if role != "system":
         return {"system_prompt": total_tokens}
 
-    try:
-        payload = json.loads(content)
-    except Exception:
-        return {"system_prompt": total_tokens}
-
-    if not isinstance(payload, dict):
-        return {"system_prompt": total_tokens}
-
-    context_type = str(payload.get("context_type") or "").strip()
-    if context_type == "tool_execution_result":
+    # Classify system messages by their distinctive markers
+    if content.startswith("[TOOL EXECUTION RESULTS]"):
         return {"tool_results": total_tokens}
-    if context_type == "final_answer_request":
+    if content.startswith("[INSTRUCTION: FINAL ANSWER REQUIRED]"):
         return {"final_instruction": total_tokens}
-    if context_type != "runtime_prompt_context":
-        return {"system_prompt": total_tokens}
+    if content.startswith("[INSTRUCTION: MISSING FINAL ANSWER"):
+        return {"final_instruction": total_tokens}
 
-    rag_context_text = _extract_rag_context_text(payload)
-    rag_tokens = min(total_tokens, _estimate_text_tokens(rag_context_text))
+    # Extract RAG context token count by identifying the knowledge base section in markdown
+    rag_tokens = 0
+    if "## Knowledge Base" in content:
+        match = re.search(r"## Knowledge Base(.*?)(?:\n## |\Z)", content, flags=re.DOTALL)
+        if match:
+            rag_context_text = match.group(1)
+            rag_tokens = min(total_tokens, _estimate_text_tokens(rag_context_text))
+
     system_tokens = max(total_tokens - rag_tokens, 0)
-
     if rag_tokens > 0 and system_tokens == 0 and total_tokens > 0:
         system_tokens = 1
         rag_tokens = max(total_tokens - 1, 0)
@@ -230,7 +242,7 @@ def _normalize_fetch_token_threshold(value) -> int:
         threshold = int(value)
     except (TypeError, ValueError):
         threshold = FETCH_SUMMARY_TOKEN_THRESHOLD
-    return max(400, threshold)
+    return max(1, threshold)
 
 
 def _normalize_fetch_clip_aggressiveness(value) -> int:
@@ -457,133 +469,6 @@ def _extract_native_tool_calls(message) -> tuple[list[dict] | None, str | None]:
     return normalized_calls, None
 
 
-def _normalize_custom_tool_calls(raw_tool_calls) -> tuple[list[dict] | None, str | None]:
-    if not isinstance(raw_tool_calls, list) or not raw_tool_calls:
-        return None, None
-
-    normalized_calls = []
-    for index, raw_call in enumerate(raw_tool_calls, start=1):
-        if not isinstance(raw_call, dict):
-            return None, f"tool_calls[{index}] must be an object"
-
-        tool_name = str(raw_call.get("name") or "").strip()
-        if not tool_name:
-            return None, f"tool_calls[{index}] is missing a tool name"
-
-        raw_arguments = raw_call.get("arguments") or {}
-        if isinstance(raw_arguments, str):
-            tool_args, parse_error = _parse_tool_call_arguments(raw_arguments, tool_name)
-            if parse_error:
-                return None, parse_error
-        elif isinstance(raw_arguments, dict):
-            tool_args = raw_arguments
-        else:
-            return None, f"Tool arguments for {tool_name} must be a JSON object"
-
-        normalized_calls.append(
-            {
-                "id": str(raw_call.get("id") or f"tool-call-{index}"),
-                "name": tool_name,
-                "arguments": tool_args or {},
-            }
-        )
-
-    return normalized_calls, None
-
-
-def _extract_tool_calls_from_content(content_text: str) -> tuple[list[dict] | None, str | None, str]:
-    raw_content = str(content_text or "")
-    stripped_content = raw_content.strip()
-    if not stripped_content:
-        return None, None, ""
-
-    # Check for DeepSeek DSML tool call format first
-    pipe = r'[\s\|｜]*'
-    start_tag = r'<\s*' + pipe + r'DSML' + pipe + r'function_calls\s*>'
-    end_tag = r'</\s*' + pipe + r'DSML' + pipe + r'function_calls\s*>'
-    
-    dsml_match = re.search(f'{start_tag}(.*?){end_tag}', raw_content, re.DOTALL | re.IGNORECASE)
-    if not dsml_match:
-        # Also check if it's unfinished (no end tag) but clearly a tool call block
-        dsml_match = re.search(f'{start_tag}(.*)', raw_content, re.DOTALL | re.IGNORECASE)
-        
-    if dsml_match:
-        from uuid import uuid4
-        dsml_block = dsml_match.group(1)
-        tool_calls = []
-        start = dsml_match.start()
-        end = dsml_match.end() if dsml_match.end() <= len(raw_content) else len(raw_content)
-        narrative = (raw_content[:start] + raw_content[end:]).strip()
-        
-        invoke_start = r'<\s*' + pipe + r'DSML' + pipe + r'invoke\s+name="([^"]+)"\s*>'
-        invoke_end = r'</\s*' + pipe + r'DSML' + pipe + r'invoke\s*>'
-        
-        for idx, invoke_match in enumerate(re.finditer(f'{invoke_start}(.*?)(?:{invoke_end}|$)', dsml_block, re.DOTALL | re.IGNORECASE)):
-            tool_name = invoke_match.group(1).strip()
-            params_block = invoke_match.group(2)
-            
-            args = {}
-            param_start = r'<\s*' + pipe + r'DSML' + pipe + r'parameter\s+name="([^"]+)"[^>]*>'
-            param_end = r'</\s*' + pipe + r'DSML' + pipe + r'parameter\s*>'
-            
-            for param_match in re.finditer(f'{param_start}(.*?)(?:{param_end}|$)', params_block, re.DOTALL | re.IGNORECASE):
-                key = param_match.group(1).strip()
-                val = param_match.group(2).strip()
-                args[key] = val
-                
-            tool_calls.append({
-                "id": f"dsml-call-{idx+1}-{uuid4().hex[:6]}",
-                "name": tool_name,
-                "arguments": args
-            })
-            
-        if tool_calls:
-            return tool_calls, None, narrative
-
-    candidates: list[tuple[str, str]] = []
-    if stripped_content.startswith("{") and stripped_content.endswith("}"):
-        candidates.append((stripped_content, ""))
-
-    fenced_json_pattern = re.compile(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", re.IGNORECASE)
-    for match in fenced_json_pattern.finditer(raw_content):
-        json_text = match.group(1).strip()
-        narrative = (raw_content[: match.start()] + raw_content[match.end() :]).strip()
-        candidates.append((json_text, narrative))
-
-    if '"tool_calls"' in stripped_content and not candidates:
-        start_index = stripped_content.find("{")
-        end_index = stripped_content.rfind("}")
-        if start_index != -1 and end_index > start_index:
-            json_text = stripped_content[start_index : end_index + 1].strip()
-            narrative = (stripped_content[:start_index] + stripped_content[end_index + 1 :]).strip()
-            candidates.append((json_text, narrative))
-
-    for json_text, narrative in candidates:
-        try:
-            payload = json.loads(json_text)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(payload, dict) or "tool_calls" not in payload:
-            continue
-
-        tool_calls, parse_error = _normalize_custom_tool_calls(payload.get("tool_calls"))
-        if parse_error:
-            return None, parse_error, narrative
-        if tool_calls:
-            return tool_calls, None, narrative
-
-    return None, None, raw_content
-
-
-def _should_hold_answer_stream(content_text: str) -> bool:
-    normalized = str(content_text or "").lstrip()
-    if not normalized:
-        return False
-    if "dsml" in normalized.lower() or "<" in normalized[:10]:
-        return True
-    return normalized.startswith("{") or "```json" in normalized.lower() or '"tool_calls"' in normalized
-
-
 def _merge_stream_tool_call_delta(tool_call_parts: list[dict], delta) -> None:
     raw_tool_calls = _read_api_field(delta, "tool_calls") or []
     for fallback_index, raw_call in enumerate(raw_tool_calls):
@@ -684,6 +569,45 @@ def _validate_scalar_type(value, expected_type: str) -> bool:
     return True
 
 
+def _parse_json_like_value(value):
+    if isinstance(value, (dict, list)):
+        return value
+    if not isinstance(value, str):
+        return None
+
+    text = value.strip()
+    if not text:
+        return None
+
+    try:
+        return json.loads(text)
+    except Exception:
+        try:
+            return ast.literal_eval(text)
+        except Exception:
+            return None
+
+
+def _coerce_clarification_question_item(raw_question):
+    if isinstance(raw_question, dict):
+        return raw_question
+    if not isinstance(raw_question, str):
+        return None
+
+    text = raw_question.strip()
+    if not text:
+        return None
+
+    parsed = _parse_json_like_value(text)
+    if isinstance(parsed, dict):
+        return parsed
+
+    return {
+        "label": text,
+        "input_type": "text",
+    }
+
+
 def _validate_tool_arguments(tool_name: str, tool_args: dict) -> str | None:
     spec = TOOL_SPEC_BY_NAME.get(tool_name)
     if not spec:
@@ -707,22 +631,11 @@ def _validate_tool_arguments(tool_name: str, tool_args: dict) -> str | None:
         expected_type = property_schema.get("type")
         
         if expected_type == "array" and isinstance(value, str):
-            try:
-                parsed_value = json.loads(value)
-                if isinstance(parsed_value, list):
-                    value = parsed_value
-                else:
-                    value = [value]
-            except Exception:
-                try:
-                    import ast
-                    parsed_value = ast.literal_eval(value)
-                    if isinstance(parsed_value, list):
-                        value = parsed_value
-                    else:
-                        value = [value]
-                except Exception:
-                    value = [value]
+            parsed_value = _parse_json_like_value(value)
+            if isinstance(parsed_value, list):
+                value = parsed_value
+            else:
+                value = [value]
             tool_args[key] = value
         elif expected_type == "integer" and isinstance(value, str):
             try:
@@ -733,14 +646,7 @@ def _validate_tool_arguments(tool_name: str, tool_args: dict) -> str | None:
                 value = coerced_value
                 tool_args[key] = value
         elif expected_type == "object" and isinstance(value, str):
-            try:
-                parsed_value = json.loads(value)
-            except Exception:
-                try:
-                    import ast
-                    parsed_value = ast.literal_eval(value)
-                except Exception:
-                    parsed_value = None
+            parsed_value = _parse_json_like_value(value)
             if isinstance(parsed_value, dict):
                 value = parsed_value
                 tool_args[key] = value
@@ -754,16 +660,12 @@ def _validate_tool_arguments(tool_name: str, tool_args: dict) -> str | None:
             for item in value:
                 normalized_item = item
                 if item_type == "object" and isinstance(item, str):
-                    try:
-                        parsed_item = json.loads(item)
-                    except Exception:
-                        try:
-                            import ast
-                            parsed_item = ast.literal_eval(item)
-                        except Exception:
-                            parsed_item = None
-                    if isinstance(parsed_item, dict):
-                        normalized_item = parsed_item
+                    if tool_name == "ask_clarifying_question":
+                        normalized_item = _coerce_clarification_question_item(item)
+                    else:
+                        parsed_item = _parse_json_like_value(item)
+                        if isinstance(parsed_item, dict):
+                            normalized_item = parsed_item
                 normalized_items.append(normalized_item)
             if normalized_items != value:
                 value = normalized_items
@@ -790,28 +692,28 @@ def _validate_tool_arguments(tool_name: str, tool_args: dict) -> str | None:
 
 
 def _build_final_answer_instruction() -> dict:
-    payload = {
-        "context_type": "final_answer_request",
-        "instruction": (
-            "Tool execution budget is exhausted. Do not call more tools. "
-            "Respond with the best possible final answer using the available context. "
+    return {
+        "role": "system",
+        "content": (
+            "[INSTRUCTION: FINAL ANSWER REQUIRED]\n\n"
+            "Tool execution budget is exhausted. Do not call more tools.\n"
+            "Respond with the best possible final answer using the available context.\n"
             "Place the final answer in assistant content, not reasoning_content."
         ),
     }
-    return {"role": "system", "content": json.dumps(payload, ensure_ascii=False)}
 
 
 def _build_missing_final_answer_instruction() -> dict:
-    payload = {
-        "context_type": "final_answer_retry",
-        "instruction": (
-            "You have not returned any final answer in assistant content yet. "
-            "Continue and respond now using assistant content only. "
-            "If you need tools, place only the tool_calls JSON in assistant content. "
+    return {
+        "role": "system",
+        "content": (
+            "[INSTRUCTION: MISSING FINAL ANSWER — RETRY]\n\n"
+            "You have not returned any final answer in assistant content yet.\n"
+            "Continue and respond now using assistant content only.\n"
+            "If you need tools, place only the tool_calls JSON in assistant content.\n"
             "Do not place the final answer or tool JSON in reasoning_content."
         ),
     }
-    return {"role": "system", "content": json.dumps(payload, ensure_ascii=False)}
 
 
 def _build_tool_execution_result_message(transcript_results: list[dict]) -> dict | None:
@@ -822,31 +724,57 @@ def _build_tool_execution_result_message(transcript_results: list[dict]) -> dict
     if not includes_fetch_results:
         return None
 
-    payload = {
-        "context_type": "tool_execution_result",
-        "tool_results": transcript_results,
-        "fetch_guidance": (
-            "For fetch_url results, use the retrieved page content as the source of truth. "
-            "Do not repeat the same fetch_url call unless the user explicitly asks to refresh the page."
-        ),
-    }
-    return {"role": "system", "content": json.dumps(payload, ensure_ascii=False)}
+    parts = [
+        "[TOOL EXECUTION RESULTS]\n",
+        "**Fetch Guidance**: Use the retrieved page content as the source of truth. "
+        "Do not repeat the same fetch_url call unless the user explicitly asks to refresh.\n",
+    ]
+    for item in transcript_results:
+        tool_name = str(item.get("tool_name") or "unknown")
+        ok = item.get("ok", False)
+        summary = str(item.get("summary") or "").strip()
+        status = "OK" if ok else "FAILED"
+        line = f"- **{tool_name}** [{status}]"
+        if summary:
+            line += f": {summary}"
+        parts.append(line)
+
+    return {"role": "system", "content": "\n".join(parts)}
 
 
 def _normalize_clarification_question(raw_question: dict, index: int) -> dict | None:
+    raw_question = _coerce_clarification_question_item(raw_question)
     if not isinstance(raw_question, dict):
         return None
 
-    question_id = str(raw_question.get("id") or f"question_{index}").strip()[:80]
-    label = str(raw_question.get("label") or "").strip()
-    input_type = str(raw_question.get("input_type") or "text").strip()
-    if not question_id or not label or input_type not in {"text", "single_select", "multi_select"}:
+    question_id = str(raw_question.get("id") or raw_question.get("key") or f"question_{index}").strip()[:80]
+    label = str(raw_question.get("label") or raw_question.get("question") or raw_question.get("prompt") or "").strip()
+
+    input_type_aliases = {
+        "": "",
+        "text": "text",
+        "string": "text",
+        "free_text": "text",
+        "single": "single_select",
+        "select": "single_select",
+        "single_select": "single_select",
+        "single-choice": "single_select",
+        "single_choice": "single_select",
+        "multiple": "multi_select",
+        "multi": "multi_select",
+        "multiselect": "multi_select",
+        "multi_select": "multi_select",
+        "multi-choice": "multi_select",
+        "multi_choice": "multi_select",
+    }
+    raw_input_type = str(raw_question.get("input_type") or raw_question.get("type") or "").strip().lower()
+    input_type = input_type_aliases.get(raw_input_type, raw_input_type)
+    if not question_id or not label:
         return None
 
     normalized = {
         "id": question_id,
         "label": label,
-        "input_type": input_type,
         "required": raw_question.get("required") is not False,
     }
 
@@ -854,30 +782,39 @@ def _normalize_clarification_question(raw_question: dict, index: int) -> dict | 
     if placeholder:
         normalized["placeholder"] = placeholder[:200]
 
-    allow_free_text = raw_question.get("allow_free_text") is True
+    allow_free_text = raw_question.get("allow_free_text") is True or raw_question.get("allowFreeText") is True
     if allow_free_text:
         normalized["allow_free_text"] = True
 
     raw_options = raw_question.get("options") if isinstance(raw_question.get("options"), list) else []
     normalized_options = []
     for option in raw_options[:10]:
-        if not isinstance(option, dict):
+        if isinstance(option, str):
+            label_text = option.strip()
+            value_text = label_text
+            description = ""
+        elif isinstance(option, dict):
+            label_text = str(option.get("label") or option.get("value") or "").strip()
+            value_text = str(option.get("value") or option.get("label") or "").strip()
+            description = str(option.get("description") or "").strip()
+        else:
             continue
-        label_text = str(option.get("label") or "").strip()
-        value_text = str(option.get("value") or "").strip()
         if not label_text or not value_text:
             continue
         normalized_option = {
             "label": label_text[:120],
             "value": value_text[:120],
         }
-        description = str(option.get("description") or "").strip()
         if description:
             normalized_option["description"] = description[:200]
         normalized_options.append(normalized_option)
 
+    if input_type not in {"text", "single_select", "multi_select"}:
+        input_type = "single_select" if normalized_options else "text"
     if input_type in {"single_select", "multi_select"} and not normalized_options:
-        return None
+        input_type = "text"
+
+    normalized["input_type"] = input_type
     if normalized_options:
         normalized["options"] = normalized_options
 
@@ -933,85 +870,219 @@ def _build_clarification_text(payload: dict) -> str:
     return "\n".join(line for line in lines if line).strip()
 
 
-def _execute_tool(tool_name: str, tool_args: dict):
-    if tool_name == "append_scratchpad":
-        result, summary = append_to_scratchpad(tool_args.get("note", ""))
-        return result, summary
-    if tool_name == "replace_scratchpad":
-        result, summary = replace_scratchpad(tool_args.get("new_content", ""))
-        return result, summary
-    if tool_name == "ask_clarifying_question":
-        payload = _normalize_clarification_payload(tool_args)
-        return {
-            "status": "needs_user_input",
-            "clarification": payload,
-            "text": _build_clarification_text(payload),
-        }, "Awaiting user clarification"
-    if tool_name == "image_explain":
-        image_id = str(tool_args.get("image_id") or "").strip()
-        conversation_id = tool_args.get("conversation_id")
-        question = str(tool_args.get("question") or "").strip()
-        try:
-            normalized_conversation_id = int(conversation_id)
-        except (TypeError, ValueError):
-            return {
-                "status": "error",
-                "error": "conversation_id must be an integer.",
-            }, "Invalid conversation id"
+def _get_canvas_runtime_state(runtime_state: dict) -> dict:
+    return runtime_state.setdefault("canvas", create_canvas_runtime_state())
 
-        asset, image_bytes = read_image_asset_bytes(image_id, conversation_id=normalized_conversation_id)
-        if not asset or not image_bytes:
-            return {
-                "status": "missing_image",
-                "error": "Stored image not found. Ask the user to re-upload the image.",
-                "image_id": image_id,
-                "conversation_id": normalized_conversation_id,
-            }, "Stored image not found"
 
-        answer = answer_image_question(
-            image_bytes,
-            asset.get("mime_type", ""),
-            question,
-            initial_analysis=asset.get("initial_analysis"),
-        )
+def _run_append_scratchpad(tool_args: dict, runtime_state: dict):
+    del runtime_state
+    return append_to_scratchpad(tool_args.get("note", ""))
+
+
+def _run_replace_scratchpad(tool_args: dict, runtime_state: dict):
+    del runtime_state
+    return replace_scratchpad(tool_args.get("new_content", ""))
+
+
+def _run_ask_clarifying_question(tool_args: dict, runtime_state: dict):
+    del runtime_state
+    payload = _normalize_clarification_payload(tool_args)
+    return {
+        "status": "needs_user_input",
+        "clarification": payload,
+        "text": _build_clarification_text(payload),
+    }, "Awaiting user clarification"
+
+
+def _run_image_explain(tool_args: dict, runtime_state: dict):
+    del runtime_state
+    image_id = str(tool_args.get("image_id") or "").strip()
+    conversation_id = tool_args.get("conversation_id")
+    question = str(tool_args.get("question") or "").strip()
+    try:
+        normalized_conversation_id = int(conversation_id)
+    except (TypeError, ValueError):
         return {
-            "status": "ok",
+            "status": "error",
+            "error": "conversation_id must be an integer.",
+        }, "Invalid conversation id"
+
+    asset, image_bytes = read_image_asset_bytes(image_id, conversation_id=normalized_conversation_id)
+    if not asset or not image_bytes:
+        return {
+            "status": "missing_image",
+            "error": "Stored image not found. Ask the user to re-upload the image.",
             "image_id": image_id,
             "conversation_id": normalized_conversation_id,
-            "answer": answer,
-        }, "Image question answered"
-    if tool_name == "search_knowledge_base":
-        result = search_knowledge_base_tool(
-            tool_args.get("query", ""),
-            category=tool_args.get("category"),
-            top_k=tool_args.get("top_k", RAG_SEARCH_DEFAULT_TOP_K),
-        )
-        summary = f"{result.get('count', 0)} knowledge chunks found"
-        return result, summary
-    if tool_name == "search_web":
-        result = search_web_tool(tool_args.get("queries", []))
-        ok_count = sum(1 for row in result if "error" not in row)
-        return result, f"{ok_count} web results found"
-    if tool_name == "search_news_ddgs":
-        result = search_news_ddgs_tool(
-            tool_args.get("queries", []),
-            lang=tool_args.get("lang", "tr"),
-            when=tool_args.get("when"),
-        )
-        ok_count = sum(1 for row in result if "error" not in row)
-        return result, f"{ok_count} news articles found"
-    if tool_name == "search_news_google":
-        result = search_news_google_tool(
-            tool_args.get("queries", []),
-            lang=tool_args.get("lang", "tr"),
-            when=tool_args.get("when"),
-        )
-        ok_count = sum(1 for row in result if "error" not in row)
-        return result, f"{ok_count} news articles found"
-    if tool_name == "fetch_url":
-        result = fetch_url_tool(tool_args.get("url", ""))
-        summary = _summarize_fetch_result(result, tool_args.get("url", ""))
-        return result, summary
+        }, "Stored image not found"
+
+    answer = answer_image_question(
+        image_bytes,
+        asset.get("mime_type", ""),
+        question,
+        initial_analysis=asset.get("initial_analysis"),
+    )
+    return {
+        "status": "ok",
+        "image_id": image_id,
+        "conversation_id": normalized_conversation_id,
+        "answer": answer,
+    }, "Image question answered"
+
+
+def _run_search_knowledge_base(tool_args: dict, runtime_state: dict):
+    del runtime_state
+    result = search_knowledge_base_tool(
+        tool_args.get("query", ""),
+        category=tool_args.get("category"),
+        top_k=tool_args.get("top_k", RAG_SEARCH_DEFAULT_TOP_K),
+    )
+    return result, f"{result.get('count', 0)} knowledge chunks found"
+
+
+def _run_search_tool_memory(tool_args: dict, runtime_state: dict):
+    del runtime_state
+    result = search_tool_memory(
+        tool_args.get("query", ""),
+        top_k=tool_args.get("top_k", RAG_SEARCH_DEFAULT_TOP_K),
+    )
+    return result, f"{result.get('count', 0)} tool memory matches found"
+
+
+def _run_search_web(tool_args: dict, runtime_state: dict):
+    del runtime_state
+    result = search_web_tool(tool_args.get("queries", []))
+    ok_count = sum(1 for row in result if "error" not in row)
+    return result, f"{ok_count} web results found"
+
+
+def _run_search_news_ddgs(tool_args: dict, runtime_state: dict):
+    del runtime_state
+    result = search_news_ddgs_tool(
+        tool_args.get("queries", []),
+        lang=tool_args.get("lang", "tr"),
+        when=tool_args.get("when"),
+    )
+    ok_count = sum(1 for row in result if "error" not in row)
+    return result, f"{ok_count} news articles found"
+
+
+def _run_search_news_google(tool_args: dict, runtime_state: dict):
+    del runtime_state
+    result = search_news_google_tool(
+        tool_args.get("queries", []),
+        lang=tool_args.get("lang", "tr"),
+        when=tool_args.get("when"),
+    )
+    ok_count = sum(1 for row in result if "error" not in row)
+    return result, f"{ok_count} news articles found"
+
+
+def _run_fetch_url(tool_args: dict, runtime_state: dict):
+    del runtime_state
+    result = fetch_url_tool(tool_args.get("url", ""))
+    return result, _summarize_fetch_result(result, tool_args.get("url", ""))
+
+
+def _run_create_canvas_document(tool_args: dict, runtime_state: dict):
+    canvas_state = _get_canvas_runtime_state(runtime_state)
+    document = create_canvas_document(
+        canvas_state,
+        title=tool_args.get("title", "Canvas"),
+        content=tool_args.get("content", ""),
+        format_name=tool_args.get("format", "markdown"),
+    )
+    return build_canvas_tool_result(document, action="created"), f"Canvas created: {document['title']}"
+
+
+def _run_rewrite_canvas_document(tool_args: dict, runtime_state: dict):
+    canvas_state = _get_canvas_runtime_state(runtime_state)
+    document = rewrite_canvas_document(
+        canvas_state,
+        content=tool_args.get("content", ""),
+        document_id=tool_args.get("document_id"),
+        title=tool_args.get("title"),
+    )
+    return build_canvas_tool_result(document, action="rewritten"), f"Canvas updated: {document['title']}"
+
+
+def _run_replace_canvas_lines(tool_args: dict, runtime_state: dict):
+    canvas_state = _get_canvas_runtime_state(runtime_state)
+    document = replace_canvas_lines(
+        canvas_state,
+        start_line=tool_args.get("start_line", 0),
+        end_line=tool_args.get("end_line", 0),
+        lines=tool_args.get("lines", []),
+        document_id=tool_args.get("document_id"),
+    )
+    return build_canvas_tool_result(document, action="lines_replaced"), f"Canvas lines replaced in {document['title']}"
+
+
+def _run_insert_canvas_lines(tool_args: dict, runtime_state: dict):
+    canvas_state = _get_canvas_runtime_state(runtime_state)
+    document = insert_canvas_lines(
+        canvas_state,
+        after_line=tool_args.get("after_line", 0),
+        lines=tool_args.get("lines", []),
+        document_id=tool_args.get("document_id"),
+    )
+    return build_canvas_tool_result(document, action="lines_inserted"), f"Canvas lines inserted in {document['title']}"
+
+
+def _run_delete_canvas_lines(tool_args: dict, runtime_state: dict):
+    canvas_state = _get_canvas_runtime_state(runtime_state)
+    document = delete_canvas_lines(
+        canvas_state,
+        start_line=tool_args.get("start_line", 0),
+        end_line=tool_args.get("end_line", 0),
+        document_id=tool_args.get("document_id"),
+    )
+    return build_canvas_tool_result(document, action="lines_deleted"), f"Canvas lines deleted in {document['title']}"
+
+
+def _run_delete_canvas_document(tool_args: dict, runtime_state: dict):
+    canvas_state = _get_canvas_runtime_state(runtime_state)
+    result = delete_canvas_document(
+        canvas_state,
+        document_id=tool_args.get("document_id"),
+    )
+    deleted_title = str(result.get("deleted_title") or "Canvas")
+    return result, f"Canvas deleted: {deleted_title}"
+
+
+def _run_clear_canvas(tool_args: dict, runtime_state: dict):
+    del tool_args
+    canvas_state = _get_canvas_runtime_state(runtime_state)
+    result = clear_canvas(canvas_state)
+    return result, f"Canvas cleared ({result.get('cleared_count', 0)} documents removed)"
+
+
+_TOOL_EXECUTORS = {
+    "append_scratchpad": _run_append_scratchpad,
+    "replace_scratchpad": _run_replace_scratchpad,
+    "ask_clarifying_question": _run_ask_clarifying_question,
+    "image_explain": _run_image_explain,
+    "search_knowledge_base": _run_search_knowledge_base,
+    "search_tool_memory": _run_search_tool_memory,
+    "search_web": _run_search_web,
+    "search_news_ddgs": _run_search_news_ddgs,
+    "search_news_google": _run_search_news_google,
+    "fetch_url": _run_fetch_url,
+    "create_canvas_document": _run_create_canvas_document,
+    "rewrite_canvas_document": _run_rewrite_canvas_document,
+    "replace_canvas_lines": _run_replace_canvas_lines,
+    "insert_canvas_lines": _run_insert_canvas_lines,
+    "delete_canvas_lines": _run_delete_canvas_lines,
+    "delete_canvas_document": _run_delete_canvas_document,
+    "clear_canvas": _run_clear_canvas,
+}
+
+
+def _execute_tool(tool_name: str, tool_args: dict, runtime_state: dict | None = None):
+    runtime_state = runtime_state if isinstance(runtime_state, dict) else {}
+    handler = _TOOL_EXECUTORS.get(tool_name)
+    if handler is not None:
+        return handler(tool_args if isinstance(tool_args, dict) else {}, runtime_state)
     return {"error": f"Unknown tool: {tool_name}"}, f"Unknown tool: {tool_name}"
 
 
@@ -1093,7 +1164,7 @@ def _format_list_tool_result(items: list[dict], title: str, link_key: str, extra
 
 
 def _build_tool_result_storage_entry(tool_name: str, tool_args: dict, result, summary: str, transcript_result=None) -> dict | None:
-    if tool_name == "search_knowledge_base":
+    if tool_name in {"search_knowledge_base", "search_tool_memory"}:
         return None
 
     text = ""
@@ -1189,9 +1260,9 @@ def run_agent_stream(
     enabled_tool_names: list[str],
     fetch_url_token_threshold: int | None = None,
     fetch_url_clip_aggressiveness: int | None = None,
+    initial_canvas_documents: list[dict] | None = None,
 ):
     messages = list(api_messages)
-    openai_tools = get_openai_tool_specs(enabled_tool_names)
     step = 0
     tool_result_cache = {}
     persisted_tool_results = []
@@ -1203,6 +1274,7 @@ def run_agent_stream(
     trace_id = uuid4().hex[:12]
     total_clean_content = ""
     fetch_attempt_counts: dict[str, int] = {}
+    canvas_modified = False
     usage_totals = {
         "prompt_tokens": 0,
         "completion_tokens": 0,
@@ -1210,6 +1282,18 @@ def run_agent_stream(
         "estimated_input_tokens": 0,
         "input_breakdown": _empty_input_breakdown(),
     }
+    runtime_state = {
+        "canvas": create_canvas_runtime_state(initial_canvas_documents),
+    }
+
+    def build_tool_capture_event() -> dict:
+        current_canvas_documents = get_canvas_runtime_documents(runtime_state.get("canvas"))
+        return {
+            "type": "tool_capture",
+            "tool_results": persisted_tool_results,
+            "canvas_documents": current_canvas_documents,
+            "canvas_cleared": canvas_modified and not current_canvas_documents,
+        }
 
     pricing = get_model_pricing(model)
     _trace_agent_event(
@@ -1283,6 +1367,7 @@ def run_agent_stream(
 
     def stream_model_turn(messages_to_send: list[dict], allow_tools: bool = True) -> dict:
         turn_reasoning_emitted = False
+        turn_tools = []
         _trace_agent_event(
             "model_turn_started",
             trace_id=trace_id,
@@ -1308,6 +1393,11 @@ def run_agent_stream(
             "stream": True,
             "stream_options": {"include_usage": True},
         }
+        if allow_tools:
+            turn_tools = get_openai_tool_specs(enabled_tool_names)
+            if turn_tools:
+                request_kwargs["tools"] = turn_tools
+                request_kwargs["tool_choice"] = "auto"
         response = client.chat.completions.create(**request_kwargs)
         estimated_breakdown, estimated_input_tokens = _estimate_input_breakdown(messages_to_send)
         usage_totals["estimated_input_tokens"] += estimated_input_tokens
@@ -1341,9 +1431,9 @@ def run_agent_stream(
         content_parts = []
         buffered_content_deltas = []
         tool_call_parts = []
+        content_streaming_live = False
         stream_error = None
-        answer_stream_held = False
-        answer_stream_released = False
+        _CONTENT_FLUSH_CHAR_THRESHOLD = 80
 
         try:
             for chunk in response:
@@ -1352,23 +1442,29 @@ def run_agent_stream(
                     reasoning_parts.append(reasoning_delta)
                     for event in emit_turn_reasoning(reasoning_delta):
                         yield event
-                if content_delta:
-                    content_parts.append(content_delta)
-                    buffered_content_deltas.append(content_delta)
-                    current_content = "".join(content_parts)
-                    if _should_hold_answer_stream(current_content):
-                        answer_stream_held = True
-                    elif not answer_stream_held:
-                        pending_deltas = buffered_content_deltas if not answer_stream_released else [content_delta]
-                        for pending_delta in pending_deltas:
-                            for event in emit_answer(pending_delta):
-                                yield event
-                        buffered_content_deltas.clear()
-                        answer_stream_released = True
                 if getattr(chunk, "choices", None):
                     delta = getattr(chunk.choices[0], "delta", None)
                     if delta is not None:
                         _merge_stream_tool_call_delta(tool_call_parts, delta)
+                if content_delta:
+                    content_parts.append(content_delta)
+                    if not turn_tools:
+                        for event in emit_answer(content_delta):
+                            yield event
+                    elif content_streaming_live:
+                        for event in emit_answer(content_delta):
+                            yield event
+                    elif tool_call_parts:
+                        buffered_content_deltas.append(content_delta)
+                    else:
+                        buffered_content_deltas.append(content_delta)
+                        buffered_chars = sum(len(d) for d in buffered_content_deltas)
+                        if buffered_chars >= _CONTENT_FLUSH_CHAR_THRESHOLD:
+                            content_streaming_live = True
+                            for pending in buffered_content_deltas:
+                                for event in emit_answer(pending):
+                                    yield event
+                            buffered_content_deltas = []
                 if getattr(chunk, "usage", None):
                     add_usage(chunk.usage)
         except Exception as exc:
@@ -1384,15 +1480,10 @@ def run_agent_stream(
         final_reasoning = "".join(reasoning_parts).strip()
         final_content = "".join(content_parts).strip()
         tool_calls, tool_call_error = _finalize_stream_tool_calls(tool_call_parts)
-        if not tool_calls and not tool_call_error:
-            tool_calls, tool_call_error, extracted_content = _extract_tool_calls_from_content(final_content)
-            final_content = extracted_content.strip() if tool_calls else extracted_content.strip()
-
         if buffered_content_deltas and not tool_calls and not tool_call_error:
             for pending_delta in buffered_content_deltas:
                 for event in emit_answer(pending_delta):
                     yield event
-            buffered_content_deltas.clear()
 
         _trace_agent_event(
             "model_turn_completed",
@@ -1441,12 +1532,10 @@ def run_agent_stream(
             yield {"type": "tool_error", "step": step, "tool": "parser", "error": tool_call_error}
             break
 
-        if content_text:
+        if content_text and not tool_calls:
             if needs_separator_for_sync and content_text.strip():
                 total_clean_content += "\n\n"
             total_clean_content += content_text
-            if tool_calls:
-                yield {"type": "answer_sync", "text": total_clean_content}
 
         _trace_agent_event(
             "tool_parse_result",
@@ -1475,7 +1564,7 @@ def run_agent_stream(
                     yield {"type": "tool_error", "step": step, "tool": "api", "error": stream_error}
                 if usage_totals["total_tokens"]:
                     yield usage_event()
-                yield {"type": "tool_capture", "tool_results": persisted_tool_results}
+                yield build_tool_capture_event()
                 yield {"type": "done"}
                 return
 
@@ -1584,7 +1673,7 @@ def run_agent_stream(
 
             yield {"type": "step_update", "step": step, "tool": tool_name, "preview": preview, "call_id": call_id}
 
-            if cache_key in tool_result_cache:
+            if tool_name not in CANVAS_TOOL_NAMES and cache_key in tool_result_cache:
                 cached_result, cached_summary = tool_result_cache[cache_key]
                 transcript_result = _prepare_tool_result_for_transcript(
                     tool_name,
@@ -1637,7 +1726,7 @@ def run_agent_stream(
                 continue
 
             try:
-                result, summary = _execute_tool(tool_name, tool_args)
+                result, summary = _execute_tool(tool_name, tool_args, runtime_state=runtime_state)
                 transcript_result = _prepare_tool_result_for_transcript(
                     tool_name,
                     result,
@@ -1645,15 +1734,35 @@ def run_agent_stream(
                     fetch_url_clip_aggressiveness=fetch_url_clip_aggressiveness,
                 )
 
-                tool_result_cache[cache_key] = (result, summary)
-                remember_tool_result(
+                if tool_name not in CANVAS_TOOL_NAMES:
+                    tool_result_cache[cache_key] = (result, summary)
+                storage_entry = _build_tool_result_storage_entry(
                     tool_name,
                     tool_args,
                     result,
                     summary,
-                    cache_key,
                     transcript_result=transcript_result,
                 )
+                if storage_entry and cache_key not in persisted_tool_cache_keys:
+                    persisted_tool_cache_keys.add(cache_key)
+                    persisted_tool_results.append(storage_entry)
+                if tool_name in WEB_TOOL_NAMES and storage_entry:
+                    try:
+                        upsert_tool_memory_result(
+                            tool_name,
+                            storage_entry.get("input_preview", ""),
+                            storage_entry.get("content", ""),
+                            storage_entry.get("summary", ""),
+                        )
+                    except Exception as exc:
+                        _trace_agent_event(
+                            "tool_memory_upsert_failed",
+                            trace_id=trace_id,
+                            step=step,
+                            tool_name=tool_name,
+                            tool_args=tool_args,
+                            error=str(exc),
+                        )
                 _trace_agent_event(
                     "tool_call_completed",
                     trace_id=trace_id,
@@ -1682,6 +1791,8 @@ def run_agent_stream(
                         "result": transcript_result,
                     }
                 )
+                if tool_name in CANVAS_TOOL_NAMES:
+                    canvas_modified = True
 
                 clarification_event = _extract_clarification_event(result)
                 if clarification_event is not None:
@@ -1699,7 +1810,7 @@ def run_agent_stream(
                     yield clarification_event
                     if usage_totals["total_tokens"]:
                         yield usage_event()
-                    yield {"type": "tool_capture", "tool_results": persisted_tool_results}
+                    yield build_tool_capture_event()
                     yield {"type": "done"}
                     return
             except Exception as exc:
@@ -1751,7 +1862,7 @@ def run_agent_stream(
                 yield event
         if usage_totals["total_tokens"]:
             yield usage_event()
-        yield {"type": "tool_capture", "tool_results": persisted_tool_results}
+        yield build_tool_capture_event()
         yield {"type": "done"}
         return
 
@@ -1790,5 +1901,5 @@ def run_agent_stream(
 
     if usage_totals["total_tokens"]:
         yield usage_event()
-    yield {"type": "tool_capture", "tool_results": persisted_tool_results}
+    yield build_tool_capture_event()
     yield {"type": "done"}

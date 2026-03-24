@@ -10,25 +10,46 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import requests as http_requests
-import web_tools
 
-from agent import FINAL_ANSWER_ERROR_TEXT, FINAL_ANSWER_MISSING_TEXT, _execute_tool, collect_agent_response, run_agent_stream
+import web_tools
+from agent import (
+    FINAL_ANSWER_ERROR_TEXT,
+    FINAL_ANSWER_MISSING_TEXT,
+    _execute_tool,
+    collect_agent_response,
+    run_agent_stream,
+)
 from app import create_app
+from canvas_service import create_canvas_runtime_state, find_latest_canvas_documents, normalize_canvas_document, replace_canvas_lines
 from db import (
     append_to_scratchpad,
     create_image_asset,
+    get_active_tool_names,
     get_app_settings,
     get_db,
-    get_active_tool_names,
     get_image_asset,
+    insert_message,
     normalize_active_tool_names,
     parse_message_metadata,
     save_app_settings,
     serialize_message_metadata,
 )
-from messages import build_api_messages, build_runtime_system_message, build_user_message_for_model, normalize_chat_messages, prepend_runtime_context
+from messages import (
+    build_api_messages,
+    build_runtime_system_message,
+    build_user_message_for_model,
+    normalize_chat_messages,
+    prepend_runtime_context,
+)
 from tool_registry import TOOL_SPEC_BY_NAME
-from web_tools import _extract_html, fetch_url_tool, load_proxies, search_news_ddgs_tool, search_news_google_tool, search_web_tool
+from web_tools import (
+    _extract_html,
+    fetch_url_tool,
+    load_proxies,
+    search_news_ddgs_tool,
+    search_news_google_tool,
+    search_web_tool,
+)
 
 
 class AppRoutesTestCase(unittest.TestCase):
@@ -52,10 +73,35 @@ class AppRoutesTestCase(unittest.TestCase):
         return response.get_json()["id"]
 
     @staticmethod
-    def _stream_chunk(reasoning: str = "", content: str = "", usage=None):
+    def _stream_chunk(reasoning: str = "", content: str = "", tool_calls=None, usage=None):
         return SimpleNamespace(
-            choices=[SimpleNamespace(delta=SimpleNamespace(reasoning_content=reasoning, content=content))] if (reasoning or content) else [],
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        reasoning_content=reasoning,
+                        content=content,
+                        tool_calls=tool_calls or [],
+                    )
+                )
+            ]
+            if (reasoning or content or tool_calls)
+            else [],
             usage=usage,
+        )
+
+    @staticmethod
+    def _tool_call_chunk(name: str, arguments: dict, call_id: str = "tool-call-1", index: int = 0):
+        return AppRoutesTestCase._stream_chunk(
+            tool_calls=[
+                {
+                    "index": index,
+                    "id": call_id,
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(arguments, ensure_ascii=False),
+                    },
+                }
+            ]
         )
 
     def test_settings_roundtrip(self):
@@ -65,10 +111,14 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(payload["scratchpad"], "")
         self.assertEqual(payload["max_steps"], 5)
         self.assertTrue(payload["rag_auto_inject"])
-        self.assertEqual(payload["chat_summary_trigger_message_count"], 40)
+        self.assertEqual(payload["chat_summary_mode"], "auto")
+        self.assertEqual(payload["chat_summary_trigger_token_count"], 6000)
         self.assertEqual(payload["chat_summary_batch_size"], 20)
         self.assertEqual(payload["fetch_url_token_threshold"], 3500)
         self.assertEqual(payload["fetch_url_clip_aggressiveness"], 50)
+        self.assertEqual(payload["rag_sensitivity"], "normal")
+        self.assertEqual(payload["rag_context_size"], "medium")
+        self.assertTrue(payload["tool_memory_auto_inject"])
         self.assertIn("features", payload)
         self.assertTrue(payload["features"]["rag_enabled"])
         self.assertTrue(payload["features"]["vision_enabled"])
@@ -78,12 +128,16 @@ class AppRoutesTestCase(unittest.TestCase):
             json={
                 "user_preferences": "Keep answers short.",
                 "max_steps": 3,
-                "chat_summary_trigger_message_count": 60,
+                "chat_summary_mode": "aggressive",
+                "chat_summary_trigger_token_count": 9000,
                 "chat_summary_batch_size": 15,
                 "fetch_url_token_threshold": 4200,
                 "fetch_url_clip_aggressiveness": 70,
                 "active_tools": ["fetch_url", "search_web"],
                 "rag_auto_inject": False,
+                "rag_sensitivity": "strict",
+                "rag_context_size": "large",
+                "tool_memory_auto_inject": False,
             },
         )
         self.assertEqual(response.status_code, 200)
@@ -91,12 +145,33 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(payload["user_preferences"], "Keep answers short.")
         self.assertEqual(payload["scratchpad"], "")
         self.assertEqual(payload["max_steps"], 3)
-        self.assertEqual(payload["chat_summary_trigger_message_count"], 60)
+        self.assertEqual(payload["chat_summary_mode"], "aggressive")
+        self.assertEqual(payload["chat_summary_trigger_token_count"], 9000)
         self.assertEqual(payload["chat_summary_batch_size"], 15)
         self.assertEqual(payload["fetch_url_token_threshold"], 4200)
         self.assertEqual(payload["fetch_url_clip_aggressiveness"], 70)
         self.assertEqual(payload["active_tools"], ["fetch_url", "search_web"])
         self.assertFalse(payload["rag_auto_inject"])
+        self.assertEqual(payload["rag_sensitivity"], "strict")
+        self.assertEqual(payload["rag_context_size"], "large")
+        self.assertFalse(payload["tool_memory_auto_inject"])
+
+    def test_settings_patch_rejects_invalid_rag_presets(self):
+        response = self.client.patch(
+            "/api/settings",
+            json={"rag_sensitivity": "aggressive"},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("rag_sensitivity", response.get_json()["error"])
+
+        response = self.client.patch(
+            "/api/settings",
+            json={"rag_context_size": "huge"},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("rag_context_size", response.get_json()["error"])
 
     def test_create_conversation_rejects_invalid_model(self):
         response = self.client.post(
@@ -107,9 +182,99 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.get_json()["error"], "Invalid model.")
 
+    def test_create_app_runs_bootstrap_rag_sync(self):
+        with patch("app.sync_conversations_to_rag_safe") as mocked_sync:
+            create_app(database_path=f"{self.temp_dir.name}/bootstrap.db")
+
+        mocked_sync.assert_called_once_with()
+
+    def test_create_conversation_triggers_auto_rag_sync(self):
+        with patch("routes.conversations.sync_conversations_to_rag_safe") as mocked_sync:
+            response = self.client.post(
+                "/api/conversations",
+                json={"title": "Test Chat", "model": "deepseek-chat"},
+            )
+
+        self.assertEqual(response.status_code, 201)
+        mocked_sync.assert_called_once_with(conversation_id=response.get_json()["id"])
+
+    def test_update_conversation_title_triggers_auto_rag_sync(self):
+        with patch("routes.conversations.sync_conversations_to_rag_safe") as mocked_sync:
+            conversation_id = self._create_conversation()
+            mocked_sync.reset_mock()
+
+            response = self.client.patch(
+                f"/api/conversations/{conversation_id}",
+                json={"title": "Renamed Chat"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        mocked_sync.assert_called_once_with(conversation_id=conversation_id)
+
+    def test_chat_route_triggers_auto_rag_sync_after_persist(self):
+        fake_events = iter(
+            [
+                {"type": "answer_start"},
+                {"type": "answer_delta", "text": "Done."},
+                {"type": "tool_capture", "tool_results": [], "canvas_documents": []},
+                {"type": "done"},
+            ]
+        )
+
+        with patch("routes.conversations.sync_conversations_to_rag_safe") as conversation_sync:
+            conversation_id = self._create_conversation()
+            conversation_sync.reset_mock()
+
+        with patch("routes.chat.run_agent_stream", return_value=fake_events), patch(
+            "routes.chat.sync_conversations_to_rag_safe"
+        ) as chat_sync:
+            response = self.client.post(
+                "/chat",
+                json={
+                    "conversation_id": conversation_id,
+                    "model": "deepseek-chat",
+                    "user_content": "Hello",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                },
+            )
+            response.get_data(as_text=True)
+
+        self.assertEqual(response.status_code, 200)
+        chat_sync.assert_called_once_with(conversation_id=conversation_id)
+
+    def test_generate_title_triggers_auto_rag_sync(self):
+        with patch("routes.conversations.sync_conversations_to_rag_safe"):
+            conversation_id = self._create_conversation()
+
+        with get_db() as conn:
+            insert_message(conn, conversation_id, "user", "Need a title")
+            insert_message(conn, conversation_id, "assistant", "Sure, here is the answer")
+            conn.execute(
+                "UPDATE conversations SET updated_at = datetime('now') WHERE id = ?",
+                (conversation_id,),
+            )
+
+        with patch(
+            "routes.chat.collect_agent_response",
+            return_value={"content": "Better Title", "errors": []},
+        ), patch("routes.chat.sync_conversations_to_rag_safe") as chat_sync:
+            response = self.client.post(f"/api/conversations/{conversation_id}/generate-title")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["title"], "Better Title")
+        chat_sync.assert_called_once_with(conversation_id=conversation_id)
+
     def test_active_tools_include_replace_scratchpad_for_existing_scratchpad_mode(self):
         settings = {"active_tools": json.dumps(["append_scratchpad", "search_web"]) }
         self.assertIn("replace_scratchpad", get_active_tool_names(settings))
+
+    def test_db_connections_enable_busy_timeout_and_wal_mode(self):
+        with get_db() as conn:
+            busy_timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+            journal_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+
+        self.assertEqual(busy_timeout, 30000)
+        self.assertEqual(str(journal_mode).lower(), "wal")
 
     def test_disabled_features_reflect_in_settings_and_routes(self):
         with patch("config.RAG_ENABLED", False), patch("db.RAG_ENABLED", False), patch("routes.pages.RAG_ENABLED", False), patch("routes.conversations.RAG_ENABLED", False):
@@ -152,33 +317,33 @@ class AppRoutesTestCase(unittest.TestCase):
         message = build_runtime_system_message(
             user_preferences="Keep answers short.",
             scratchpad="The user is 22 years old.",
-            active_tool_names=["append_scratchpad", "ask_clarifying_question", "image_explain", "search_knowledge_base"],
+            active_tool_names=[
+                "append_scratchpad",
+                "ask_clarifying_question",
+                "image_explain",
+                "search_knowledge_base",
+                "search_tool_memory",
+            ],
             retrieved_context="Context block",
+            tool_memory_context="Remembered web result",
             now=now,
         )
 
         self.assertEqual(message["role"], "system")
-        payload = json.loads(message["content"])
-        self.assertEqual(payload["context_type"], "runtime_prompt_context")
-        self.assertEqual(
-            payload["current_datetime"],
-            {
-                "iso": "2026-03-15T21:42:05+03:00",
-                "date": "2026-03-15",
-                "time": "21:42:05",
-                "weekday": "Sunday",
-                "timezone": "UTC+03:00",
-            },
-        )
-        self.assertEqual(payload["user_preferences"], "Keep answers short.")
-        self.assertEqual(payload["scratchpad"]["content"], "The user is 22 years old.")
-        self.assertIn("durable user facts", payload["scratchpad"]["memory_write_policy"])
-        self.assertEqual(payload["clarification_policy"]["tool"], "ask_clarifying_question")
-        self.assertIn("missing requirements", payload["clarification_policy"]["guidance"])
-        self.assertEqual(payload["image_follow_up_policy"]["tool"], "image_explain")
-        self.assertIn("stored prior image", payload["image_follow_up_policy"]["guidance"])
-        self.assertIsNotNone(payload["knowledge_base"])
-        self.assertEqual(payload["knowledge_base"]["auto_injected_context"], "Context block")
+        content = message["content"]
+        self.assertIn("## Current Date and Time", content)
+        self.assertIn("2026-03-15T21:42:05+03:00", content)
+        self.assertIn("User Preferences\nKeep answers short.", content)
+        self.assertIn("Scratchpad (AI Persistent Memory)", content)
+        self.assertIn("The user is 22 years old.", content)
+        self.assertIn("Durable user facts", content)
+        self.assertIn("Web findings", content)
+        self.assertIn("Clarification**: If a good answer depends", content)
+        self.assertIn("Image Follow-up**: Use for follow-up questions", content)
+        self.assertIn("Tool Memory", content)
+        self.assertIn("Remembered web result", content)
+        self.assertIn("Knowledge Base", content)
+        self.assertIn("Context block", content)
 
     def test_prepend_runtime_context_places_datetime_system_message_first(self):
         messages = prepend_runtime_context(
@@ -190,38 +355,24 @@ class AppRoutesTestCase(unittest.TestCase):
 
         self.assertEqual(messages[0]["role"], "system")
         
-        # Extract the JSON part from inside the ```json block
         content = messages[0]["content"]
-        json_str = content.split("```json")[-1].split("```")[0].strip()
-        payload = json.loads(json_str)
-        
-        self.assertIn("current_datetime", payload)
-        self.assertEqual(payload["scratchpad"]["content"], "Persistent note")
-        self.assertIsNone(payload["user_preferences"])
-        self.assertIn("date", payload["current_datetime"])
-        self.assertIn("time", payload["current_datetime"])
+        self.assertIn("Current Date and Time", content)
+        self.assertIn("Persistent note", content)
+        self.assertNotIn("User Preferences", content)
+        self.assertIn("Date: ", content)
+        self.assertIn("Time: ", content)
         self.assertEqual(messages[1]["role"], "user")
 
-    def test_settings_patch_rejects_manual_scratchpad_updates(self):
+    def test_settings_patch_allows_manual_scratchpad_updates(self):
         response = self.client.patch(
             "/api/settings",
-            json={"scratchpad": "manual override"},
+            json={"scratchpad": "The user likes concise answers.\nThe user likes concise answers.\n"},
         )
-
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("read-only", response.get_json()["error"])
-
-    def test_settings_patch_allows_manual_scratchpad_updates_in_admin_mode(self):
-        with patch("config.SCRATCHPAD_ADMIN_EDITING_ENABLED", True):
-            response = self.client.patch(
-                "/api/settings",
-                json={"scratchpad": "The user likes concise answers.\nThe user likes concise answers.\n"},
-            )
 
         self.assertEqual(response.status_code, 200)
         payload = response.get_json()
         self.assertEqual(payload["scratchpad"], "The user likes concise answers.")
-        self.assertTrue(payload["features"]["scratchpad_admin_editing"])
+        self.assertFalse(payload["features"]["scratchpad_admin_editing"])
 
     def test_settings_get_reports_scratchpad_admin_feature_flag(self):
         with patch("config.SCRATCHPAD_ADMIN_EDITING_ENABLED", True):
@@ -277,9 +428,49 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         first_call_messages = mocked_stream.call_args.args[0]
         full_content = first_call_messages[0]["content"]
-        json_str = full_content.split("```json")[-1].split("```")[0].strip()
-        runtime_payload = json.loads(json_str)
-        self.assertEqual(runtime_payload["scratchpad"]["content"], "The user prefers concise answers.")
+        self.assertIn("The user prefers concise answers.", full_content)
+
+    def test_chat_uses_saved_rag_sensitivity_and_context_size(self):
+        conversation_id = self._create_conversation()
+        save_app_settings(
+            {
+                "user_preferences": "",
+                "scratchpad": "",
+                "max_steps": "2",
+                "active_tools": "[]",
+                "rag_auto_inject": "true",
+                "rag_sensitivity": "strict",
+                "rag_context_size": "large",
+            }
+        )
+
+        fake_events = iter(
+            [
+                {"type": "answer_start"},
+                {"type": "answer_delta", "text": "Done."},
+                {"type": "tool_capture", "tool_results": []},
+                {"type": "done"},
+            ]
+        )
+
+        with patch("routes.chat.build_rag_auto_context", return_value=None) as mocked_rag, patch(
+            "routes.chat.run_agent_stream", return_value=fake_events
+        ):
+            response = self.client.post(
+                "/chat",
+                json={
+                    "conversation_id": conversation_id,
+                    "model": "deepseek-chat",
+                    "user_content": "Hello",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(mocked_rag.call_args.args[0], "Hello")
+        self.assertTrue(mocked_rag.call_args.args[1])
+        self.assertEqual(mocked_rag.call_args.kwargs["threshold"], 0.55)
+        self.assertEqual(mocked_rag.call_args.kwargs["top_k"], 8)
 
     def test_index_uses_external_app_script(self):
         response = self.client.get("/")
@@ -288,8 +479,9 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn("marked/marked.min.js", html)
         self.assertIn("dompurify/dist/purify.min.js", html)
         self.assertIn('id="app-bootstrap"', html)
-        self.assertIn('id="scratchpad-output"', html)
-        self.assertIn('id="scratchpad-admin-block"', html)
+        self.assertIn('id="scratchpad-list"', html)
+        self.assertIn('id="scratchpad-add-btn"', html)
+        self.assertIn('id="scratchpad-count"', html)
 
     def test_build_user_message_for_model_includes_stored_image_reference(self):
         content = build_user_message_for_model(
@@ -333,6 +525,40 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIsInstance(tool_args["questions"][0], dict)
         self.assertEqual(tool_args["questions"][0]["id"], "scope")
 
+    def test_clarification_tool_validator_accepts_plain_string_questions(self):
+        from agent import _validate_tool_arguments
+
+        tool_args = {
+            "questions": [
+                "Which operating system should I target?",
+                "Any hard constraints?",
+            ]
+        }
+
+        self.assertIsNone(_validate_tool_arguments("ask_clarifying_question", tool_args))
+        self.assertEqual(tool_args["questions"][0]["label"], "Which operating system should I target?")
+        self.assertEqual(tool_args["questions"][0]["input_type"], "text")
+
+    def test_execute_clarification_tool_normalizes_question_aliases(self):
+        result, summary = _execute_tool(
+            "ask_clarifying_question",
+            {
+                "questions": [
+                    {
+                        "key": "software",
+                        "question": "Hangi sanallaştırma yazılımını kullanacaksın?",
+                        "type": "single",
+                    }
+                ]
+            },
+        )
+
+        self.assertEqual(summary, "Awaiting user clarification")
+        self.assertEqual(result["status"], "needs_user_input")
+        self.assertEqual(result["clarification"]["questions"][0]["id"], "software")
+        self.assertEqual(result["clarification"]["questions"][0]["label"], "Hangi sanallaştırma yazılımını kullanacaksın?")
+        self.assertEqual(result["clarification"]["questions"][0]["input_type"], "text")
+
     def test_load_proxies_uses_cached_file_contents(self):
         proxies_path = Path(self.temp_dir.name) / "proxies.txt"
         proxies_path.write_text("http://127.0.0.1:8080\n", encoding="utf-8")
@@ -362,6 +588,88 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(summary, "Stored image not found")
         self.assertEqual(result["status"], "missing_image")
         self.assertIn("re-upload", result["error"])
+
+    def test_canvas_tools_create_and_edit_document_in_runtime_state(self):
+        runtime_state = {}
+
+        created, create_summary = _execute_tool(
+            "create_canvas_document",
+            {
+                "title": "Release Plan",
+                "content": "# Release Plan\n\n- Draft\n- Review",
+            },
+            runtime_state=runtime_state,
+        )
+        self.assertEqual(create_summary, "Canvas created: Release Plan")
+        self.assertEqual(created["action"], "created")
+        document_id = created["document_id"]
+
+        inserted, insert_summary = _execute_tool(
+            "insert_canvas_lines",
+            {
+                "document_id": document_id,
+                "after_line": 2,
+                "lines": ["", "## Notes", "- Ship after QA"],
+            },
+            runtime_state=runtime_state,
+        )
+        self.assertEqual(insert_summary, "Canvas lines inserted in Release Plan")
+        self.assertIn("## Notes", inserted["content"])
+
+        deleted, delete_summary = _execute_tool(
+            "delete_canvas_lines",
+            {
+                "document_id": document_id,
+                "start_line": 2,
+                "end_line": 2,
+            },
+            runtime_state=runtime_state,
+        )
+        self.assertEqual(delete_summary, "Canvas lines deleted in Release Plan")
+        self.assertNotIn("", deleted["content"].splitlines()[:1])
+
+    def test_canvas_tools_delete_and_clear_documents_in_runtime_state(self):
+        runtime_state = {}
+
+        created_first, _ = _execute_tool(
+            "create_canvas_document",
+            {
+                "title": "Draft One",
+                "content": "# Draft One",
+            },
+            runtime_state=runtime_state,
+        )
+        created_second, _ = _execute_tool(
+            "create_canvas_document",
+            {
+                "title": "Draft Two",
+                "content": "# Draft Two",
+            },
+            runtime_state=runtime_state,
+        )
+
+        deleted, delete_summary = _execute_tool(
+            "delete_canvas_document",
+            {"document_id": created_first["document_id"]},
+            runtime_state=runtime_state,
+        )
+
+        self.assertEqual(delete_summary, "Canvas deleted: Draft One")
+        self.assertEqual(deleted["action"], "deleted")
+        self.assertEqual(deleted["remaining_count"], 1)
+
+        cleared, clear_summary = _execute_tool(
+            "clear_canvas",
+            {},
+            runtime_state=runtime_state,
+        )
+
+        self.assertEqual(clear_summary, "Canvas cleared (1 documents removed)")
+        self.assertEqual(cleared["action"], "cleared")
+        self.assertEqual(cleared["cleared_count"], 1)
+        self.assertEqual(runtime_state["canvas"]["documents"], [])
+        self.assertIsNone(runtime_state["canvas"]["active_document_id"])
+        self.assertEqual(created_second["title"], "Draft Two")
 
     def test_chat_image_upload_persists_image_asset_and_metadata(self):
         conversation_id = self._create_conversation()
@@ -431,11 +739,11 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertTrue(script_path.exists())
         script_text = script_path.read_text(encoding="utf-8")
         self.assertIn('document.getElementById("app-bootstrap")', script_text)
-        self.assertIn('document.getElementById("scratchpad-output")', script_text)
-        self.assertIn('document.getElementById("scratchpad-input")', script_text)
+        self.assertIn('document.getElementById("scratchpad-list")', script_text)
+        self.assertIn('document.getElementById("scratchpad-add-btn")', script_text)
         self.assertIn("function renderScratchpad", script_text)
+        self.assertIn("function addScratchpadNote", script_text)
         self.assertIn('fetch("/api/settings")', script_text)
-        self.assertIn("scratchpad_admin_editing", script_text)
         self.assertIn("globalThis.marked", script_text)
         self.assertIn("function renderMarkdown", script_text)
         self.assertIn("INPUT_BREAKDOWN_ORDER", script_text)
@@ -471,30 +779,41 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn("function appendClarificationPanel(group, metadata, options = {})", script_text)
         self.assertIn("pending_clarification: pendingClarification", script_text)
         self.assertIn('clarification_response', script_text)
-        self.assertIn("NodeFilter.SHOW_TEXT", script_text)
-        self.assertIn("insertBefore(cursor", script_text)
+        self.assertIn("function renderBubbleWithCursor(bubbleEl, text)", script_text)
+        self.assertIn('bubbleEl.classList.add("streaming-text")', script_text)
+        self.assertIn("function renderBubbleMarkdown(bubbleEl, text)", script_text)
 
         style_path = Path(__file__).resolve().parent.parent / "static" / "style.css"
         style_text = style_path.read_text(encoding="utf-8")
         self.assertIn(".clarification-card", style_text)
         self.assertIn(".clarification-form", style_text)
+        self.assertIn(".bubble.streaming-text", style_text)
 
     def test_settings_ui_exposes_fetch_threshold_input(self):
         html = self.client.get("/").get_data(as_text=True)
         self.assertIn('value="append_scratchpad"', html)
         self.assertIn('value="ask_clarifying_question"', html)
-        self.assertIn('id="scratchpad-output"', html)
-        self.assertIn('id="scratchpad-input"', html)
+        self.assertIn('id="scratchpad-list"', html)
+        self.assertIn('id="scratchpad-add-btn"', html)
+        self.assertIn('id="summary-mode-select"', html)
         self.assertIn('id="summary-trigger-input"', html)
         self.assertIn('id="summary-batch-input"', html)
         self.assertIn('id="fetch-threshold-input"', html)
         self.assertIn('id="fetch-aggressiveness-input"', html)
+        self.assertIn('id="rag-sensitivity-select"', html)
+        self.assertIn('id="rag-context-size-select"', html)
+        self.assertIn('id="rag-sensitivity-hint"', html)
+
+        script_path = Path(__file__).resolve().parent.parent / "static" / "app.js"
+        script_text = script_path.read_text(encoding="utf-8")
+        self.assertIn("const RAG_SENSITIVITY_HINTS = {", script_text)
+        self.assertIn('rag_context_size', script_text)
 
     def test_run_agent_stream_executes_append_scratchpad_tool(self):
         responses = [
             iter(
                 [
-                    self._stream_chunk(content='{"tool_calls":[{"name":"append_scratchpad","arguments":{"note":"The user is 22 years old."}}]}'),
+                    self._tool_call_chunk("append_scratchpad", {"note": "The user is 22 years old."}),
                     self._stream_chunk(usage=SimpleNamespace(prompt_tokens=3, completion_tokens=3, total_tokens=6)),
                 ]
             ),
@@ -521,15 +840,23 @@ class AppRoutesTestCase(unittest.TestCase):
         responses = [
             iter(
                 [
-                    self._stream_chunk(
-                        content=(
-                            '{"tool_calls":[{"name":"ask_clarifying_question","arguments":'
-                            '{"intro":"Before I answer, I need two details.","questions":['
-                            '{"id":"scope","label":"Which scope?","input_type":"single_select","options":['
-                            '{"label":"Only this repo","value":"repo"},'
-                            '{"label":"General tool","value":"general"}]},'
-                            '{"id":"notes","label":"Anything else?","input_type":"text","required":false}]}}]}'
-                        )
+                    self._tool_call_chunk(
+                        "ask_clarifying_question",
+                        {
+                            "intro": "Before I answer, I need two details.",
+                            "questions": [
+                                {
+                                    "id": "scope",
+                                    "label": "Which scope?",
+                                    "input_type": "single_select",
+                                    "options": [
+                                        {"label": "Only this repo", "value": "repo"},
+                                        {"label": "General tool", "value": "general"},
+                                    ],
+                                },
+                                {"id": "notes", "label": "Anything else?", "input_type": "text", "required": False},
+                            ],
+                        },
                     ),
                     self._stream_chunk(usage=SimpleNamespace(prompt_tokens=3, completion_tokens=4, total_tokens=7)),
                 ]
@@ -954,12 +1281,340 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(metadata["tool_trace"][0]["state"], "done")
         self.assertTrue(metadata["tool_trace"][0]["cached"])
 
-    def test_run_agent_stream_executes_custom_json_tool_calls(self):
+    def test_serialize_message_metadata_keeps_canvas_documents(self):
+        payload = serialize_message_metadata(
+            {
+                "canvas_documents": [
+                    {
+                        "id": "canvas-1",
+                        "title": "Draft",
+                        "format": "markdown",
+                        "content": "# Draft\n\nHello",
+                    },
+                    {
+                        "id": "canvas-2",
+                        "title": "Notes",
+                        "format": "markdown",
+                        "content": "# Notes\n\nExtra",
+                    }
+                ]
+            }
+        )
+
+        metadata = parse_message_metadata(payload)
+        self.assertEqual(metadata["canvas_documents"][0]["id"], "canvas-1")
+        self.assertEqual(metadata["canvas_documents"][0]["title"], "Draft")
+        self.assertEqual(metadata["canvas_documents"][1]["id"], "canvas-2")
+
+    def test_serialize_message_metadata_keeps_canvas_cleared_flag(self):
+        payload = serialize_message_metadata(
+            {
+                "canvas_documents": [],
+                "canvas_cleared": True,
+            }
+        )
+
+        metadata = parse_message_metadata(payload)
+        self.assertEqual(metadata["canvas_documents"], [])
+        self.assertTrue(metadata["canvas_cleared"])
+
+    def test_find_latest_canvas_documents_stops_at_cleared_marker(self):
+        messages = [
+            {
+                "id": 1,
+                "metadata": {
+                    "canvas_documents": [
+                        {
+                            "id": "canvas-1",
+                            "title": "Draft",
+                            "format": "markdown",
+                            "content": "# Draft",
+                        }
+                    ]
+                },
+            },
+            {
+                "id": 2,
+                "metadata": {
+                    "canvas_documents": [],
+                    "canvas_cleared": True,
+                },
+            },
+        ]
+
+        self.assertEqual(find_latest_canvas_documents(messages), [])
+
+    def test_create_canvas_runtime_state_preserves_multiple_documents(self):
+        runtime_state = create_canvas_runtime_state(
+            [
+                {"id": "canvas-1", "title": "Draft", "format": "markdown", "content": "one"},
+                {"id": "canvas-2", "title": "Notes", "format": "markdown", "content": "two"},
+            ]
+        )
+
+        self.assertEqual(len(runtime_state["documents"]), 2)
+        self.assertEqual(runtime_state["active_document_id"], "canvas-2")
+
+    def test_chat_persists_canvas_documents_from_tool_capture(self):
+        conversation_id = self._create_conversation()
+        fake_events = iter(
+            [
+                {"type": "answer_start"},
+                {"type": "answer_delta", "text": "I prepared a draft."},
+                {
+                    "type": "tool_capture",
+                    "tool_results": [],
+                    "canvas_documents": [
+                        {
+                            "id": "canvas-1",
+                            "title": "Draft",
+                            "format": "markdown",
+                            "content": "# Draft\n\nInitial version",
+                        }
+                    ],
+                },
+                {"type": "done"},
+            ]
+        )
+
+        with patch("routes.chat.run_agent_stream", return_value=fake_events):
+            response = self.client.post(
+                "/chat",
+                json={
+                    "conversation_id": conversation_id,
+                    "model": "deepseek-chat",
+                    "user_content": "Create a draft",
+                    "messages": [{"role": "user", "content": "Create a draft"}],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        events = [json.loads(line) for line in response.get_data(as_text=True).strip().splitlines()]
+        canvas_event = next((event for event in events if event["type"] == "canvas_sync"), None)
+        self.assertIsNotNone(canvas_event)
+        self.assertEqual(canvas_event["documents"][0]["title"], "Draft")
+
+        conversation_response = self.client.get(f"/api/conversations/{conversation_id}")
+        messages = conversation_response.get_json()["messages"]
+        assistant_messages = [message for message in messages if message["role"] == "assistant"]
+        self.assertEqual(assistant_messages[-1]["metadata"]["canvas_documents"][0]["id"], "canvas-1")
+
+    def test_chat_persists_canvas_documents_without_text_response(self):
+        conversation_id = self._create_conversation()
+        fake_events = iter(
+            [
+                {
+                    "type": "tool_capture",
+                    "tool_results": [],
+                    "canvas_documents": [
+                        {
+                            "id": "canvas-empty-answer",
+                            "title": "Draft",
+                            "format": "markdown",
+                            "content": "# Draft\n\nInitial version",
+                        }
+                    ],
+                },
+                {"type": "done"},
+            ]
+        )
+
+        with patch("routes.chat.run_agent_stream", return_value=fake_events):
+            response = self.client.post(
+                "/chat",
+                json={
+                    "conversation_id": conversation_id,
+                    "model": "deepseek-chat",
+                    "user_content": "Create a draft",
+                    "messages": [{"role": "user", "content": "Create a draft"}],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        events = [json.loads(line) for line in response.get_data(as_text=True).strip().splitlines()]
+        canvas_event = next((event for event in events if event["type"] == "canvas_sync"), None)
+        self.assertIsNotNone(canvas_event)
+
+        conversation_response = self.client.get(f"/api/conversations/{conversation_id}")
+        messages = conversation_response.get_json()["messages"]
+        assistant_messages = [message for message in messages if message["role"] == "assistant"]
+        self.assertEqual(len(assistant_messages), 1)
+        self.assertEqual(assistant_messages[0]["content"], "")
+        self.assertEqual(
+            assistant_messages[0]["metadata"]["canvas_documents"][0]["id"],
+            "canvas-empty-answer",
+        )
+
+    def test_chat_persists_cleared_canvas_without_documents(self):
+        conversation_id = self._create_conversation()
+        fake_events = iter(
+            [
+                {
+                    "type": "tool_capture",
+                    "tool_results": [],
+                    "canvas_documents": [],
+                    "canvas_cleared": True,
+                },
+                {"type": "done"},
+            ]
+        )
+
+        with patch("routes.chat.run_agent_stream", return_value=fake_events):
+            response = self.client.post(
+                "/chat",
+                json={
+                    "conversation_id": conversation_id,
+                    "model": "deepseek-chat",
+                    "user_content": "Clear the canvas",
+                    "messages": [{"role": "user", "content": "Clear the canvas"}],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        events = [json.loads(line) for line in response.get_data(as_text=True).strip().splitlines()]
+        canvas_event = next((event for event in events if event["type"] == "canvas_sync"), None)
+        self.assertIsNotNone(canvas_event)
+        self.assertEqual(canvas_event["documents"], [])
+        self.assertTrue(canvas_event["cleared"])
+
+        conversation_response = self.client.get(f"/api/conversations/{conversation_id}")
+        messages = conversation_response.get_json()["messages"]
+        assistant_messages = [message for message in messages if message["role"] == "assistant"]
+        self.assertEqual(len(assistant_messages), 1)
+        self.assertEqual(assistant_messages[0]["metadata"]["canvas_documents"], [])
+        self.assertTrue(assistant_messages[0]["metadata"]["canvas_cleared"])
+
+    def test_canvas_export_endpoint_returns_markdown_and_pdf(self):
+        conversation_id = self._create_conversation()
+        metadata = serialize_message_metadata(
+            {
+                "canvas_documents": [
+                    {
+                        "id": "canvas-export",
+                        "title": "Draft Export",
+                        "format": "markdown",
+                        "content": "# Export\n\n- One\n- Two",
+                    }
+                ]
+            }
+        )
+
+        with get_db() as conn:
+            insert_message(conn, conversation_id, "assistant", "Here is the draft.", metadata=metadata)
+
+        markdown_response = self.client.get(
+            f"/api/conversations/{conversation_id}/canvas/export?format=md&document_id=canvas-export"
+        )
+        self.assertEqual(markdown_response.status_code, 200)
+        self.assertEqual(markdown_response.mimetype, "text/markdown")
+        self.assertIn("attachment; filename=\"Draft-Export.md\"", markdown_response.headers["Content-Disposition"])
+        self.assertIn("# Export", markdown_response.get_data(as_text=True))
+
+        pdf_response = self.client.get(
+            f"/api/conversations/{conversation_id}/canvas/export?format=pdf&document_id=canvas-export"
+        )
+        self.assertEqual(pdf_response.status_code, 200)
+        self.assertEqual(pdf_response.mimetype, "application/pdf")
+        self.assertTrue(pdf_response.data.startswith(b"%PDF"))
+
+        html_response = self.client.get(
+            f"/api/conversations/{conversation_id}/canvas/export?format=html&document_id=canvas-export"
+        )
+        self.assertEqual(html_response.status_code, 200)
+        self.assertEqual(html_response.mimetype, "text/html")
+        self.assertIn("attachment; filename=\"Draft-Export.html\"", html_response.headers["Content-Disposition"])
+        self.assertIn("<ul>", html_response.get_data(as_text=True))
+
+    def test_conversation_export_endpoint_returns_markdown_docx_and_pdf(self):
+        conversation_id = self._create_conversation("Exportable Chat")
+
+        with get_db() as conn:
+            insert_message(conn, conversation_id, "user", "Hello")
+            insert_message(
+                conn,
+                conversation_id,
+                "assistant",
+                "Here is the answer.",
+                metadata=serialize_message_metadata(
+                    {
+                        "reasoning_content": "Reasoned through the request.",
+                        "tool_trace": [
+                            {
+                                "tool_name": "search_web",
+                                "step": 1,
+                                "preview": "hello",
+                                "summary": "1 web result found",
+                                "state": "done",
+                            }
+                        ],
+                    }
+                ),
+            )
+
+        markdown_response = self.client.get(f"/api/conversations/{conversation_id}/export?format=md")
+        self.assertEqual(markdown_response.status_code, 200)
+        self.assertEqual(markdown_response.mimetype, "text/markdown")
+        self.assertIn("attachment; filename=\"Exportable-Chat.md\"", markdown_response.headers["Content-Disposition"])
+        self.assertIn("## 1. User", markdown_response.get_data(as_text=True))
+        self.assertIn("### Tool Trace", markdown_response.get_data(as_text=True))
+
+        docx_response = self.client.get(f"/api/conversations/{conversation_id}/export?format=docx")
+        self.assertEqual(docx_response.status_code, 200)
+        self.assertEqual(
+            docx_response.mimetype,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+        self.assertTrue(docx_response.data.startswith(b"PK"))
+
+        pdf_response = self.client.get(f"/api/conversations/{conversation_id}/export?format=pdf")
+        self.assertEqual(pdf_response.status_code, 200)
+        self.assertEqual(pdf_response.mimetype, "application/pdf")
+        self.assertTrue(pdf_response.data.startswith(b"%PDF"))
+
+    def test_canvas_line_replace_rejects_out_of_bounds_start_line(self):
+        runtime_state = create_canvas_runtime_state(
+            [
+                {
+                    "id": "canvas-1",
+                    "title": "Draft",
+                    "content": "line 1\nline 2",
+                    "format": "markdown",
+                }
+            ]
+        )
+
+        with self.assertRaisesRegex(ValueError, "Line range exceeds"):
+            replace_canvas_lines(runtime_state, 3, 3, ["replacement"], document_id="canvas-1")
+
+    def test_normalize_canvas_document_falls_back_to_default_title(self):
+        normalized = normalize_canvas_document(
+            {
+                "id": "canvas-blank-title",
+                "title": "   ",
+                "format": "markdown",
+                "content": "content",
+            }
+        )
+
+        self.assertEqual(normalized["title"], "Canvas")
+
+    def test_run_agent_stream_executes_native_tool_calls(self):
         responses = [
             iter(
                 [
                     self._stream_chunk(reasoning="Need current info. "),
-                    self._stream_chunk(content='{"tool_calls":[{"name":"search_web","arguments":{"queries":["test query"]}}]}'),
+                    self._stream_chunk(
+                        tool_calls=[
+                            {
+                                "index": 0,
+                                "id": "tool-call-1",
+                                "function": {
+                                    "name": "search_web",
+                                    "arguments": '{"queries":["test query"]}',
+                                },
+                            }
+                        ]
+                    ),
                     self._stream_chunk(usage=SimpleNamespace(prompt_tokens=4, completion_tokens=6, total_tokens=10)),
                 ]
             ),
@@ -989,9 +1644,15 @@ class AppRoutesTestCase(unittest.TestCase):
 
         for call in mocked_create.call_args_list:
             _, kwargs = call
-            self.assertNotIn("tools", kwargs)
-            self.assertNotIn("tool_choice", kwargs)
             self.assertTrue(kwargs.get("stream"))
+
+        first_call_kwargs = mocked_create.call_args_list[0].kwargs
+        self.assertIn("tools", first_call_kwargs)
+        self.assertEqual(first_call_kwargs["tool_choice"], "auto")
+
+        second_call_kwargs = mocked_create.call_args_list[1].kwargs
+        self.assertIn("tools", second_call_kwargs)
+        self.assertEqual(second_call_kwargs["tool_choice"], "auto")
 
         usage_events = [event for event in events if event["type"] == "usage"]
         self.assertEqual(len(usage_events), 1)
@@ -1087,15 +1748,16 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(leaked_reasoning, [])
 
         second_call_messages = mocked_create.call_args_list[1].kwargs["messages"]
-        retry_instruction = json.loads(second_call_messages[-1]["content"])
-        self.assertEqual(retry_instruction["context_type"], "final_answer_retry")
+        retry_content = second_call_messages[-1]["content"]
+        self.assertIn("MISSING FINAL ANSWER", retry_content)
+        self.assertIn("assistant content only", retry_content)
 
     def test_run_agent_stream_separates_reasoning_turns_with_blank_line(self):
         responses = [
             iter(
                 [
                     self._stream_chunk(reasoning="First reasoning block."),
-                    self._stream_chunk(content='{"tool_calls":[{"name":"search_web","arguments":{"queries":["x"]}}]}'),
+                    self._tool_call_chunk("search_web", {"queries": ["x"]}),
                     self._stream_chunk(usage=SimpleNamespace(prompt_tokens=2, completion_tokens=3, total_tokens=5)),
                 ]
             ),
@@ -1355,6 +2017,54 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn("Current USD and EUR rates are listed here.", result["content"])
         self.assertTrue(mocked_cache_set.called)
 
+    def test_fetch_url_tool_retries_without_ssl_verification_on_cert_failure(self):
+        verify_values = []
+
+        class FakeResponse:
+            def __init__(self):
+                self.headers = {"Content-Type": "text/html; charset=utf-8"}
+                self.url = "https://example.com/page"
+                self.encoding = "utf-8"
+                self.status_code = 200
+
+            def iter_content(self, chunk_size=8192):
+                yield b"<html><head><title>Example</title></head><body><main>Trusted content</main></body></html>"
+
+        class FakeSession:
+            def __init__(self):
+                self.max_redirects = 0
+                self.trust_env = False
+                self.proxies = {}
+
+            def get(self, *args, **kwargs):
+                verify_values.append(kwargs.get("verify", True))
+                if kwargs.get("verify", True):
+                    raise http_requests.exceptions.SSLError(
+                        "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed"
+                    )
+                return FakeResponse()
+
+            def close(self):
+                return None
+
+        with patch("web_tools._is_safe_url", return_value=(True, "")), patch(
+            "web_tools.cache_get",
+            return_value=None,
+        ), patch("web_tools.cache_set") as mocked_cache_set, patch(
+            "web_tools.get_proxy_candidates",
+            return_value=[None],
+        ), patch("web_tools.http_requests.Session", side_effect=FakeSession):
+            result = fetch_url_tool("https://example.com/page")
+
+        self.assertGreaterEqual(len(verify_values), 2)
+        self.assertEqual(verify_values[:2], [True, False])
+        self.assertEqual(verify_values[::2], [True] * (len(verify_values) // 2))
+        self.assertEqual(verify_values[1::2], [False] * (len(verify_values) // 2))
+        self.assertEqual(result["title"], "Example")
+        self.assertTrue(result["ssl_verification_bypassed"])
+        self.assertIn("without certificate verification", result["fetch_warning"])
+        self.assertTrue(mocked_cache_set.called)
+
     def test_fetch_url_tool_does_not_cache_empty_blocked_page(self):
         class FakeResponse:
             def __init__(self):
@@ -1479,9 +2189,7 @@ class AppRoutesTestCase(unittest.TestCase):
         responses = [
             iter(
                 [
-                    self._stream_chunk(
-                        content='{"tool_calls":[{"name":"fetch_url","arguments":{"url":"https://example.com/long"}}]}'
-                    ),
+                    self._tool_call_chunk("fetch_url", {"url": "https://example.com/long"}),
                     self._stream_chunk(usage=SimpleNamespace(prompt_tokens=3, completion_tokens=5, total_tokens=8)),
                 ]
             ),
@@ -1531,20 +2239,16 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(stored_result["raw_content"], long_content.strip())
 
         second_call_messages = mocked_create.call_args_list[1].kwargs["messages"]
-        transcript_payload = json.loads(second_call_messages[-1]["content"])
-        transcript_result = transcript_payload["tool_results"][0]["result"]
-        self.assertEqual(transcript_result["content_mode"], "clipped_text")
-        self.assertIn("cleaned and clipped", transcript_result["summary_notice"])
-        self.assertTrue(long_content.startswith(transcript_result["content"].rstrip("…")))
-        self.assertNotEqual(transcript_result["content"], long_content)
+        transcript_content = second_call_messages[-1]["content"]
+        self.assertIn("TOOL EXECUTION RESULTS", transcript_content)
+        self.assertIn("fetch_url", transcript_content)
+        self.assertIn("OK", transcript_content)
 
     def test_run_agent_stream_marks_fetch_failures_clearly_in_transcript(self):
         responses = [
             iter(
                 [
-                    self._stream_chunk(
-                        content='{"tool_calls":[{"name":"fetch_url","arguments":{"url":"https://example.com/blocked"}}]}'
-                    ),
+                    self._tool_call_chunk("fetch_url", {"url": "https://example.com/blocked"}),
                     self._stream_chunk(usage=SimpleNamespace(prompt_tokens=3, completion_tokens=5, total_tokens=8)),
                 ]
             ),
@@ -1576,20 +2280,17 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn("fetch_url already attempted this URL", stored_result["fetch_diagnostic"])
 
         second_call_messages = mocked_create.call_args_list[1].kwargs["messages"]
-        transcript_payload = json.loads(second_call_messages[-1]["content"])
-        self.assertIn("For fetch_url results", transcript_payload["fetch_guidance"])
-        transcript_entry = transcript_payload["tool_results"][0]
-        self.assertFalse(transcript_entry["ok"])
-        self.assertEqual(transcript_entry["result"]["fetch_outcome"], "error")
-        self.assertIn("HTTP 403", transcript_entry["result"]["fetch_diagnostic"])
+        transcript_content = second_call_messages[-1]["content"]
+        self.assertIn("TOOL EXECUTION RESULTS", transcript_content)
+        self.assertIn("source of truth", transcript_content)
+        self.assertIn("fetch_url", transcript_content)
+        self.assertIn("FAILED", transcript_content)
 
     def test_run_agent_stream_marks_partial_fetch_as_already_attempted(self):
         responses = [
             iter(
                 [
-                    self._stream_chunk(
-                        content='{"tool_calls":[{"name":"fetch_url","arguments":{"url":"https://example.com/page"}}]}'
-                    ),
+                    self._tool_call_chunk("fetch_url", {"url": "https://example.com/page"}),
                     self._stream_chunk(usage=SimpleNamespace(prompt_tokens=3, completion_tokens=5, total_tokens=8)),
                 ]
             ),
@@ -1624,27 +2325,22 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn("Do not repeat the same fetch_url call", stored_result["fetch_diagnostic"])
 
         second_call_messages = mocked_create.call_args_list[1].kwargs["messages"]
-        transcript_payload = json.loads(second_call_messages[-1]["content"])
-        transcript_entry = transcript_payload["tool_results"][0]
-        self.assertTrue(transcript_entry["ok"])
-        self.assertEqual(transcript_entry["result"]["fetch_outcome"], "partial_content")
-        self.assertIn("partial page content", transcript_entry["result"]["fetch_diagnostic"].lower())
+        transcript_content = second_call_messages[-1]["content"]
+        self.assertIn("TOOL EXECUTION RESULTS", transcript_content)
+        self.assertIn("fetch_url", transcript_content)
+        self.assertIn("OK", transcript_content)
 
     def test_run_agent_stream_logs_duplicate_fetch_url_calls(self):
         responses = [
             iter(
                 [
-                    self._stream_chunk(
-                        content='{"tool_calls":[{"name":"fetch_url","arguments":{"url":"https://example.com/page"}}]}'
-                    ),
+                    self._tool_call_chunk("fetch_url", {"url": "https://example.com/page"}),
                     self._stream_chunk(usage=SimpleNamespace(prompt_tokens=3, completion_tokens=5, total_tokens=8)),
                 ]
             ),
             iter(
                 [
-                    self._stream_chunk(
-                        content='{"tool_calls":[{"name":"fetch_url","arguments":{"url":"https://example.com/page"}}]}'
-                    ),
+                    self._tool_call_chunk("fetch_url", {"url": "https://example.com/page"}),
                     self._stream_chunk(usage=SimpleNamespace(prompt_tokens=3, completion_tokens=5, total_tokens=8)),
                 ]
             ),
@@ -1675,10 +2371,9 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn("Page content extracted", tool_result_summaries[1])
 
         third_call_messages = mocked_create.call_args_list[2].kwargs["messages"]
-        transcript_payload = json.loads(third_call_messages[-1]["content"])
-        transcript_entry = transcript_payload["tool_results"][0]
-        self.assertTrue(transcript_entry["ok"])
-        self.assertTrue(transcript_entry["cached"])
+        transcript_content = third_call_messages[-1]["content"]
+        self.assertIn("TOOL EXECUTION RESULTS", transcript_content)
+        self.assertIn("fetch_url", transcript_content)
         duplicate_logs = [call for call in mocked_trace.call_args_list if call.args and call.args[0] == "duplicate_fetch_attempt"]
         self.assertEqual(len(duplicate_logs), 1)
         self.assertEqual(duplicate_logs[0].kwargs["url"], "https://example.com/page")
@@ -1708,11 +2403,11 @@ class AppRoutesTestCase(unittest.TestCase):
 
         self.assertGreater(len(less_aggressive["content"]), len(more_aggressive["content"]))
 
-    def test_run_agent_stream_recovers_tool_json_from_mixed_text(self):
+    def test_run_agent_stream_executes_native_tool_call_without_content_fallback(self):
         responses = [
             iter(
                 [
-                    self._stream_chunk(content='Before\n```json\n{"tool_calls":[{"name":"search_web","arguments":{"queries":["x"]}}]}\n```'),
+                    self._tool_call_chunk("search_web", {"queries": ["x"]}),
                     self._stream_chunk(usage=SimpleNamespace(prompt_tokens=2, completion_tokens=3, total_tokens=5)),
                 ]
             ),
@@ -1730,36 +2425,27 @@ class AppRoutesTestCase(unittest.TestCase):
         ):
             events = list(run_agent_stream([{"role": "user", "content": "Test"}], "deepseek-chat", 2, ["search_web"]))
 
-        parser_errors = [event for event in events if event["type"] == "tool_error" and event["tool"] == "parser"]
-        self.assertEqual(parser_errors, [])
         self.assertIn("step_update", [event["type"] for event in events])
         self.assertIn("tool_result", [event["type"] for event in events])
         self.assertIn({"type": "answer_delta", "text": "Recovered answer"}, events)
 
-    def test_run_agent_stream_suppresses_pre_tool_text_from_answer_and_injects_as_assistant_message(self):
-        """When model outputs text before a ```json tool_call block:
-        - The text must NOT leak into answer_delta events (no raw JSON shown to user)
-        - The text must be injected as an assistant message so the model sees its own commitment
-        """
+    def test_run_agent_stream_suppresses_native_pre_tool_text_from_answer_and_preserves_history(self):
         captured_calls = []
 
-        def fake_create(model, messages, stream, stream_options=None):
+        def fake_create(model, messages, stream, stream_options=None, tools=None, tool_choice=None):
             captured_calls.append(list(messages))
             call_index = len(captured_calls)
             if call_index == 1:
-                # Step 1: model outputs narrative text + tool_call JSON block
                 return iter(
                     [
-                        self._stream_chunk(
-                            content='Okay, I will check now.\n\n```json\n{"tool_calls":[{"name":"search_web","arguments":{"queries":["test"]}}]}\n```'
-                        ),
+                        self._stream_chunk(content="Okay, I will check now."),
+                        self._tool_call_chunk("search_web", {"queries": ["test"]}),
                         self._stream_chunk(
                             usage=SimpleNamespace(prompt_tokens=5, completion_tokens=20, total_tokens=25)
                         ),
                     ]
                 )
             else:
-                # Step 2: model returns final answer
                 return iter(
                     [
                         self._stream_chunk(content="Here is the result."),
@@ -1775,16 +2461,11 @@ class AppRoutesTestCase(unittest.TestCase):
         ):
             events = list(run_agent_stream([{"role": "user", "content": "Test"}], "deepseek-chat", 2, ["search_web"]))
 
-        # Raw JSON block must NOT appear in any answer_delta
         answer_texts = [event["text"] for event in events if event["type"] == "answer_delta"]
         combined_answer = "".join(answer_texts)
-        self.assertNotIn("tool_calls", combined_answer, "Raw JSON tool_call must not leak into answer stream")
-        self.assertNotIn("```", combined_answer, "Fenced code block must not leak into answer stream")
-
-        # The final answer should arrive correctly
+        self.assertNotIn("Okay, I will check now.", combined_answer)
         self.assertIn("Here is the result.", combined_answer)
 
-        # The second model call must include an assistant message with the pre-tool narrative text
         self.assertGreaterEqual(len(captured_calls), 2, "Expected at least 2 model calls")
         second_call_messages = captured_calls[1]
         assistant_messages = [m for m in second_call_messages if m.get("role") == "assistant"]
@@ -1922,9 +2603,13 @@ class AppRoutesTestCase(unittest.TestCase):
 
         with get_db() as conn:
             rows = conn.execute(
-                "SELECT id, role, content FROM messages WHERE conversation_id = ? ORDER BY id",
+                "SELECT id, role, content FROM messages WHERE conversation_id = ? AND deleted_at IS NULL ORDER BY id",
                 (conversation_id,),
             ).fetchall()
+            deleted_row = conn.execute(
+                "SELECT deleted_at FROM messages WHERE id = ?",
+                (stale_assistant_id,),
+            ).fetchone()
 
         self.assertEqual(
             [(row["id"], row["role"], row["content"]) for row in rows],
@@ -1935,7 +2620,8 @@ class AppRoutesTestCase(unittest.TestCase):
                 (message_ids_event["assistant_message_id"], "assistant", "New answer"),
             ],
         )
-        self.assertFalse(any(row["id"] == stale_assistant_id for row in rows))
+        self.assertIsNotNone(deleted_row)
+        self.assertIsNotNone(deleted_row["deleted_at"])
 
     def test_chat_stream_emits_history_sync_with_canonical_messages(self):
         conversation_id = self._create_conversation()
@@ -1976,13 +2662,15 @@ class AppRoutesTestCase(unittest.TestCase):
 
     def test_chat_summarizes_oldest_unsummarized_visible_messages(self):
         conversation_id = self._create_conversation()
+        dense_message = " ".join(["context"] * 120)
         save_app_settings(
             {
                 "user_preferences": "",
                 "max_steps": "1",
                 "active_tools": "[]",
                 "rag_auto_inject": "false",
-                "chat_summary_trigger_message_count": "40",
+                "chat_summary_mode": "auto",
+                "chat_summary_trigger_token_count": "1000",
                 "chat_summary_batch_size": "20",
             }
         )
@@ -1991,7 +2679,7 @@ class AppRoutesTestCase(unittest.TestCase):
             for index in range(39):
                 conn.execute(
                     "INSERT INTO messages (conversation_id, role, content, metadata) VALUES (?, 'user', ?, ?)",
-                    (conversation_id, f"Message {index + 1}", None),
+                    (conversation_id, f"Message {index + 1} {dense_message}", None),
                 )
 
         fake_summary = {
@@ -2012,26 +2700,27 @@ class AppRoutesTestCase(unittest.TestCase):
 
         with patch("routes.chat.collect_agent_response", return_value=fake_summary), patch(
             "routes.chat.run_agent_stream", return_value=fake_events
-        ):
+        ), patch("routes.chat.sync_conversations_to_rag_safe"):
             response = self.client.post(
                 "/chat",
                 json={
                     "conversation_id": conversation_id,
                     "model": "deepseek-chat",
-                    "user_content": "Message 40",
-                    "messages": [{"role": "user", "content": "Message 40"}],
+                    "user_content": f"Message 40 {dense_message}",
+                    "messages": [{"role": "user", "content": f"Message 40 {dense_message}"}],
                 },
             )
+            streamed_events = [json.loads(line) for line in response.get_data(as_text=True).strip().splitlines()]
 
         self.assertEqual(response.status_code, 200)
-        streamed_events = [json.loads(line) for line in response.get_data(as_text=True).strip().splitlines()]
         conversation_response = self.client.get(f"/api/conversations/{conversation_id}")
         self.assertEqual(conversation_response.status_code, 200)
         conversation_messages = conversation_response.get_json()["messages"]
         self.assertEqual(conversation_messages[0]["role"], "summary")
         self.assertTrue(conversation_messages[0]["metadata"]["is_summary"])
         self.assertEqual(conversation_messages[0]["metadata"]["covered_message_count"], 20)
-        self.assertEqual(conversation_messages[0]["metadata"]["trigger_threshold"], 40)
+        self.assertEqual(conversation_messages[0]["metadata"]["summary_mode"], "auto")
+        self.assertEqual(conversation_messages[0]["metadata"]["trigger_token_count"], 1000)
         self.assertEqual(conversation_messages[0]["metadata"]["summary_batch_size"], 20)
         self.assertEqual(
             conversation_messages[0]["content"],
@@ -2040,9 +2729,21 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(len(conversation_messages), 22)
         self.assertEqual(conversation_messages[-1]["role"], "assistant")
 
-        history_sync_event = next((event for event in streamed_events if event["type"] == "history_sync"), None)
-        self.assertIsNotNone(history_sync_event)
-        self.assertEqual(history_sync_event["messages"][0]["role"], "summary")
+        summary_event = next((event for event in streamed_events if event["type"] == "conversation_summary_applied"), None)
+        self.assertIsNotNone(summary_event)
+        self.assertEqual(summary_event["covered_message_count"], 20)
+        self.assertEqual(summary_event["mode"], "auto")
+
+        history_sync_events = [event for event in streamed_events if event["type"] == "history_sync"]
+        self.assertEqual(len(history_sync_events), 2)
+        self.assertEqual(history_sync_events[-1]["messages"][0]["role"], "summary")
+
+        with get_db() as conn:
+            deleted_count = conn.execute(
+                "SELECT COUNT(*) AS count FROM messages WHERE conversation_id = ? AND deleted_at IS NOT NULL",
+                (conversation_id,),
+            ).fetchone()["count"]
+        self.assertEqual(deleted_count, 20)
 
     def test_chat_rejects_edit_for_message_removed_by_summary(self):
         conversation_id = self._create_conversation()
@@ -2077,13 +2778,15 @@ class AppRoutesTestCase(unittest.TestCase):
 
     def test_chat_summary_preserves_interleaved_tool_messages(self):
         conversation_id = self._create_conversation()
+        dense_message = " ".join(["history"] * 120)
         save_app_settings(
             {
                 "user_preferences": "",
                 "max_steps": "1",
                 "active_tools": "[]",
                 "rag_auto_inject": "false",
-                "chat_summary_trigger_message_count": "10",
+                "chat_summary_mode": "auto",
+                "chat_summary_trigger_token_count": "1000",
                 "chat_summary_batch_size": "5",
             }
         )
@@ -2091,11 +2794,11 @@ class AppRoutesTestCase(unittest.TestCase):
         with get_db() as conn:
             conn.execute(
                 "INSERT INTO messages (conversation_id, role, content, metadata) VALUES (?, 'user', ?, ?)",
-                (conversation_id, "First user message", None),
+                (conversation_id, f"First user message {dense_message}", None),
             )
             conn.execute(
                 "INSERT INTO messages (conversation_id, role, content, metadata) VALUES (?, 'assistant', ?, ?)",
-                (conversation_id, "First answer", None),
+                (conversation_id, f"First answer {dense_message}", None),
             )
             conn.execute(
                 "INSERT INTO messages (conversation_id, role, content, tool_call_id) VALUES (?, 'tool', ?, ?)",
@@ -2104,7 +2807,7 @@ class AppRoutesTestCase(unittest.TestCase):
             for index in range(7):
                 conn.execute(
                     "INSERT INTO messages (conversation_id, role, content, metadata) VALUES (?, 'user', ?, ?)",
-                    (conversation_id, f"Follow-up user message {index + 1}", None),
+                    (conversation_id, f"Follow-up user message {index + 1} {dense_message}", None),
                 )
 
         fake_summary = {
@@ -2125,28 +2828,32 @@ class AppRoutesTestCase(unittest.TestCase):
 
         with patch("routes.chat.collect_agent_response", return_value=fake_summary), patch(
             "routes.chat.run_agent_stream", return_value=fake_events
-        ):
+        ), patch("routes.chat.sync_conversations_to_rag_safe"):
             response = self.client.post(
                 "/chat",
                 json={
                     "conversation_id": conversation_id,
                     "model": "deepseek-chat",
-                    "user_content": "Third user message",
-                    "messages": [{"role": "user", "content": "Third user message"}],
+                    "user_content": f"Third user message {dense_message}",
+                    "messages": [{"role": "user", "content": f"Third user message {dense_message}"}],
                 },
             )
+            response.get_data(as_text=True)
 
         self.assertEqual(response.status_code, 200)
-        response.get_data(as_text=True)
 
         with get_db() as conn:
-            rows = conn.execute(
-                "SELECT role, content, tool_call_id FROM messages WHERE conversation_id = ? ORDER BY position, id",
+            visible_rows = conn.execute(
+                "SELECT role, content, tool_call_id FROM messages WHERE conversation_id = ? AND deleted_at IS NULL ORDER BY position, id",
                 (conversation_id,),
             ).fetchall()
+            deleted_count = conn.execute(
+                "SELECT COUNT(*) AS count FROM messages WHERE conversation_id = ? AND deleted_at IS NOT NULL",
+                (conversation_id,),
+            ).fetchone()["count"]
 
         self.assertEqual(
-            [(row["role"], row["tool_call_id"]) for row in rows],
+            [(row["role"], row["tool_call_id"]) for row in visible_rows],
             [
                 ("summary", None),
                 ("tool", "call-1"),
@@ -2158,17 +2865,20 @@ class AppRoutesTestCase(unittest.TestCase):
                 ("assistant", None),
             ],
         )
-        self.assertEqual(rows[1]["content"], '{"ok":true}')
+        self.assertEqual(visible_rows[1]["content"], '{"ok":true}')
+        self.assertEqual(deleted_count, 5)
 
     def test_chat_can_create_multiple_summary_passes_without_resummarizing_old_ones(self):
         conversation_id = self._create_conversation()
+        dense_message = " ".join(["seed"] * 120)
         save_app_settings(
             {
                 "user_preferences": "",
                 "max_steps": "1",
                 "active_tools": "[]",
                 "rag_auto_inject": "false",
-                "chat_summary_trigger_message_count": "10",
+                "chat_summary_mode": "auto",
+                "chat_summary_trigger_token_count": "1000",
                 "chat_summary_batch_size": "5",
             }
         )
@@ -2177,18 +2887,18 @@ class AppRoutesTestCase(unittest.TestCase):
             for index in range(13):
                 conn.execute(
                     "INSERT INTO messages (conversation_id, role, content, metadata) VALUES (?, 'user', ?, ?)",
-                    (conversation_id, f"Seed {index + 1}", None),
+                    (conversation_id, f"Seed {index + 1} {dense_message}", None),
                 )
 
         first_summary = {
-            "content": "First summary block.",
+            "content": "First summary block with enough retained detail.",
             "reasoning_content": "",
             "usage": None,
             "tool_results": [],
             "errors": [],
         }
         second_summary = {
-            "content": "Second summary block.",
+            "content": "Second summary block with enough retained detail.",
             "reasoning_content": "",
             "usage": None,
             "tool_results": [],
@@ -2209,18 +2919,18 @@ class AppRoutesTestCase(unittest.TestCase):
             )
             with patch("routes.chat.collect_agent_response", return_value=summary_payload), patch(
                 "routes.chat.run_agent_stream", return_value=fake_events
-            ):
+            ), patch("routes.chat.sync_conversations_to_rag_safe"):
                 response = self.client.post(
                     "/chat",
                     json={
                         "conversation_id": conversation_id,
                         "model": "deepseek-chat",
-                        "user_content": user_text,
-                        "messages": [{"role": "user", "content": user_text}],
+                        "user_content": f"{user_text} {dense_message}",
+                        "messages": [{"role": "user", "content": f"{user_text} {dense_message}"}],
                     },
                 )
+                response.get_data(as_text=True)
             self.assertEqual(response.status_code, 200)
-            response.get_data(as_text=True)
 
         conversation_response = self.client.get(f"/api/conversations/{conversation_id}")
         self.assertEqual(conversation_response.status_code, 200)
@@ -2230,11 +2940,11 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(len(summary_messages), 2)
         self.assertEqual(
             summary_messages[0]["content"],
-            "Conversation summary (generated from deleted messages):\n\nFirst summary block.",
+            "Conversation summary (generated from deleted messages):\n\nFirst summary block with enough retained detail.",
         )
         self.assertEqual(
             summary_messages[1]["content"],
-            "Conversation summary (generated from deleted messages):\n\nSecond summary block.",
+            "Conversation summary (generated from deleted messages):\n\nSecond summary block with enough retained detail.",
         )
         self.assertEqual(summary_messages[0]["metadata"]["covered_message_count"], 5)
         self.assertEqual(summary_messages[1]["metadata"]["covered_message_count"], 5)
@@ -2244,19 +2954,73 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertTrue(second_ids)
         self.assertTrue(first_ids.isdisjoint(second_ids))
 
+    def test_chat_summary_mode_never_skips_summary_even_above_token_threshold(self):
+        conversation_id = self._create_conversation()
+        dense_message = " ".join(["never"] * 120)
+        save_app_settings(
+            {
+                "user_preferences": "",
+                "max_steps": "1",
+                "active_tools": "[]",
+                "rag_auto_inject": "false",
+                "chat_summary_mode": "never",
+                "chat_summary_trigger_token_count": "1000",
+                "chat_summary_batch_size": "5",
+            }
+        )
+
+        with get_db() as conn:
+            for index in range(12):
+                conn.execute(
+                    "INSERT INTO messages (conversation_id, role, content, metadata) VALUES (?, 'user', ?, ?)",
+                    (conversation_id, f"Seed {index + 1} {dense_message}", None),
+                )
+
+        fake_events = iter(
+            [
+                {"type": "answer_start"},
+                {"type": "answer_delta", "text": "Answer without summary"},
+                {"type": "tool_capture", "tool_results": []},
+                {"type": "done"},
+            ]
+        )
+
+        with patch("routes.chat.collect_agent_response") as mocked_summary, patch(
+            "routes.chat.run_agent_stream", return_value=fake_events
+        ), patch("routes.chat.sync_conversations_to_rag_safe"):
+            response = self.client.post(
+                "/chat",
+                json={
+                    "conversation_id": conversation_id,
+                    "model": "deepseek-chat",
+                    "user_content": f"Latest {dense_message}",
+                    "messages": [{"role": "user", "content": f"Latest {dense_message}"}],
+                },
+            )
+            events = [json.loads(line) for line in response.get_data(as_text=True).strip().splitlines()]
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(any(event["type"] == "conversation_summary_applied" for event in events))
+        mocked_summary.assert_not_called()
+
+        conversation_response = self.client.get(f"/api/conversations/{conversation_id}")
+        self.assertEqual(conversation_response.status_code, 200)
+        visible_messages = conversation_response.get_json()["messages"]
+        self.assertFalse(any(message["role"] == "summary" for message in visible_messages))
+
     def test_run_agent_stream_blocks_tool_json_after_max_steps(self):
         responses = [
             iter(
                 [
                     self._stream_chunk(reasoning="Need web data."),
-                    self._stream_chunk(content='{"tool_calls":[{"name":"search_web","arguments":{"queries":["x"]}}]}'),
+                    self._tool_call_chunk("search_web", {"queries": ["x"]}),
                     self._stream_chunk(usage=SimpleNamespace(prompt_tokens=2, completion_tokens=3, total_tokens=5)),
                 ]
             ),
             iter(
                 [
                     self._stream_chunk(reasoning="Still trying to call a tool."),
-                    self._stream_chunk(content='{"tool_calls":[{"name":"search_web","arguments":{"queries":["y"]}}]}'),
+                    self._tool_call_chunk("search_web", {"queries": ["y"]}),
                     self._stream_chunk(usage=SimpleNamespace(prompt_tokens=2, completion_tokens=3, total_tokens=5)),
                 ]
             ),
@@ -2309,6 +3073,72 @@ class AppRoutesTestCase(unittest.TestCase):
         with get_db() as conn:
             row = conn.execute("SELECT title FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
         self.assertEqual(row["title"], "Updated Title")
+
+    def test_generate_title_falls_back_to_new_chat_for_noisy_output(self):
+        conversation_id = self._create_conversation(title="Untitled")
+        with get_db() as conn:
+            conn.execute(
+                "INSERT INTO messages (conversation_id, role, content, metadata) VALUES (?, 'user', ?, ?)",
+                (conversation_id, "Need a short title", None),
+            )
+            conn.execute(
+                "INSERT INTO messages (conversation_id, role, content, metadata) VALUES (?, 'assistant', ?, ?)",
+                (conversation_id, "Sure, here is the answer", None),
+            )
+
+        fake_result = {
+            "content": "**Tamamlandı!** 🚀 Canvas'a bakıp detayları ekleyebilirim.",
+            "reasoning_content": "",
+            "usage": None,
+            "tool_results": [],
+            "errors": [],
+        }
+        with patch("routes.chat.collect_agent_response", return_value=fake_result):
+            response = self.client.post(f"/api/conversations/{conversation_id}/generate-title")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["title"], "New Chat")
+
+        with get_db() as conn:
+            row = conn.execute("SELECT title FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
+        self.assertEqual(row["title"], "New Chat")
+
+    def test_generate_title_uses_minimal_prompt_without_runtime_context_or_tools(self):
+        """Root-cause regression test: generate_title must NOT inject runtime context or tools."""
+        conversation_id = self._create_conversation(title="Untitled")
+        with get_db() as conn:
+            conn.execute(
+                "INSERT INTO messages (conversation_id, role, content, metadata) VALUES (?, 'user', ?, ?)",
+                (conversation_id, "How do I sort a list?", None),
+            )
+
+        fake_result = {
+            "content": "Sorting a List",
+            "reasoning_content": "",
+            "usage": None,
+            "tool_results": [],
+            "errors": [],
+        }
+        with patch("routes.chat.collect_agent_response", return_value=fake_result) as mocked_collect:
+            self.client.post(f"/api/conversations/{conversation_id}/generate-title")
+
+        mocked_collect.assert_called_once()
+        args, _kwargs = mocked_collect.call_args
+        prompt_messages, _model, max_steps, enabled_tool_names = args
+
+        # Exactly two messages: system directive + user content — no runtime system context
+        self.assertEqual(len(prompt_messages), 2)
+        self.assertEqual(prompt_messages[0]["role"], "system")
+        self.assertEqual(prompt_messages[1]["role"], "user")
+
+        system_content = prompt_messages[0]["content"]
+        self.assertNotIn("helpful AI assistant", system_content)
+        self.assertNotIn("Available Tools", system_content)
+        self.assertIn("title generator", system_content)
+
+        # Must use exactly 1 step and zero tools — prevents multi-turn tool calls
+        self.assertEqual(max_steps, 1)
+        self.assertEqual(enabled_tool_names, [])
 
 
 if __name__ == "__main__":

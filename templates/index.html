@@ -5,15 +5,26 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>ChatBot</title>
   <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/github-dark.min.css" />
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/dompurify/dist/purify.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
 </head>
 <body>
 
 <header>
-  <div class="header-brand">
-    <div class="header-logo">✦</div>
-    <h1>ChatBot</h1>
+  <div class="header-left">
+    <button class="btn-sidebar-toggle" id="sidebar-toggle-btn" type="button" aria-controls="sidebar" aria-expanded="true" title="Hide conversations">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <line x1="3" y1="6" x2="21" y2="6"/>
+        <line x1="3" y1="12" x2="21" y2="12"/>
+        <line x1="3" y1="18" x2="21" y2="18"/>
+      </svg>
+    </button>
+    <div class="header-brand">
+      <div class="header-logo">✦</div>
+      <h1>ChatBot</h1>
+    </div>
   </div>
   <div class="header-controls">
     <div class="model-select-wrapper">
@@ -23,11 +34,12 @@
         {% endfor %}
       </select>
     </div>
-    <button class="btn-ghost sidebar-toggle" id="sidebar-toggle-btn" type="button" aria-controls="sidebar" aria-expanded="true">
-      <span class="sidebar-toggle__label">Conversations</span>
+    <button class="btn-ghost btn-canvas" id="canvas-btn" type="button">
+      <span>Canvas</span>
+      <span id="canvas-btn-indicator" class="canvas-btn-indicator" hidden aria-hidden="true"></span>
     </button>
+    <button class="btn-ghost" id="export-btn" type="button">Export</button>
     <button class="btn-ghost" id="settings-btn">Settings</button>
-    <button class="btn-ghost btn-ghost--danger" id="clear-btn">Clear Chat</button>
     <button class="btn-tokens" id="tokens-btn" title="Token usage and cost">
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>
@@ -60,12 +72,33 @@
     </div>
   </div>
   <div class="mobile-tools-panel__section mobile-tools-panel__section--actions">
+    <button class="mobile-tools-action" id="mobile-export-btn" type="button">Export chat</button>
     <button class="mobile-tools-action" id="mobile-settings-btn" type="button">Settings</button>
     <button class="mobile-tools-action" id="mobile-tokens-btn" type="button">Usage &amp; cost</button>
-    <button class="mobile-tools-action mobile-tools-action--danger" id="mobile-clear-btn" type="button">Clear chat</button>
   </div>
 </div>
 <div id="mobile-tools-overlay" class="mobile-tools-overlay"></div>
+
+<div id="export-panel" class="export-panel" aria-hidden="true" aria-labelledby="export-panel-title">
+  <div class="export-panel-header">
+    <div>
+      <span id="export-panel-title">Export chat</span>
+      <p id="export-subtitle" class="export-panel-subtitle">Select a format for the current conversation.</p>
+    </div>
+    <button id="export-close" title="Close" type="button">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+        <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+      </svg>
+    </button>
+  </div>
+  <div class="export-panel-actions">
+    <button class="btn-ghost" id="conversation-export-md-btn" type="button">Download .md</button>
+    <button class="btn-ghost" id="conversation-export-docx-btn" type="button">Download .docx</button>
+    <button class="btn-primary" id="conversation-export-pdf-btn" type="button">Download .pdf</button>
+  </div>
+  <div id="export-status" class="export-status">Export idle</div>
+</div>
+<div id="export-overlay" class="export-overlay"></div>
 
 <div id="stats-panel" class="stats-panel" aria-hidden="true">
   <div class="stats-panel-header">
@@ -181,8 +214,14 @@
     <textarea id="preferences-input" rows="8" placeholder="Example: Reply in English, keep answers concise, and use bullet points when useful."></textarea>
     <label class="settings-label" for="max-steps-input">Web search step limit (1–10)</label>
     <input type="number" class="settings-number" id="max-steps-input" min="1" max="10" value="5" />
-    <label class="settings-label" for="summary-trigger-input">Conversation summary trigger in visible messages (10–500)</label>
-    <input type="number" class="settings-number" id="summary-trigger-input" min="10" max="500" value="40" />
+    <label class="settings-label" for="summary-mode-select">Conversation summary mode</label>
+    <select id="summary-mode-select">
+      <option value="auto">Auto</option>
+      <option value="never">Never</option>
+      <option value="aggressive">Aggressive</option>
+    </select>
+    <label class="settings-label" for="summary-trigger-input">Conversation summary trigger in visible tokens (1000–200000)</label>
+    <input type="number" class="settings-number" id="summary-trigger-input" min="1000" max="200000" value="6000" />
     <label class="settings-label" for="summary-batch-input">Messages to summarize per pass (5–100)</label>
     <input type="number" class="settings-number" id="summary-batch-input" min="5" max="100" value="20" />
     <label class="settings-label" for="fetch-threshold-input">Fetch URL clipping threshold in tokens (400–20000)</label>
@@ -196,10 +235,16 @@
       <label class="tool-toggle"><input type="checkbox" value="ask_clarifying_question" /> <span>Ask interactive clarification questions</span></label>
       <label class="tool-toggle"><input type="checkbox" value="image_explain" /> <span>Follow up on stored images</span></label>
       <label class="tool-toggle"><input type="checkbox" value="search_knowledge_base" /> <span>Knowledge base search</span></label>
+      <label class="tool-toggle"><input type="checkbox" value="search_tool_memory" /> <span>Search tool memory</span></label>
       <label class="tool-toggle"><input type="checkbox" value="search_web" /> <span>Web search</span></label>
       <label class="tool-toggle"><input type="checkbox" value="fetch_url" /> <span>Read URL content</span></label>
       <label class="tool-toggle"><input type="checkbox" value="search_news_ddgs" /> <span>Search news (DDGS)</span></label>
       <label class="tool-toggle"><input type="checkbox" value="search_news_google" /> <span>Search news (Google)</span></label>
+      <label class="tool-toggle"><input type="checkbox" value="create_canvas_document" /> <span>Create canvas document</span></label>
+      <label class="tool-toggle"><input type="checkbox" value="rewrite_canvas_document" /> <span>Rewrite canvas document</span></label>
+      <label class="tool-toggle"><input type="checkbox" value="replace_canvas_lines" /> <span>Replace canvas lines</span></label>
+      <label class="tool-toggle"><input type="checkbox" value="insert_canvas_lines" /> <span>Insert canvas lines</span></label>
+      <label class="tool-toggle"><input type="checkbox" value="delete_canvas_lines" /> <span>Delete canvas lines</span></label>
     </div>
     <div class="settings-actions">
       <span id="settings-status" class="settings-status">Not saved yet</span>
@@ -209,14 +254,20 @@
 
   <div class="settings-section">
     <div class="settings-section-title">Scratchpad</div>
-    <p class="settings-copy">This is AI-managed persistent memory. It is injected into each runtime system prompt as read-only context and can only be updated through the dedicated scratchpad tool.</p>
+    <p class="settings-copy">This is AI-managed persistent memory. It is injected into each runtime system prompt and can be edited here as a list of durable notes.</p>
     <div class="settings-label">Stored notes</div>
-    <pre id="scratchpad-output" class="settings-readonly">No scratchpad entries yet.</pre>
-    <div id="scratchpad-admin-block" hidden>
-      <label class="settings-label" for="scratchpad-input">Admin manual editing</label>
-      <p class="settings-copy">Admin mode is enabled. Saving here replaces the full scratchpad content after normalization and deduplication.</p>
-      <textarea id="scratchpad-input" rows="8" placeholder="One durable memory note per line."></textarea>
+    <div id="scratchpad-list" class="scratchpad-list" aria-label="Stored notes list"></div>
+    <div class="scratchpad-toolbar">
+      <button class="btn-ghost" id="scratchpad-add-btn" type="button">Add note</button>
+      <span id="scratchpad-count" class="scratchpad-count">0 notes</span>
     </div>
+  </div>
+
+  <div class="settings-section">
+    <div class="settings-section-title">Tool Memory</div>
+    <p class="settings-copy">Web tool results (search, news, URL fetches) are automatically indexed into a vector store. When enabled, relevant past results are injected into each chat turn so the AI can reuse earlier findings without repeating requests.</p>
+    <p id="tool-memory-disabled-note" class="settings-copy" hidden>Tool memory requires RAG to be enabled in .env.</p>
+    <label class="tool-toggle"><input type="checkbox" id="tool-memory-auto-inject-toggle" /> <span>Auto inject remembered tool results into each chat turn</span></label>
   </div>
 
   <div class="settings-section">
@@ -224,6 +275,27 @@
     <p class="settings-copy">RAG now indexes only synced conversation history and successful text-like tool results. Legacy file, URL, and note ingestion is disabled.</p>
     <p id="rag-disabled-note" class="settings-copy" hidden>RAG is disabled in .env, so knowledge-base sync and auto-injection are unavailable.</p>
     <label class="tool-toggle"><input type="checkbox" id="rag-auto-inject-toggle" /> <span>Auto inject retrieved context into each chat turn</span></label>
+    <div id="rag-inject-options" class="rag-settings-grid">
+      <div class="rag-setting-group">
+        <label class="settings-label" for="rag-sensitivity-select">Injection sensitivity</label>
+        <select id="rag-sensitivity-select" class="settings-select">
+          <option value="flexible">Flexible</option>
+          <option value="normal">Normal</option>
+          <option value="strict">Strict</option>
+        </select>
+        <p id="rag-sensitivity-hint" class="settings-copy">Normal: balanced matching with an approximate threshold of 0.35.</p>
+      </div>
+
+      <div class="rag-setting-group">
+        <label class="settings-label" for="rag-context-size-select">Injected context size</label>
+        <select id="rag-context-size-select" class="settings-select">
+          <option value="small">Small (2 chunks)</option>
+          <option value="medium">Medium (5 chunks)</option>
+          <option value="large">Large (8 chunks)</option>
+        </select>
+        <p class="settings-copy">Limits how many retrieved chunks can be added to a single turn.</p>
+      </div>
+    </div>
 
     <div class="kb-actions-row">
       <button class="btn-ghost" id="kb-sync-btn" type="button">Sync chats</button>
@@ -231,7 +303,6 @@
 
     <div class="settings-actions">
       <span id="kb-status" class="settings-status">Knowledge base idle</span>
-      <button class="btn-primary" id="kb-sync-all-btn" type="button">Re-sync all chats</button>
     </div>
 
     <div class="kb-documents-block">
@@ -241,6 +312,38 @@
   </div>
 </div>
 <div id="settings-overlay" class="settings-overlay"></div>
+
+<div id="canvas-panel" class="canvas-panel" aria-hidden="true" aria-labelledby="canvas-subtitle">
+  <div class="canvas-panel-header">
+    <div>
+      <span>Canvas</span>
+      <p id="canvas-subtitle" class="canvas-panel-subtitle">No canvas document yet.</p>
+    </div>
+    <button id="canvas-close" title="Close">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+        <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+      </svg>
+    </button>
+  </div>
+  <div class="canvas-panel-actions">
+    <button class="btn-ghost" id="canvas-copy-btn" type="button">Copy</button>
+    <button class="btn-ghost" id="canvas-download-html-btn" type="button">Download .html</button>
+    <button class="btn-ghost" id="canvas-download-md-btn" type="button">Download .md</button>
+    <button class="btn-primary" id="canvas-download-pdf-btn" type="button">Download .pdf</button>
+  </div>
+  <div id="canvas-document-tabs" class="canvas-document-tabs" hidden></div>
+  <div class="canvas-search-row">
+    <label class="sr-only" for="canvas-search-input">Search canvas</label>
+    <input id="canvas-search-input" class="canvas-search-input" type="search" placeholder="Search in canvas" autocomplete="off" spellcheck="false" />
+  </div>
+  <div id="canvas-status" class="canvas-status">Canvas idle</div>
+  <div id="canvas-empty-state" class="canvas-empty-state">
+    <h3>No canvas document yet</h3>
+    <p>Ask the assistant to draft something substantial, then continue refining it with line-based edits.</p>
+  </div>
+  <article id="canvas-document" class="canvas-document" role="document" aria-label="Canvas document" hidden></article>
+</div>
+<div id="canvas-overlay" class="canvas-overlay"></div>
 
 <div class="main-layout">
   <aside class="sidebar" id="sidebar">
@@ -270,14 +373,21 @@
         <button id="edit-banner-cancel" class="edit-banner__cancel" type="button">Cancel</button>
       </div>
       <div class="input-wrapper">
-        <input id="image-input" type="file" accept="image/png,image/jpeg,image/webp" hidden />
-        <button id="attach-btn" class="btn-attach" title="Add image" type="button">
+        <input id="image-input" type="file" accept="image/png,image/jpeg,image/webp,.docx,.pdf,.txt,.csv,.md,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/pdf,text/plain,text/csv,text/markdown" hidden />
+        <input id="doc-input" type="file" accept=".docx,.pdf,.txt,.csv,.md,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/pdf,text/plain,text/csv,text/markdown" hidden />
+        <button id="attach-btn" class="btn-attach" title="Add file" type="button">
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 1 1 5.66 5.66L9.41 17.41a2 2 0 1 1-2.83-2.83l8.49-8.48"/>
           </svg>
         </button>
         <textarea id="user-input" rows="1" placeholder="Type a message…"></textarea>
-        <button class="btn-fix" id="fix-btn" title="Improve text">Fix</button>
+        <button class="btn-fix" id="fix-btn" title="Improve text" aria-label="Improve text" type="button">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M12.3 6.3l5.4 5.4"/>
+            <path d="M4 20l3.4-.9L19.1 7.4a2 2 0 0 0 0-2.8l-.7-.7a2 2 0 0 0-2.8 0L3.9 16.5 4 20z"/>
+            <path d="M14.8 3.7l5.5 5.5"/>
+          </svg>
+        </button>
         <button id="cancel-btn" class="btn-cancel" title="Cancel" style="display:none">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
             <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
@@ -290,7 +400,7 @@
         </button>
       </div>
       <div id="attachment-preview" class="attachment-preview" hidden></div>
-      <p id="vision-disabled-note" class="input-hint" hidden>Image uploads are disabled in .env, so local vision analysis is unavailable.</p>
+      <p id="vision-disabled-note" class="input-hint" hidden>Image uploads are disabled in .env. Document uploads (DOCX, PDF, TXT, CSV, MD) are still available.</p>
       <p class="input-hint">Press <kbd>Enter</kbd> to send &nbsp;·&nbsp; <kbd>Shift+Enter</kbd> for a new line</p>
       <div id="error-area"></div>
     </div>
