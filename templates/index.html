@@ -222,13 +222,10 @@
     </select>
     <label class="settings-label" for="summary-trigger-input">Conversation summary trigger in visible tokens (1000–200000)</label>
     <input type="number" class="settings-number" id="summary-trigger-input" min="1000" max="200000" value="80000" />
-    <label class="settings-label" for="summary-batch-input">Messages to summarize per pass (5–100)</label>
-    <input type="number" class="settings-number" id="summary-batch-input" min="5" max="100" value="20" />
     <label class="settings-label" for="summary-skip-first-input">Protect first N messages from summary (0–20)</label>
     <input type="number" class="settings-number" id="summary-skip-first-input" min="0" max="20" value="2" />
     <label class="settings-label" for="summary-skip-last-input">Protect last N messages from summary (0–20)</label>
     <input type="number" class="settings-number" id="summary-skip-last-input" min="0" max="20" value="1" />
-    <label class="tool-toggle"><input type="checkbox" id="summary-dynamic-batch-toggle" checked /> <span>Dynamic batch size (auto-adjust based on token density)</span></label>
     <div class="summary-inspector" id="summary-inspector">
       <div class="summary-inspector__header">
         <span class="settings-label">Summary process</span>
@@ -245,33 +242,11 @@
           <strong id="summary-inspector-trigger">80,000</strong>
         </div>
         <div class="summary-inspector__metric">
-          <span>Next pass</span>
-          <strong id="summary-inspector-next">20 msgs</strong>
-        </div>
-        <div class="summary-inspector__metric">
           <span>Gap</span>
           <strong id="summary-inspector-gap">80,000 left</strong>
         </div>
       </div>
-      <div class="summary-inspector__grid">
-        <div class="summary-inspector__metric">
-          <span>Candidates</span>
-          <strong id="summary-inspector-candidates">0</strong>
-        </div>
-        <div class="summary-inspector__metric">
-          <span>Filtered empty</span>
-          <strong id="summary-inspector-empty">0</strong>
-        </div>
-        <div class="summary-inspector__metric">
-          <span>Tool tokens</span>
-          <strong id="summary-inspector-tool-tokens">0</strong>
-        </div>
-        <div class="summary-inspector__metric">
-          <span>Last output</span>
-          <strong id="summary-inspector-output">—</strong>
-        </div>
-      </div>
-      <p class="summary-inspector__detail" id="summary-inspector-detail">Counts user, assistant, and tool history. Does not count runtime system prompt, RAG context, or final-answer instructions.</p>
+      <p class="summary-inspector__detail" id="summary-inspector-detail">Counts user, assistant, tool, and summary history. Runtime system prompt, RAG context, and final-answer instructions are excluded.</p>
       <p class="summary-inspector__detail" id="summary-inspector-reason">The latest summary decision will appear here after each completed assistant turn.</p>
       <p class="summary-inspector__detail" id="summary-inspector-last">No summary pass has run in this conversation yet.</p>
       <div class="summary-inspector__actions">
@@ -382,6 +357,8 @@
   </div>
   <div class="canvas-panel-actions">
     <button class="btn-ghost" id="canvas-copy-btn" type="button">Copy</button>
+    <button class="btn-ghost btn-ghost--danger" id="canvas-delete-btn" type="button">Delete current</button>
+    <button class="btn-ghost btn-ghost--danger" id="canvas-clear-btn" type="button">Clear all</button>
     <button class="btn-ghost" id="canvas-download-html-btn" type="button">Download .html</button>
     <button class="btn-ghost" id="canvas-download-md-btn" type="button">Download .md</button>
     <button class="btn-primary" id="canvas-download-pdf-btn" type="button">Download .pdf</button>
@@ -399,6 +376,26 @@
   <article id="canvas-document" class="canvas-document" role="document" aria-label="Canvas document" hidden></article>
 </div>
 <div id="canvas-overlay" class="canvas-overlay"></div>
+
+<div id="canvas-confirm-overlay" class="canvas-confirm-overlay"></div>
+<div id="canvas-confirm-modal" class="canvas-confirm-modal" aria-hidden="true" aria-labelledby="canvas-confirm-title" aria-describedby="canvas-confirm-message">
+  <div class="canvas-confirm-modal__header">
+    <div>
+      <span class="canvas-confirm-modal__eyebrow">Canvas ready</span>
+      <h2 id="canvas-confirm-title">Open document in Canvas?</h2>
+    </div>
+    <button id="canvas-confirm-close" title="Close" type="button">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+        <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+      </svg>
+    </button>
+  </div>
+  <p id="canvas-confirm-message" class="canvas-confirm-modal__message">Your uploaded document is ready in Canvas.</p>
+  <div class="canvas-confirm-modal__actions">
+    <button id="canvas-confirm-later" class="btn-ghost" type="button">Later</button>
+    <button id="canvas-confirm-open" class="btn-primary" type="button">Open Canvas</button>
+  </div>
+</div>
 
 <div class="main-layout">
   <aside class="sidebar" id="sidebar">

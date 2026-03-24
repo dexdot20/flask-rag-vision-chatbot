@@ -63,7 +63,7 @@ _GN_WHEN = {
     "m": "when:30d",
     "y": "when:1y",
 }
-_DDGS_TIMELIMIT = {"d": "d", "w": "w", "m": "m", "y": "m"}
+_DDGS_TIMELIMIT = {"d": "d", "w": "w", "m": "m", "y": "y"}
 _DDGS_REGION = {"tr": "tr-tr", "en": "us-en"}
 _proxy_index = 0
 _proxy_cache: list[str] | None = None

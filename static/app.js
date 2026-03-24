@@ -23,10 +23,8 @@ const scratchpadCountEl = document.getElementById("scratchpad-count");
 const maxStepsEl = document.getElementById("max-steps-input");
 const summaryModeEl = document.getElementById("summary-mode-select");
 const summaryTriggerEl = document.getElementById("summary-trigger-input");
-const summaryBatchEl = document.getElementById("summary-batch-input");
 const summarySkipFirstEl = document.getElementById("summary-skip-first-input");
 const summarySkipLastEl = document.getElementById("summary-skip-last-input");
-const summaryDynamicBatchEl = document.getElementById("summary-dynamic-batch-toggle");
 const summaryNowBtn = document.getElementById("summary-now-btn");
 const summaryUndoBtn = document.getElementById("summary-undo-btn");
 const fetchThresholdEl = document.getElementById("fetch-threshold-input");
@@ -63,12 +61,7 @@ const summaryInspectorBadge = document.getElementById("summary-inspector-badge")
 const summaryInspectorHeadline = document.getElementById("summary-inspector-headline");
 const summaryInspectorCurrent = document.getElementById("summary-inspector-current");
 const summaryInspectorTrigger = document.getElementById("summary-inspector-trigger");
-const summaryInspectorNext = document.getElementById("summary-inspector-next");
 const summaryInspectorGap = document.getElementById("summary-inspector-gap");
-const summaryInspectorCandidates = document.getElementById("summary-inspector-candidates");
-const summaryInspectorEmpty = document.getElementById("summary-inspector-empty");
-const summaryInspectorToolTokens = document.getElementById("summary-inspector-tool-tokens");
-const summaryInspectorOutput = document.getElementById("summary-inspector-output");
 const summaryInspectorDetail = document.getElementById("summary-inspector-detail");
 const summaryInspectorReason = document.getElementById("summary-inspector-reason");
 const summaryInspectorLast = document.getElementById("summary-inspector-last");
@@ -83,10 +76,19 @@ const canvasEmptyState = document.getElementById("canvas-empty-state");
 const canvasDocumentEl = document.getElementById("canvas-document");
 const canvasDocumentTabsEl = document.getElementById("canvas-document-tabs");
 const canvasCopyBtn = document.getElementById("canvas-copy-btn");
+const canvasDeleteBtn = document.getElementById("canvas-delete-btn");
+const canvasClearBtn = document.getElementById("canvas-clear-btn");
 const canvasDownloadHtmlBtn = document.getElementById("canvas-download-html-btn");
 const canvasDownloadMdBtn = document.getElementById("canvas-download-md-btn");
 const canvasDownloadPdfBtn = document.getElementById("canvas-download-pdf-btn");
 const canvasBtnIndicator = document.getElementById("canvas-btn-indicator");
+const canvasConfirmModal = document.getElementById("canvas-confirm-modal");
+const canvasConfirmOverlay = document.getElementById("canvas-confirm-overlay");
+const canvasConfirmTitle = document.getElementById("canvas-confirm-title");
+const canvasConfirmMessage = document.getElementById("canvas-confirm-message");
+const canvasConfirmOpenBtn = document.getElementById("canvas-confirm-open");
+const canvasConfirmLaterBtn = document.getElementById("canvas-confirm-later");
+const canvasConfirmCloseBtn = document.getElementById("canvas-confirm-close");
 const tokensBtn = document.getElementById("tokens-btn");
 const tokensBadge = document.getElementById("tokens-badge");
 const statsPanel = document.getElementById("stats-panel");
@@ -121,13 +123,19 @@ let currentConvTitle = "New Chat";
 let activeAbortController = null;
 let selectedImageFile = null;
 let selectedDocumentFile = null;
+let pendingDocumentCanvasOpen = null;
 let editingMessageId = null;
 let activeCanvasDocumentId = null;
 let streamingCanvasDocuments = [];
 let canvasHasUnreadUpdates = false;
 let lastCanvasTriggerEl = null;
+let lastCanvasConfirmTriggerEl = null;
 let lastExportTriggerEl = null;
 let latestSummaryStatus = null;
+let conversationRefreshGeneration = 0;
+let pendingConversationRefreshTimers = new Set();
+let lastConversationSignature = "";
+let pendingCanvasConfirmAction = null;
 const appSettings = bootstrapData.settings || {};
 const featureFlags = bootstrapData.features || appSettings.features || {};
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
@@ -141,6 +149,10 @@ const ALLOWED_DOCUMENT_TYPES = new Set([
   "text/markdown",
 ]);
 const DOCUMENT_EXTENSIONS = new Set([".docx", ".pdf", ".txt", ".csv", ".md"]);
+const STREAM_TYPING_INTERVAL_MS = 24;
+const STREAM_TYPING_MIN_STEP = 3;
+const STREAM_TYPING_MAX_STEP = 48;
+
 function isDocumentFile(file) {
   if (ALLOWED_DOCUMENT_TYPES.has(file.type)) return true;
   const ext = (file.name || "").toLowerCase().match(/\.[^.]+$/);
@@ -216,226 +228,6 @@ function renderMarkdown(text) {
   return sanitizeHtml(escHtml(rawText).replace(/\n/g, "<br>"));
 }
 
-function renderStreamingMarkdown(text) {
-  const rawText = closeUnclosedCodeFences(String(text || ""));
-  const lines = rawText.split("\n");
-  const htmlParts = [];
-  let paragraphLines = [];
-  let listType = null;
-  let codeFence = null;
-  let codeLines = [];
-  let tableHeader = null;
-  let tableAlignments = null;
-  let tableRows = [];
-
-  const splitTableCells = (line) => {
-    const trimmed = String(line || "").trim();
-    if (!trimmed.includes("|")) {
-      return [];
-    }
-    return trimmed
-      .replace(/^\|/, "")
-      .replace(/\|$/, "")
-      .split("|")
-      .map((cell) => cell.trim());
-  };
-
-  const getTableAlignments = (line) => {
-    const cells = splitTableCells(line);
-    if (!cells.length) {
-      return null;
-    }
-
-    const alignments = [];
-    for (const cell of cells) {
-      if (!/^:?-{3,}:?$/.test(cell)) {
-        return null;
-      }
-      if (cell.startsWith(":" ) && cell.endsWith(":")) {
-        alignments.push("center");
-      } else if (cell.endsWith(":")) {
-        alignments.push("right");
-      } else if (cell.startsWith(":")) {
-        alignments.push("left");
-      } else {
-        alignments.push("");
-      }
-    }
-    return alignments;
-  };
-
-  const renderInlineStreamingMarkdown = (value) => {
-    let html = escHtml(String(value || ""));
-    html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
-    html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-    html = html.replace(/__([^_]+)__/g, "<strong>$1</strong>");
-    html = html.replace(/\*([^*]+)\*/g, "<em>$1</em>");
-    html = html.replace(/_([^_]+)_/g, "<em>$1</em>");
-    html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
-    return html;
-  };
-
-  const flushParagraph = () => {
-    if (!paragraphLines.length) {
-      return;
-    }
-    htmlParts.push(`<p>${paragraphLines.map((line) => renderInlineStreamingMarkdown(line)).join("<br>")}</p>`);
-    paragraphLines = [];
-  };
-
-  const closeList = () => {
-    if (!listType) {
-      return;
-    }
-    htmlParts.push(listType === "ol" ? "</ol>" : "</ul>");
-    listType = null;
-  };
-
-  const flushTable = () => {
-    if (!tableHeader || !tableAlignments) {
-      tableHeader = null;
-      tableAlignments = null;
-      tableRows = [];
-      return;
-    }
-
-    const renderTableCell = (tagName, value, index) => {
-      const alignment = tableAlignments[index] || "";
-      const alignAttr = alignment ? ` style="text-align: ${alignment}"` : "";
-      return `<${tagName}${alignAttr}>${renderInlineStreamingMarkdown(value)}</${tagName}>`;
-    };
-
-    htmlParts.push("<table>");
-    htmlParts.push(`<thead><tr>${tableHeader.map((cell, index) => renderTableCell("th", cell, index)).join("")}</tr></thead>`);
-    if (tableRows.length) {
-      htmlParts.push("<tbody>");
-      for (const row of tableRows) {
-        htmlParts.push(`<tr>${row.map((cell, index) => renderTableCell("td", cell, index)).join("")}</tr>`);
-      }
-      htmlParts.push("</tbody>");
-    }
-    htmlParts.push("</table>");
-    tableHeader = null;
-    tableAlignments = null;
-    tableRows = [];
-  };
-
-  const flushCodeFence = () => {
-    if (!codeFence) {
-      return;
-    }
-    const langClass = codeFence ? ` class="language-${escHtml(codeFence)}"` : "";
-    htmlParts.push(`<pre><code${langClass}>${escHtml(codeLines.join("\n"))}</code></pre>`);
-    codeFence = null;
-    codeLines = [];
-  };
-
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index];
-    const fenceMatch = line.match(/^```\s*(\S+)?\s*$/);
-    if (fenceMatch) {
-      flushParagraph();
-      closeList();
-      flushTable();
-      if (codeFence !== null) {
-        flushCodeFence();
-      } else {
-        codeFence = fenceMatch[1] || "";
-      }
-      continue;
-    }
-
-    const thematicBreakMatch = line.match(/^\s{0,3}(?:-\s*){3,}\s*$|^\s{0,3}(?:\*\s*){3,}\s*$|^\s{0,3}(?:_\s*){3,}\s*$/);
-    if (thematicBreakMatch) {
-      flushParagraph();
-      closeList();
-      flushTable();
-      htmlParts.push("<hr>");
-      continue;
-    }
-
-    if (codeFence !== null) {
-      codeLines.push(line);
-      continue;
-    }
-
-    if (!line.trim()) {
-      flushParagraph();
-      closeList();
-      flushTable();
-      continue;
-    }
-
-    if (tableHeader && tableAlignments) {
-      const rowCells = splitTableCells(line);
-      if (rowCells.length) {
-        tableRows.push(rowCells);
-        continue;
-      }
-      flushTable();
-    }
-
-    const nextLine = lines[index + 1] || "";
-    const headerCells = splitTableCells(line);
-    const alignments = getTableAlignments(nextLine);
-    if (headerCells.length >= 2 && alignments && alignments.length === headerCells.length) {
-      flushParagraph();
-      closeList();
-      tableHeader = headerCells;
-      tableAlignments = alignments;
-      tableRows = [];
-      index += 1;
-      continue;
-    }
-
-    const headingMatch = line.match(/^(#{1,6})\s+(.*)$/);
-    if (headingMatch) {
-      flushParagraph();
-      closeList();
-      flushTable();
-      const level = headingMatch[1].length;
-      htmlParts.push(`<h${level}>${renderInlineStreamingMarkdown(headingMatch[2])}</h${level}>`);
-      continue;
-    }
-
-    const unorderedMatch = line.match(/^\s*[-*+]\s+(.*)$/);
-    if (unorderedMatch) {
-      flushParagraph();
-      flushTable();
-      if (listType !== "ul") {
-        closeList();
-        htmlParts.push("<ul>");
-        listType = "ul";
-      }
-      htmlParts.push(`<li>${renderInlineStreamingMarkdown(unorderedMatch[1])}</li>`);
-      continue;
-    }
-
-    const orderedMatch = line.match(/^\s*\d+\.\s+(.*)$/);
-    if (orderedMatch) {
-      flushParagraph();
-      flushTable();
-      if (listType !== "ol") {
-        closeList();
-        htmlParts.push("<ol>");
-        listType = "ol";
-      }
-      htmlParts.push(`<li>${renderInlineStreamingMarkdown(orderedMatch[1])}</li>`);
-      continue;
-    }
-
-    closeList();
-    flushTable();
-    paragraphLines.push(line);
-  }
-
-  flushParagraph();
-  closeList();
-  flushTable();
-  flushCodeFence();
-  return htmlParts.join("");
-}
-
 function getCanvasDocuments(metadata) {
   if (!metadata || typeof metadata !== "object" || !Array.isArray(metadata.canvas_documents)) {
     return [];
@@ -497,6 +289,92 @@ function setCanvasStatus(message, tone = "muted") {
   }
   canvasStatus.textContent = String(message || "").trim() || "Canvas idle";
   canvasStatus.dataset.tone = tone;
+}
+
+function setPendingDocumentCanvasOpen(file) {
+  if (!file) {
+    pendingDocumentCanvasOpen = null;
+    return;
+  }
+
+  pendingDocumentCanvasOpen = {
+    fileName: String(file.name || "Document").trim() || "Document",
+  };
+}
+
+function consumePendingDocumentCanvasOpen() {
+  const pendingRequest = pendingDocumentCanvasOpen;
+  pendingDocumentCanvasOpen = null;
+  return pendingRequest;
+}
+
+function isCanvasConfirmOpen() {
+  return Boolean(canvasConfirmModal?.classList.contains("open"));
+}
+
+function closeCanvasConfirmModal(action = "cancel", executeHandler = true) {
+  if (!canvasConfirmModal) {
+    return;
+  }
+
+  const pendingAction = pendingCanvasConfirmAction;
+  pendingCanvasConfirmAction = null;
+  canvasConfirmModal.classList.remove("open");
+  canvasConfirmOverlay?.classList.remove("open");
+  canvasConfirmModal.setAttribute("aria-hidden", "true");
+
+  if (lastCanvasConfirmTriggerEl && typeof lastCanvasConfirmTriggerEl.focus === "function") {
+    lastCanvasConfirmTriggerEl.focus();
+  }
+
+  if (!executeHandler || !pendingAction) {
+    return;
+  }
+
+  if (action === "confirm") {
+    pendingAction.onConfirm?.();
+    return;
+  }
+
+  pendingAction.onCancel?.();
+}
+
+function openCanvasConfirmModal(options = {}) {
+  if (!canvasConfirmModal || !canvasConfirmTitle || !canvasConfirmMessage) {
+    options.onConfirm?.();
+    return;
+  }
+
+  if (isCanvasConfirmOpen()) {
+    closeCanvasConfirmModal("cancel", false);
+  }
+
+  closeMobileTools();
+  closeExportPanel();
+  closeSettings();
+  closeStats();
+  lastCanvasConfirmTriggerEl = document.activeElement instanceof HTMLElement ? document.activeElement : attachBtn;
+  pendingCanvasConfirmAction = {
+    onConfirm: typeof options.onConfirm === "function" ? options.onConfirm : null,
+    onCancel: typeof options.onCancel === "function" ? options.onCancel : null,
+  };
+  canvasConfirmTitle.textContent = String(options.title || "Open document in Canvas?").trim() || "Open document in Canvas?";
+  canvasConfirmMessage.textContent = String(options.message || "Your uploaded document is ready in Canvas.").trim() || "Your uploaded document is ready in Canvas.";
+  canvasConfirmModal.classList.add("open");
+  canvasConfirmOverlay?.classList.add("open");
+  canvasConfirmModal.setAttribute("aria-hidden", "false");
+  canvasConfirmOpenBtn?.focus();
+}
+
+function confirmCanvasOpenForDocument(pendingRequest, documentCount, callbacks = {}) {
+  const fileName = String(pendingRequest?.fileName || "document").trim() || "document";
+  const documentLabel = documentCount === 1 ? "canvas document" : `${documentCount} canvas documents`;
+  openCanvasConfirmModal({
+    title: "Open document in Canvas?",
+    message: `${fileName} is ready in Canvas. ${documentLabel.charAt(0).toUpperCase()}${documentLabel.slice(1)} ${documentCount === 1 ? "is" : "are"} available now.`,
+    onConfirm: callbacks.onConfirm,
+    onCancel: callbacks.onCancel,
+  });
 }
 
 function escapeRegExp(text) {
@@ -622,6 +500,12 @@ function renderCanvasPanel() {
     if (canvasCopyBtn) {
       canvasCopyBtn.disabled = true;
     }
+    if (canvasDeleteBtn) {
+      canvasDeleteBtn.disabled = true;
+    }
+    if (canvasClearBtn) {
+      canvasClearBtn.disabled = true;
+    }
     if (canvasDownloadHtmlBtn) {
       canvasDownloadHtmlBtn.disabled = true;
     }
@@ -659,6 +543,12 @@ function renderCanvasPanel() {
   if (canvasCopyBtn) {
     canvasCopyBtn.disabled = false;
   }
+  if (canvasDeleteBtn) {
+    canvasDeleteBtn.disabled = false;
+  }
+  if (canvasClearBtn) {
+    canvasClearBtn.disabled = documents.length === 0;
+  }
   if (canvasDownloadHtmlBtn) {
     canvasDownloadHtmlBtn.disabled = false;
   }
@@ -676,6 +566,7 @@ function renderCanvasPanel() {
 
 function openCanvas() {
   closeMobileTools();
+  closeCanvasConfirmModal("cancel", false);
   closeSettings();
   closeStats();
   closeExportPanel();
@@ -778,22 +669,91 @@ async function downloadCanvasDocument(format) {
   }
 }
 
+async function deleteCanvasDocuments({ documentId = null, clearAll = false } = {}) {
+  if (!currentConvId) {
+    setCanvasStatus("Canvas is not available yet.", "warning");
+    return;
+  }
+
+  const activeDocument = getActiveCanvasDocument();
+  const targetDocumentId = documentId || activeDocument?.id || null;
+  if (!clearAll && !targetDocumentId) {
+    setCanvasStatus("No canvas document is available to delete.", "warning");
+    return;
+  }
+
+  const confirmationMessage = clearAll
+    ? "Delete all canvas documents?"
+    : `Delete ${activeDocument?.title || "this canvas document"}?`;
+  if (!globalThis.confirm(confirmationMessage)) {
+    return;
+  }
+
+  setCanvasStatus(clearAll ? "Deleting all canvas documents..." : "Deleting canvas document...", "muted");
+  try {
+    const params = new URLSearchParams();
+    if (targetDocumentId) {
+      params.set("document_id", targetDocumentId);
+    }
+    if (clearAll) {
+      params.set("clear_all", "true");
+    }
+
+    const query = params.toString();
+    const response = await fetch(`/api/conversations/${currentConvId}/canvas${query ? `?${query}` : ""}`, {
+      method: "DELETE",
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(payload.error || "Canvas delete failed.");
+    }
+
+    history = Array.isArray(payload.messages) ? payload.messages.map(normalizeHistoryEntry) : history;
+    streamingCanvasDocuments = [];
+    activeCanvasDocumentId = payload.cleared
+      ? null
+      : String(payload.active_document_id || getActiveCanvasDocument(history)?.id || "").trim() || null;
+    renderConversationHistory();
+    renderCanvasPanel();
+
+    if (payload.cleared) {
+      setCanvasAttention(false);
+      setCanvasStatus("Canvas cleared.", "success");
+      return;
+    }
+
+    setCanvasStatus("Canvas document deleted.", "success");
+  } catch (error) {
+    setCanvasStatus(error.message || "Canvas delete failed.", "danger");
+  }
+}
+
 function renderBubbleWithCursor(bubbleEl, text) {
   if (!bubbleEl) {
     return;
   }
 
   bubbleEl.classList.add("streaming-text");
+  bubbleEl.innerHTML = renderMarkdown(text);
 
-  const cursorMarker = "\uE000STREAMCURSOR\uE001";
-  let html = renderStreamingMarkdown(text + cursorMarker);
+  const existingCursor = bubbleEl.querySelector(".stream-cursor");
+  if (existingCursor) {
+    existingCursor.remove();
+  }
 
-  html = html.replace(
-    cursorMarker,
-    '<span class="stream-cursor">▋</span>'
+  const cursorEl = document.createElement("span");
+  cursorEl.className = "stream-cursor";
+  cursorEl.textContent = "▋";
+
+  const cursorTarget = bubbleEl.querySelector(
+    "pre code, p:last-child, li:last-child, blockquote:last-child, h1:last-child, h2:last-child, h3:last-child, h4:last-child, h5:last-child, h6:last-child, td:last-child, th:last-child"
   );
+  if (cursorTarget) {
+    cursorTarget.appendChild(cursorEl);
+    return;
+  }
 
-  bubbleEl.innerHTML = html;
+  bubbleEl.appendChild(cursorEl);
 }
 
 function renderBubbleMarkdown(bubbleEl, text) {
@@ -1012,6 +972,15 @@ function isRenderableHistoryEntry(message) {
 
 function getVisibleHistoryEntries(entries = history) {
   return entries.filter(isRenderableHistoryEntry);
+}
+
+function getConversationSignature(entries = history) {
+  return getVisibleHistoryEntries(entries)
+    .map((message) => {
+      const metadata = message.metadata ? JSON.stringify(message.metadata) : "";
+      return `${message.role}:${message.content}:${metadata}`;
+    })
+    .join("\u0001");
 }
 
 function buildAssistantMetadata({
@@ -1349,6 +1318,71 @@ function renderConversationHistory() {
   renderSummaryInspector();
 }
 
+async function refreshConversationFromServer() {
+  if (!currentConvId) {
+    return false;
+  }
+
+  const response = await fetch(`/api/conversations/${currentConvId}`);
+  if (!response.ok) {
+    return false;
+  }
+
+  const data = await response.json().catch(() => null);
+  if (!data || Number(data.conversation?.id) !== Number(currentConvId)) {
+    return false;
+  }
+
+  const serverHistory = Array.isArray(data.messages) ? data.messages.map(normalizeHistoryEntry) : [];
+  const serverSignature = getConversationSignature(serverHistory);
+  if (serverSignature === lastConversationSignature) {
+    return false;
+  }
+
+  history = serverHistory;
+  currentConvTitle = String(data.conversation?.title || currentConvTitle || "New Chat").trim() || "New Chat";
+  latestSummaryStatus = null;
+  streamingCanvasDocuments = [];
+  activeCanvasDocumentId = getActiveCanvasDocument(history)?.id || null;
+  lastConversationSignature = serverSignature;
+  renderConversationHistory();
+  renderCanvasPanel();
+  updateExportPanel();
+  rebuildTokenStatsFromHistory();
+  loadSidebar();
+  return true;
+}
+
+function scheduleConversationRefreshAfterStream() {
+  if (!currentConvId) {
+    return;
+  }
+
+  const refreshGeneration = ++conversationRefreshGeneration;
+  pendingConversationRefreshTimers.forEach((timerId) => window.clearTimeout(timerId));
+  pendingConversationRefreshTimers.clear();
+
+  [800, 2000, 5000, 10000].forEach((delay) => {
+    const timerId = window.setTimeout(async () => {
+      pendingConversationRefreshTimers.delete(timerId);
+      if (refreshGeneration !== conversationRefreshGeneration || !currentConvId || isStreaming || isFixing) {
+        return;
+      }
+
+      try {
+        const refreshed = await refreshConversationFromServer();
+        if (refreshed) {
+          pendingConversationRefreshTimers.forEach((pendingTimerId) => window.clearTimeout(pendingTimerId));
+          pendingConversationRefreshTimers.clear();
+        }
+      } catch (_) {
+        // Ignore transient refresh errors and keep polling.
+      }
+    }, delay);
+    pendingConversationRefreshTimers.add(timerId);
+  });
+}
+
 function rebuildTokenStatsFromHistory() {
   resetTokenStats();
   history.forEach((message) => {
@@ -1439,11 +1473,6 @@ function getSummaryTriggerValue() {
   return Number.isFinite(rawValue) ? rawValue : 80000;
 }
 
-function getSummaryBatchValue() {
-  const rawValue = parseInt(summaryBatchEl?.value || appSettings.chat_summary_batch_size || 20, 10);
-  return Number.isFinite(rawValue) ? rawValue : 20;
-}
-
 function getEffectiveSummaryTriggerValue() {
   const baseTrigger = getSummaryTriggerValue();
   return getSummaryModeValue() === "aggressive"
@@ -1465,30 +1494,6 @@ function estimateSummaryTriggerTokens(entries = history) {
     }
     return total + estimateLocalTokens(entry.content);
   }, 0);
-}
-
-function estimateSummaryTokensByRoles(entries = history, roles = []) {
-  const activeRoles = new Set(Array.isArray(roles) ? roles : []);
-  return (entries || []).reduce((total, entry) => {
-    const role = String(entry?.role || "").trim();
-    if (!activeRoles.has(role)) {
-      return total;
-    }
-    return total + estimateLocalTokens(entry.content);
-  }, 0);
-}
-
-function getSummaryCandidateCount(entries = history) {
-  return (entries || []).filter((entry) => {
-    const role = String(entry?.role || "").trim();
-    if (role === "user") {
-      return true;
-    }
-    if (role !== "assistant") {
-      return false;
-    }
-    return !(Array.isArray(entry?.tool_calls) && entry.tool_calls.length > 0);
-  }).length;
 }
 
 function findLatestSummaryEntry(entries = history) {
@@ -1569,8 +1574,6 @@ function renderSummaryInspector() {
   const mode = getSummaryModeValue();
   const effectiveTrigger = getEffectiveSummaryTriggerValue();
   const currentEstimate = estimateSummaryTriggerTokens(history);
-  const localCandidateCount = getSummaryCandidateCount(history);
-  const batchSize = getSummaryBatchValue();
   const latestSummary = findLatestSummaryEntry(history);
   const lastSummaryMeta = latestSummary?.metadata && typeof latestSummary.metadata === "object"
     ? latestSummary.metadata
@@ -1579,16 +1582,8 @@ function renderSummaryInspector() {
   const remaining = Math.max(0, effectiveTrigger - currentEstimate);
   const overBy = Math.max(0, currentEstimate - effectiveTrigger);
   const latestServerCheck = Number(latestSummaryStatus?.visible_token_count || 0);
-  const candidateCount = Number(latestSummaryStatus?.candidate_message_count || localCandidateCount);
-  const emptyMessageCount = Number(latestSummaryStatus?.empty_message_count || 0);
-  const returnedTextLength = Number(latestSummaryStatus?.returned_text_length || 0);
-  const serverToolTokens = Number(latestSummaryStatus?.tool_token_count || 0);
-  const toolTokenEstimate = serverToolTokens || estimateSummaryTokensByRoles(history, ["tool"]);
-  const userAssistantTokenEstimate = Number(latestSummaryStatus?.user_assistant_token_count || estimateSummaryTokensByRoles(history, ["user", "assistant"]));
   const mergedAssistantCount = Number(latestSummaryStatus?.merged_assistant_message_count || 0);
   const skippedErrorCount = Number(latestSummaryStatus?.skipped_error_message_count || 0);
-  const promptMessageCount = Number(latestSummaryStatus?.prompt_message_count || 0);
-  const usedMaxSteps = Number(latestSummaryStatus?.used_max_steps || 1);
 
   let badgeTone = "muted";
   let badgeText = "Waiting";
@@ -1629,25 +1624,11 @@ function renderSummaryInspector() {
   summaryInspectorHeadline.textContent = headline;
   summaryInspectorCurrent.textContent = fmt(currentEstimate);
   summaryInspectorTrigger.textContent = fmt(effectiveTrigger);
-  summaryInspectorNext.textContent = `${Math.min(candidateCount, batchSize)} / ${fmt(batchSize)} msgs`;
   summaryInspectorGap.textContent = overBy > 0 ? `${fmt(overBy)} over` : `${fmt(remaining)} left`;
-  if (summaryInspectorCandidates) {
-    summaryInspectorCandidates.textContent = fmt(candidateCount);
-  }
-  if (summaryInspectorEmpty) {
-    summaryInspectorEmpty.textContent = fmt(emptyMessageCount);
-  }
-  if (summaryInspectorToolTokens) {
-    summaryInspectorToolTokens.textContent = fmt(toolTokenEstimate);
-  }
-  if (summaryInspectorOutput) {
-    summaryInspectorOutput.textContent = returnedTextLength > 0 ? `${fmt(returnedTextLength)} chars` : "—";
-  }
 
   const detailParts = [
     "Counts user, assistant, tool, and summary history toward the summary trigger, while ignoring assistant tool-call placeholders.",
     "Does not count runtime system prompt, RAG context, or final-answer instructions.",
-    "Only the oldest unsummarized user and assistant messages are compressed; tool history remains part of the trigger count.",
   ];
   if (latestServerCheck > 0) {
     detailParts.push(`Last server-side check saw ${fmt(latestServerCheck)} counted tokens.`);
@@ -1661,23 +1642,22 @@ function renderSummaryInspector() {
   summaryInspectorDetail.textContent = detailParts.join(" ");
 
   if (summaryInspectorReason) {
-    const reasonParts = [];
+    let reasonText = "The latest summary decision will appear here after each completed assistant turn.";
     if (latestSummaryStatus) {
-      reasonParts.push(describeSummaryFailure(latestSummaryStatus));
-      if (promptMessageCount > 0) {
-        reasonParts.push(`Prompt payload used ${fmt(promptMessageCount)} cleaned history messages.`);
-      }
-      if (usedMaxSteps > 0) {
-        reasonParts.push(`Summary generation runs with max_steps=${fmt(usedMaxSteps)}.`);
+      if (latestSummaryStatus.reason === "summary_generation_failed" || latestSummaryStatus.reason === "locked" || latestSummaryStatus.reason === "below_threshold" || latestSummaryStatus.reason === "mode_never") {
+        reasonText = describeSummaryFailure(latestSummaryStatus);
+      } else if (latestSummaryStatus.applied) {
+        reasonText = "Latest summary pass completed successfully.";
+      } else {
+        reasonText = "Latest summary check completed.";
       }
       const failureDetail = String(latestSummaryStatus.failure_detail || "").trim();
-      if (failureDetail && failureDetail !== describeSummaryFailure(latestSummaryStatus)) {
-        reasonParts.push(failureDetail);
+      const failureSummary = describeSummaryFailure(latestSummaryStatus);
+      if (failureDetail && failureDetail !== failureSummary) {
+        reasonText = `${reasonText} ${failureDetail}`;
       }
-    } else {
-      reasonParts.push("The latest summary decision will appear here after each completed assistant turn.");
     }
-    summaryInspectorReason.textContent = reasonParts.join(" ");
+    summaryInspectorReason.textContent = reasonText;
   }
 
   if (lastSummaryMeta?.is_summary) {
@@ -1875,6 +1855,16 @@ if (canvasCopyBtn) {
     }
   });
 }
+if (canvasDeleteBtn) {
+  canvasDeleteBtn.addEventListener("click", () => {
+    void deleteCanvasDocuments();
+  });
+}
+if (canvasClearBtn) {
+  canvasClearBtn.addEventListener("click", () => {
+    void deleteCanvasDocuments({ clearAll: true });
+  });
+}
 if (canvasDownloadHtmlBtn) {
   canvasDownloadHtmlBtn.addEventListener("click", () => downloadCanvasDocument("html"));
 }
@@ -1908,6 +1898,18 @@ if (mobileToolsClose) {
 if (mobileToolsOverlay) {
   mobileToolsOverlay.addEventListener("click", closeMobileTools);
 }
+if (canvasConfirmOverlay) {
+  canvasConfirmOverlay.addEventListener("click", () => closeCanvasConfirmModal("cancel"));
+}
+if (canvasConfirmCloseBtn) {
+  canvasConfirmCloseBtn.addEventListener("click", () => closeCanvasConfirmModal("cancel"));
+}
+if (canvasConfirmLaterBtn) {
+  canvasConfirmLaterBtn.addEventListener("click", () => closeCanvasConfirmModal("cancel"));
+}
+if (canvasConfirmOpenBtn) {
+  canvasConfirmOpenBtn.addEventListener("click", () => closeCanvasConfirmModal("confirm"));
+}
 if (mobileSettingsBtn) {
   mobileSettingsBtn.addEventListener("click", () => {
     openSettings();
@@ -1936,6 +1938,10 @@ window.addEventListener("resize", () => {
 
 window.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
+    if (isCanvasConfirmOpen()) {
+      closeCanvasConfirmModal("cancel");
+      return;
+    }
     if (isCanvasOpen()) {
       if (canvasSearchInput?.value) {
         canvasSearchInput.value = "";
@@ -2031,6 +2037,7 @@ async function openConversation(id) {
   history = Array.isArray(data.messages) ? data.messages.map(normalizeHistoryEntry) : [];
   streamingCanvasDocuments = [];
   activeCanvasDocumentId = getActiveCanvasDocument(history)?.id || null;
+  lastConversationSignature = getConversationSignature(history);
   renderConversationHistory();
   renderCanvasPanel();
   updateExportPanel();
@@ -2051,12 +2058,16 @@ async function deleteConversation(id) {
 }
 
 function startNewChat() {
+  conversationRefreshGeneration += 1;
+  pendingConversationRefreshTimers.forEach((timerId) => window.clearTimeout(timerId));
+  pendingConversationRefreshTimers.clear();
   currentConvId = null;
   currentConvTitle = "New Chat";
   history = [];
   latestSummaryStatus = null;
   streamingCanvasDocuments = [];
   activeCanvasDocumentId = null;
+  lastConversationSignature = "";
   clearEditTarget();
   clearSelectedImage();
   resetTokenStats();
@@ -2455,11 +2466,6 @@ summaryTriggerEl.addEventListener("input", () => {
   renderSummaryInspector();
 });
 
-summaryBatchEl.addEventListener("input", () => {
-  setSettingsStatus("Unsaved changes", "warning");
-  renderSummaryInspector();
-});
-
 fetchThresholdEl.addEventListener("input", () => {
   setSettingsStatus("Unsaved changes", "warning");
 });
@@ -2531,10 +2537,8 @@ function applySettingsToForm() {
   maxStepsEl.value = String(appSettings.max_steps || 5);
   summaryModeEl.value = appSettings.chat_summary_mode || "auto";
   summaryTriggerEl.value = String(appSettings.chat_summary_trigger_token_count || 80000);
-  summaryBatchEl.value = String(appSettings.chat_summary_batch_size || 20);
   if (summarySkipFirstEl) summarySkipFirstEl.value = String(appSettings.summary_skip_first ?? 2);
   if (summarySkipLastEl) summarySkipLastEl.value = String(appSettings.summary_skip_last ?? 1);
-  if (summaryDynamicBatchEl) summaryDynamicBatchEl.checked = appSettings.summary_dynamic_batch !== false;
   fetchThresholdEl.value = String(appSettings.fetch_url_token_threshold || 3500);
   fetchAggressivenessEl.value = String(appSettings.fetch_url_clip_aggressiveness || 50);
   applySelectedTools(appSettings.active_tools || []);
@@ -2563,10 +2567,8 @@ async function refreshSettings() {
     appSettings.max_steps = data.max_steps || 5;
     appSettings.chat_summary_mode = data.chat_summary_mode || "auto";
     appSettings.chat_summary_trigger_token_count = data.chat_summary_trigger_token_count || 80000;
-    appSettings.chat_summary_batch_size = data.chat_summary_batch_size || 20;
     appSettings.summary_skip_first = data.summary_skip_first ?? 2;
     appSettings.summary_skip_last = data.summary_skip_last ?? 1;
-    appSettings.summary_dynamic_batch = data.summary_dynamic_batch !== false;
     appSettings.fetch_url_token_threshold = data.fetch_url_token_threshold || 3500;
     appSettings.fetch_url_clip_aggressiveness = data.fetch_url_clip_aggressiveness ?? 50;
     appSettings.active_tools = Array.isArray(data.active_tools) ? data.active_tools : [];
@@ -2627,10 +2629,8 @@ async function saveSettings() {
     max_steps: parseInt(maxStepsEl.value, 10) || 5,
     chat_summary_mode: summaryModeEl.value || "auto",
     chat_summary_trigger_token_count: parseInt(summaryTriggerEl.value, 10) || 80000,
-    chat_summary_batch_size: parseInt(summaryBatchEl.value, 10) || 20,
     summary_skip_first: summarySkipFirstEl ? parseInt(summarySkipFirstEl.value, 10) || 0 : 2,
     summary_skip_last: summarySkipLastEl ? parseInt(summarySkipLastEl.value, 10) || 0 : 1,
-    summary_dynamic_batch: summaryDynamicBatchEl ? summaryDynamicBatchEl.checked : true,
     fetch_url_token_threshold: parseInt(fetchThresholdEl.value, 10) || 3500,
     fetch_url_clip_aggressiveness: parseInt(fetchAggressivenessEl.value, 10) || 50,
     active_tools: getSelectedTools(),
@@ -2660,10 +2660,8 @@ async function saveSettings() {
     appSettings.max_steps = data.max_steps || 5;
     appSettings.chat_summary_mode = data.chat_summary_mode || "auto";
     appSettings.chat_summary_trigger_token_count = data.chat_summary_trigger_token_count || 80000;
-    appSettings.chat_summary_batch_size = data.chat_summary_batch_size || 20;
     appSettings.summary_skip_first = data.summary_skip_first ?? 2;
     appSettings.summary_skip_last = data.summary_skip_last ?? 1;
-    appSettings.summary_dynamic_batch = data.summary_dynamic_batch !== false;
     appSettings.fetch_url_token_threshold = data.fetch_url_token_threshold || 3500;
     appSettings.fetch_url_clip_aggressiveness = data.fetch_url_clip_aggressiveness ?? 50;
     appSettings.active_tools = Array.isArray(data.active_tools) ? data.active_tools : [];
@@ -3649,6 +3647,8 @@ async function sendMessage(options = {}) {
     return;
   }
 
+  setPendingDocumentCanvasOpen(pendingDocument);
+
   if (pendingImage && !Boolean(featureFlags.vision_enabled)) {
     clearSelectedImage();
     showError("Image uploads are disabled in .env.");
@@ -3728,6 +3728,9 @@ async function sendMessage(options = {}) {
 
   const controller = new AbortController();
   activeAbortController = controller;
+  conversationRefreshGeneration += 1;
+  pendingConversationRefreshTimers.forEach((timerId) => window.clearTimeout(timerId));
+  pendingConversationRefreshTimers.clear();
   setStreaming(true);
 
   let rawAnswer = "";
@@ -3744,37 +3747,50 @@ async function sendMessage(options = {}) {
   const stepSections = {};
   const assistantTraceByKey = {};
   let latestStepInfo = { step: 1, maxSteps: null };
-  let pendingAnswerRenderFrame = null;
+  let pendingAnswerRenderTimer = null;
+  let visibleAnswer = "";
+
+  const getTypingStepSize = () => {
+    const remainingLength = Math.max(0, fullAnswer.length - visibleAnswer.length);
+    if (!remainingLength) {
+      return 0;
+    }
+
+    return Math.max(
+      STREAM_TYPING_MIN_STEP,
+      Math.min(STREAM_TYPING_MAX_STEP, Math.ceil(remainingLength * 0.18)),
+    );
+  };
 
   const scheduleAnswerRender = () => {
-    if (pendingAnswerRenderFrame !== null) {
+    if (pendingAnswerRenderTimer !== null) {
       return;
     }
 
-    const flushRender = () => {
-      pendingAnswerRenderFrame = null;
-      renderBubbleWithCursor(asstBubble, fullAnswer);
+    pendingAnswerRenderTimer = window.setTimeout(() => {
+      pendingAnswerRenderTimer = null;
+      const stepSize = getTypingStepSize();
+      if (!stepSize) {
+        return;
+      }
+
+      visibleAnswer = fullAnswer.slice(0, visibleAnswer.length + stepSize);
+      renderBubbleWithCursor(asstBubble, visibleAnswer);
       scrollToBottom();
-    };
-
-    if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
-      pendingAnswerRenderFrame = window.requestAnimationFrame(flushRender);
-      return;
-    }
-
-    pendingAnswerRenderFrame = window.setTimeout(flushRender, 16);
+      if (visibleAnswer.length < fullAnswer.length) {
+        scheduleAnswerRender();
+      }
+    }, STREAM_TYPING_INTERVAL_MS);
   };
 
   const flushAnswerRender = () => {
-    if (pendingAnswerRenderFrame !== null) {
-      if (typeof window !== "undefined" && typeof window.cancelAnimationFrame === "function") {
-        window.cancelAnimationFrame(pendingAnswerRenderFrame);
-      } else {
-        window.clearTimeout(pendingAnswerRenderFrame);
-      }
-      pendingAnswerRenderFrame = null;
+    if (pendingAnswerRenderTimer !== null) {
+      window.clearTimeout(pendingAnswerRenderTimer);
+      pendingAnswerRenderTimer = null;
     }
-    renderBubbleWithCursor(asstBubble, fullAnswer);
+
+    visibleAnswer = fullAnswer;
+    renderBubbleWithCursor(asstBubble, visibleAnswer);
   };
 
   try {
@@ -4014,9 +4030,7 @@ async function sendMessage(options = {}) {
         }
         rawAnswer = syncedAnswer;
         fullAnswer = rawAnswer;
-        if (pendingAnswerRenderFrame !== null) {
-          flushAnswerRender();
-        }
+        flushAnswerRender();
         asstBubble.classList.remove("thinking");
         asstBubble.classList.remove("cursor");
         renderBubbleMarkdown(asstBubble, fullAnswer);
@@ -4029,9 +4043,7 @@ async function sendMessage(options = {}) {
         pendingClarification = event.clarification && typeof event.clarification === "object" ? event.clarification : null;
         rawAnswer = String(event.text || "").trim();
         fullAnswer = rawAnswer;
-        if (pendingAnswerRenderFrame !== null) {
-          flushAnswerRender();
-        }
+        flushAnswerRender();
         asstBubble.classList.remove("thinking");
         asstBubble.classList.remove("cursor");
         renderBubbleMarkdown(asstBubble, fullAnswer);
@@ -4062,7 +4074,23 @@ async function sendMessage(options = {}) {
             ? activeCanvasDocumentId
             : streamingCanvasDocuments[streamingCanvasDocuments.length - 1].id;
           renderCanvasPanel();
-          if (event.auto_open && !isCanvasOpen()) {
+          const pendingCanvasRequest = pendingDocumentCanvasOpen;
+          if (pendingCanvasRequest) {
+            consumePendingDocumentCanvasOpen();
+          }
+
+          if (pendingCanvasRequest && event.auto_open && !isCanvasOpen()) {
+            confirmCanvasOpenForDocument(pendingCanvasRequest, streamingCanvasDocuments.length, {
+              onConfirm: () => {
+                openCanvas();
+                setCanvasStatus(`${pendingCanvasRequest.fileName} opened in Canvas.`, "success");
+              },
+              onCancel: () => {
+                setCanvasAttention(true);
+                setCanvasStatus(`${pendingCanvasRequest.fileName} is ready in Canvas. Open the panel when needed.`, "muted");
+              },
+            });
+          } else if (event.auto_open && !isCanvasOpen()) {
             openCanvas();
             setCanvasStatus("Document opened in Canvas.", "success");
           } else if (isCanvasOpen()) {
@@ -4115,9 +4143,10 @@ async function sendMessage(options = {}) {
       }
     });
 
-    if (pendingAnswerRenderFrame !== null) {
+    if (pendingAnswerRenderTimer !== null) {
       flushAnswerRender();
     }
+    pendingDocumentCanvasOpen = null;
     asstBubble.classList.remove("cursor");
     renderBubbleMarkdown(asstBubble, fullAnswer);
     const assistantEntry = {
@@ -4146,10 +4175,13 @@ async function sendMessage(options = {}) {
     } else {
       loadSidebar();
     }
+    lastConversationSignature = getConversationSignature(history);
+    scheduleConversationRefreshAfterStream();
   } catch (error) {
-    if (pendingAnswerRenderFrame !== null) {
+    if (pendingAnswerRenderTimer !== null) {
       flushAnswerRender();
     }
+    pendingDocumentCanvasOpen = null;
     if (fullAnswer.trim()) {
       asstBubble.classList.remove("cursor");
       renderBubbleMarkdown(asstBubble, fullAnswer);
@@ -4179,6 +4211,8 @@ async function sendMessage(options = {}) {
       if (error.name !== "AbortError") {
         showError("Connection was interrupted. The partial answer was preserved.");
       }
+      lastConversationSignature = getConversationSignature(history);
+      scheduleConversationRefreshAfterStream();
     } else {
       if (currentConvId) {
         await openConversation(currentConvId);

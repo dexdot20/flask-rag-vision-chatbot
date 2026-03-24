@@ -12,7 +12,6 @@ from flask import current_app, has_app_context
 from canvas_service import extract_canvas_documents
 from config import (
     CACHE_TTL_HOURS,
-    CHAT_SUMMARY_BATCH_SIZE,
     CHAT_SUMMARY_ALLOWED_MODES,
     CHAT_SUMMARY_MODE,
     CHAT_SUMMARY_TRIGGER_TOKEN_COUNT,
@@ -25,6 +24,13 @@ from config import (
     FETCH_SUMMARY_TOKEN_THRESHOLD,
     IMAGE_STORAGE_DIR,
     MAX_SCRATCHPAD_LENGTH,
+    PROMPT_MAX_INPUT_TOKENS,
+    PROMPT_PREFLIGHT_SUMMARY_TOKEN_COUNT,
+    PROMPT_RAG_MAX_TOKENS,
+    PROMPT_RECENT_HISTORY_MAX_TOKENS,
+    PROMPT_RESPONSE_TOKEN_RESERVE,
+    PROMPT_SUMMARY_MAX_TOKENS,
+    PROMPT_TOOL_MEMORY_MAX_TOKENS,
     RAG_CONTEXT_SIZE_PRESETS,
     RAG_DEFAULT_CONTEXT_SIZE_PRESET,
     RAG_DEFAULT_SENSITIVITY_PRESET,
@@ -32,6 +38,8 @@ from config import (
     RAG_SENSITIVITY_PRESETS,
     RAG_TOOL_RESULT_MAX_TEXT_CHARS,
     RAG_TOOL_RESULT_SUMMARY_MAX_CHARS,
+    SUMMARY_RETRY_MIN_SOURCE_TOKENS,
+    SUMMARY_SOURCE_TARGET_TOKENS,
 )
 from token_utils import estimate_text_tokens
 
@@ -954,10 +962,11 @@ def serialize_message_metadata(metadata: dict | None) -> str | None:
         "covers_to_position",
         "summary_position",
         "covered_message_count",
+        "covered_tool_call_message_count",
+        "covered_tool_message_count",
         "trigger_threshold",
         "trigger_token_count",
         "visible_token_count",
-        "summary_batch_size",
     ):
         normalized = _coerce_non_negative_int(metadata.get(key))
         if normalized is not None:
@@ -988,6 +997,22 @@ def serialize_message_metadata(metadata: dict | None) -> str | None:
                 normalized_ids.append(normalized)
         if normalized_ids:
             cleaned["covered_message_ids"] = normalized_ids
+
+    for key in (
+        "covered_visible_message_ids",
+        "covered_tool_call_message_ids",
+        "covered_tool_message_ids",
+    ):
+        raw_ids = metadata.get(key)
+        if not isinstance(raw_ids, list):
+            continue
+        normalized_ids = []
+        for raw_value in raw_ids[:64]:
+            normalized = _coerce_non_negative_int(raw_value)
+            if normalized is not None and normalized not in normalized_ids:
+                normalized_ids.append(normalized)
+        if normalized_ids:
+            cleaned[key] = normalized_ids
 
     tool_results = extract_message_tool_results(metadata)
     if tool_results:
@@ -1275,16 +1300,6 @@ def get_chat_summary_trigger_token_count(settings: dict | None = None) -> int:
     return max(1_000, min(200_000, value))
 
 
-def get_chat_summary_batch_size(settings: dict | None = None) -> int:
-    source = settings if settings is not None else get_app_settings()
-    raw_value = source.get("chat_summary_batch_size", DEFAULT_SETTINGS["chat_summary_batch_size"])
-    try:
-        value = int(raw_value)
-    except (TypeError, ValueError):
-        value = CHAT_SUMMARY_BATCH_SIZE
-    return max(5, min(100, value))
-
-
 def get_summary_skip_first(settings: dict | None = None) -> int:
     source = settings if settings is not None else get_app_settings()
     raw_value = source.get("summary_skip_first", DEFAULT_SETTINGS["summary_skip_first"])
@@ -1305,10 +1320,49 @@ def get_summary_skip_last(settings: dict | None = None) -> int:
     return max(0, min(20, value))
 
 
-def get_summary_dynamic_batch(settings: dict | None = None) -> bool:
-    source = settings if settings is not None else get_app_settings()
-    raw_value = source.get("summary_dynamic_batch", DEFAULT_SETTINGS["summary_dynamic_batch"])
-    return str(raw_value).strip().lower() in {"1", "true", "yes", "on"}
+def get_prompt_max_input_tokens(settings: dict | None = None) -> int:
+    del settings
+    return PROMPT_MAX_INPUT_TOKENS
+
+
+def get_prompt_response_token_reserve(settings: dict | None = None) -> int:
+    del settings
+    return PROMPT_RESPONSE_TOKEN_RESERVE
+
+
+def get_prompt_recent_history_max_tokens(settings: dict | None = None) -> int:
+    del settings
+    return PROMPT_RECENT_HISTORY_MAX_TOKENS
+
+
+def get_prompt_summary_max_tokens(settings: dict | None = None) -> int:
+    del settings
+    return PROMPT_SUMMARY_MAX_TOKENS
+
+
+def get_prompt_rag_max_tokens(settings: dict | None = None) -> int:
+    del settings
+    return PROMPT_RAG_MAX_TOKENS
+
+
+def get_prompt_tool_memory_max_tokens(settings: dict | None = None) -> int:
+    del settings
+    return PROMPT_TOOL_MEMORY_MAX_TOKENS
+
+
+def get_prompt_preflight_summary_token_count(settings: dict | None = None) -> int:
+    del settings
+    return PROMPT_PREFLIGHT_SUMMARY_TOKEN_COUNT
+
+
+def get_summary_source_target_tokens(settings: dict | None = None) -> int:
+    del settings
+    return SUMMARY_SOURCE_TARGET_TOKENS
+
+
+def get_summary_retry_min_source_tokens(settings: dict | None = None) -> int:
+    del settings
+    return SUMMARY_RETRY_MIN_SOURCE_TOKENS
 
 
 def get_fetch_url_token_threshold(settings: dict | None = None) -> int:

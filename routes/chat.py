@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import logging
 import json
 import re
 from datetime import datetime
 from threading import Lock
 
-from flask import Response, jsonify, request, stream_with_context
+from flask import Response, current_app, jsonify, request, stream_with_context
 
 from agent import FINAL_ANSWER_ERROR_TEXT, FINAL_ANSWER_MISSING_TEXT, collect_agent_response, run_agent_stream
 from canvas_service import (
@@ -27,17 +28,24 @@ from db import (
     find_summary_covering_message_id,
     get_active_tool_names,
     get_app_settings,
-    get_chat_summary_batch_size,
     get_chat_summary_mode,
     get_chat_summary_trigger_token_count,
     get_conversation_messages,
     get_db,
     get_fetch_url_clip_aggressiveness,
     get_fetch_url_token_threshold,
+    get_prompt_max_input_tokens,
+    get_prompt_preflight_summary_token_count,
+    get_prompt_rag_max_tokens,
+    get_prompt_recent_history_max_tokens,
+    get_prompt_response_token_reserve,
+    get_prompt_summary_max_tokens,
+    get_prompt_tool_memory_max_tokens,
     get_rag_auto_inject_enabled,
     get_rag_auto_inject_top_k,
     get_rag_sensitivity,
-    get_summary_dynamic_batch,
+    get_summary_retry_min_source_tokens,
+    get_summary_source_target_tokens,
     get_summary_skip_first,
     get_summary_skip_last,
     get_tool_memory_auto_inject_enabled,
@@ -79,8 +87,15 @@ TITLE_FALLBACK = "New Chat"
 TITLE_ALLOWED_SOURCE_ROLES = {"user", "summary"}
 SUMMARY_MIN_TEXT_LENGTH = 100
 SUMMARY_EXECUTOR = ThreadPoolExecutor(max_workers=2)
+POST_RESPONSE_EXECUTOR = ThreadPoolExecutor(max_workers=2)
 _SUMMARY_LOCKS: dict[int, Lock] = {}
 _SUMMARY_LOCKS_GUARD = Lock()
+LOGGER = logging.getLogger(__name__)
+SUMMARY_TOOL_RESULT_LIMIT = 3
+SUMMARY_TOOL_RESULT_TEXT_LIMIT = 280
+SUMMARY_TOOL_MESSAGE_TEXT_LIMIT = 320
+SUMMARY_MAX_OUTPUT_CHARS = 2_200
+SUMMARY_MAX_BULLETS = 10
 
 
 def _select_title_source_messages(messages: list[dict]) -> list[dict]:
@@ -158,19 +173,248 @@ def build_summary_content(summary_text: str) -> str:
     return f"{SUMMARY_LABEL}\n\n{text}"
 
 
+def _clip_summary_tool_text(value: str, limit: int = SUMMARY_TOOL_RESULT_TEXT_LIMIT) -> str:
+    normalized = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _build_assistant_summary_content(content: str, metadata: dict | None) -> str:
+    base_content = str(content or "").strip()
+    tool_results = extract_message_tool_results(metadata)
+    if not tool_results:
+        return base_content
+
+    tool_lines: list[str] = []
+    for entry in tool_results[:SUMMARY_TOOL_RESULT_LIMIT]:
+        tool_name = str(entry.get("tool_name") or "tool").strip() or "tool"
+        tool_text = (
+            str(entry.get("summary") or "").strip()
+            or str(entry.get("content") or "").strip()
+            or str(entry.get("raw_content") or "").strip()
+        )
+        if not tool_text:
+            continue
+        tool_lines.append(f"- {tool_name}: {_clip_summary_tool_text(tool_text)}")
+
+    if not tool_lines:
+        return base_content
+
+    tool_block = "Tool findings:\n" + "\n".join(tool_lines)
+    if not base_content:
+        return tool_block
+    return f"{base_content}\n\n{tool_block}"
+
+
+def _build_tool_message_summary_content(content: str, tool_call_id: str | None = None) -> str:
+    body = _clip_summary_tool_text(content, SUMMARY_TOOL_MESSAGE_TEXT_LIMIT)
+    if not body:
+        return ""
+
+    identifier = str(tool_call_id or "").strip()
+    if not identifier:
+        return body
+    return f"call {identifier}: {body}"
+
+
+def _sort_message_key(message: dict) -> tuple[int, int]:
+    return int(message.get("position") or 0), int(message.get("id") or 0)
+
+
+def _get_message_role(message: dict) -> str:
+    return str(message.get("role") or "").strip()
+
+
+def _extract_tool_call_ids(message: dict) -> list[str]:
+    tool_calls = message.get("tool_calls")
+    if not isinstance(tool_calls, list):
+        return []
+
+    call_ids: list[str] = []
+    for tool_call in tool_calls:
+        if not isinstance(tool_call, dict):
+            continue
+        call_id = str(tool_call.get("id") or "").strip()
+        if call_id:
+            call_ids.append(call_id)
+    return list(dict.fromkeys(call_ids))
+
+
+def _is_tool_call_assistant_message(message: dict) -> bool:
+    return _get_message_role(message) == "assistant" and bool(_extract_tool_call_ids(message))
+
+
+def _iter_message_blocks(messages: list[dict]) -> list[dict]:
+    ordered_messages = sorted(
+        (message for message in messages if isinstance(message, dict)),
+        key=_sort_message_key,
+    )
+    blocks: list[dict] = []
+    index = 0
+
+    while index < len(ordered_messages):
+        message = ordered_messages[index]
+        role = _get_message_role(message)
+
+        if role == "tool":
+            blocks.append(
+                {
+                    "messages": [message],
+                    "valid_for_prompt": False,
+                    "expected_tool_call_ids": [],
+                    "seen_tool_call_ids": [],
+                }
+            )
+            index += 1
+            continue
+
+        if not _is_tool_call_assistant_message(message):
+            blocks.append(
+                {
+                    "messages": [message],
+                    "valid_for_prompt": True,
+                    "expected_tool_call_ids": [],
+                    "seen_tool_call_ids": [],
+                }
+            )
+            index += 1
+            continue
+
+        expected_tool_call_ids = _extract_tool_call_ids(message)
+        seen_tool_call_ids: list[str] = []
+        block_messages = [message]
+        probe_index = index + 1
+
+        while probe_index < len(ordered_messages):
+            candidate = ordered_messages[probe_index]
+            if _get_message_role(candidate) != "tool":
+                break
+            block_messages.append(candidate)
+            candidate_call_id = str(candidate.get("tool_call_id") or "").strip()
+            if candidate_call_id and candidate_call_id in expected_tool_call_ids and candidate_call_id not in seen_tool_call_ids:
+                seen_tool_call_ids.append(candidate_call_id)
+            probe_index += 1
+
+        blocks.append(
+            {
+                "messages": block_messages,
+                "valid_for_prompt": set(seen_tool_call_ids) >= set(expected_tool_call_ids),
+                "expected_tool_call_ids": expected_tool_call_ids,
+                "seen_tool_call_ids": seen_tool_call_ids,
+            }
+        )
+        index = probe_index
+
+    return blocks
+
+
+def _collect_summary_block_messages(messages: list[dict], start_position: int, end_position: int) -> list[dict]:
+    selected_messages: list[dict] = []
+    for block in _iter_message_blocks(messages):
+        block_messages = block["messages"]
+        if not block_messages:
+            continue
+        block_start = min(int(message.get("position") or 0) for message in block_messages)
+        block_end = max(int(message.get("position") or 0) for message in block_messages)
+        if block_end < start_position or block_start > end_position:
+            continue
+        selected_messages.extend(block_messages)
+    return selected_messages
+
+
+def _resolve_summary_restore_message_ids(
+    canonical_messages: list[dict],
+    summary_message_id: int,
+    summary_metadata: dict,
+) -> list[int]:
+    covered_message_ids = summary_metadata.get("covered_message_ids") if isinstance(summary_metadata, dict) else None
+    restored_ids = [
+        int(message_id)
+        for message_id in (covered_message_ids or [])
+        if int(message_id or 0) > 0
+    ]
+    covers_from_position = int(summary_metadata.get("covers_from_position") or 0) if isinstance(summary_metadata, dict) else 0
+    covers_to_position = int(summary_metadata.get("covers_to_position") or 0) if isinstance(summary_metadata, dict) else 0
+
+    if covers_from_position > 0 and covers_to_position >= covers_from_position:
+        for message in _collect_summary_block_messages(canonical_messages, covers_from_position, covers_to_position):
+            message_id = int(message.get("id") or 0)
+            if message_id <= 0 or message_id == summary_message_id:
+                continue
+            if message.get("deleted_at") is None:
+                continue
+            if message_id not in restored_ids:
+                restored_ids.append(message_id)
+
+    return restored_ids
+
+
+def _expand_summary_source_messages(
+    canonical_messages: list[dict],
+    visible_source_messages: list[dict],
+    visible_candidates: list[dict],
+) -> list[dict]:
+    if not visible_source_messages:
+        return []
+
+    ordered_visible_source = sorted(
+        (message for message in visible_source_messages if isinstance(message, dict)),
+        key=_sort_message_key,
+    )
+    ordered_candidates = sorted(
+        (message for message in visible_candidates if isinstance(message, dict)),
+        key=_sort_message_key,
+    )
+    ordered_canonical = sorted(
+        (message for message in canonical_messages if isinstance(message, dict)),
+        key=_sort_message_key,
+    )
+    if not ordered_visible_source:
+        return []
+
+    selected_ids = {int(message.get("id") or 0) for message in ordered_visible_source if int(message.get("id") or 0) > 0}
+    start_position = int(ordered_visible_source[0].get("position") or 0)
+    last_source_key = _sort_message_key(ordered_visible_source[-1])
+    next_visible_position = None
+
+    for candidate in ordered_candidates:
+        if _sort_message_key(candidate) > last_source_key:
+            next_visible_position = int(candidate.get("position") or 0)
+            break
+
+    end_position = next_visible_position - 1 if next_visible_position is not None else max(
+        (int(message.get("position") or 0) for message in ordered_canonical),
+        default=0,
+    )
+    expanded_messages = _collect_summary_block_messages(ordered_canonical, start_position, end_position)
+
+    filtered_messages: list[dict] = []
+    for message in expanded_messages:
+        message_id = int(message.get("id") or 0)
+        role = _get_message_role(message)
+        if message_id in selected_ids or role == "tool" or _is_tool_call_assistant_message(message):
+            filtered_messages.append(message)
+
+    return filtered_messages
+
+
 def _build_summary_prompt_payload(source_messages: list[dict], user_preferences: str) -> tuple[list[dict], dict]:
     instruction = (
         "You are compressing earlier conversation history for later reuse. "
         "Analyze the dominant language of the conversation and write the summary in that language.\n\n"
-        "Provide a structured summary with the following sections (if applicable):\n"
-        "1. User Goals & Intentions: What the user wanted to achieve.\n"
-        "2. Key Facts & Information: Important data, numbers, names, dates, preferences.\n"
-        "3. Decisions & Agreements: Concrete decisions made, promises, commitments.\n"
-        "4. Unresolved Questions & Open Issues: Questions that still need answering.\n"
-        "5. Important Context: Any constraints, preferences, or special instructions.\n\n"
-        "Include sufficient detail to allow a future assistant to continue the conversation without losing important context. "
-        "Use concise paragraphs or bullet points. "
+        "Produce a short operational summary using only the sections that matter:\n"
+        "1. User Goals & Intentions\n"
+        "2. Key Facts & Information\n"
+        "3. Decisions & Agreements\n"
+        "4. Unresolved Questions & Open Issues\n"
+        "5. Important Context\n"
+        "6. Important Tool Findings\n\n"
+        "Include sufficient detail to let a future assistant continue accurately, but keep the output compact and continuation-oriented. "
+        "Prefer short bullets over long paragraphs. "
+        f"Target at most {SUMMARY_MAX_BULLETS} bullets and keep the total summary under {SUMMARY_MAX_OUTPUT_CHARS} characters. "
         "Do not mention tool internals unless they materially affect future replies. "
+        "If tool results contain facts or retrieved findings that matter for future replies, include those findings at a high level. "
         "Do not use markdown headings, tables, or code fences. "
         "You MUST NOT call any tools or functions. Respond only with plain text. Return only the summary text."
     )
@@ -188,10 +432,15 @@ def _build_summary_prompt_payload(source_messages: list[dict], user_preferences:
             continue
 
         role = str(message.get("role") or "").strip()
-        if role not in {"user", "assistant"}:
+        if role not in {"user", "assistant", "tool"}:
             continue
 
+        metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else None
         content = str(message.get("content") or "").strip()
+        if role == "assistant":
+            content = _build_assistant_summary_content(content, metadata)
+        elif role == "tool":
+            content = _build_tool_message_summary_content(content, message.get("tool_call_id"))
         if not content:
             empty_message_count += 1
             continue
@@ -211,7 +460,7 @@ def _build_summary_prompt_payload(source_messages: list[dict], user_preferences:
             {
                 "role": role,
                 "content": content,
-                "metadata": message.get("metadata") if isinstance(message.get("metadata"), dict) else None,
+                "metadata": metadata,
                 "tool_calls": message.get("tool_calls"),
                 "tool_call_id": message.get("tool_call_id"),
             }
@@ -224,7 +473,8 @@ def _build_summary_prompt_payload(source_messages: list[dict], user_preferences:
         metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else None
         if role == "USER":
             content = build_user_message_for_model(content, metadata)
-        transcript_blocks.append(f"{role}:\n{content}".strip())
+        role_label = "TOOL RESULT" if role == "TOOL" else role
+        transcript_blocks.append(f"{role_label}:\n{content}".strip())
 
     transcript_message = {
         "role": "user",
@@ -307,23 +557,240 @@ def _get_effective_summary_trigger_token_count(settings: dict) -> int:
     return base_threshold
 
 
-def _calculate_dynamic_batch_size(source_messages: list[dict], base_batch_size: int) -> int:
-    if not source_messages:
-        return base_batch_size
-    total_tokens = sum(
-        estimate_text_tokens(str(m.get("content") or ""))
-        for m in source_messages
-        if isinstance(m, dict)
+def _estimate_prompt_tokens(messages: list[dict]) -> int:
+    total = 0
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        total += estimate_text_tokens(str(message.get("content") or ""))
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list) and tool_calls:
+            total += estimate_text_tokens(json.dumps(tool_calls, ensure_ascii=False))
+        tool_call_id = str(message.get("tool_call_id") or "").strip()
+        if tool_call_id:
+            total += estimate_text_tokens(tool_call_id)
+    return total
+
+
+def _trim_text_sections_to_token_budget(text: str | None, max_tokens: int) -> str | None:
+    normalized = str(text or "").strip()
+    if not normalized or max_tokens <= 0:
+        return None
+    if estimate_text_tokens(normalized) <= max_tokens:
+        return normalized
+
+    sections = [section.strip() for section in normalized.split("\n\n") if section.strip()]
+    kept: list[str] = []
+    total = 0
+    for section in sections:
+        section_tokens = estimate_text_tokens(section)
+        if kept and total + section_tokens > max_tokens:
+            break
+        if not kept and section_tokens > max_tokens:
+            clipped_chars = max(200, int(len(section) * (max_tokens / max(section_tokens, 1))))
+            return section[:clipped_chars].rstrip() + "…"
+        kept.append(section)
+        total += section_tokens
+    return "\n\n".join(kept) if kept else None
+
+
+def _trim_rag_context_to_token_budget(retrieved_context: dict | None, max_tokens: int) -> dict | None:
+    if not isinstance(retrieved_context, dict) or max_tokens <= 0:
+        return None
+    matches = retrieved_context.get("matches") if isinstance(retrieved_context.get("matches"), list) else []
+    if not matches:
+        return None
+
+    trimmed_matches = []
+    for match in matches:
+        candidate = {
+            "query": retrieved_context.get("query"),
+            "count": len(trimmed_matches) + 1,
+            "matches": [*trimmed_matches, match],
+        }
+        if estimate_text_tokens(json.dumps(candidate, ensure_ascii=False)) > max_tokens:
+            break
+        trimmed_matches.append(match)
+    if not trimmed_matches:
+        return None
+    return {
+        "query": retrieved_context.get("query"),
+        "count": len(trimmed_matches),
+        "matches": trimmed_matches,
+    }
+
+
+def _select_tail_messages_by_token_budget(messages: list[dict], max_tokens: int) -> list[dict]:
+    if max_tokens <= 0:
+        return []
+    selected_reversed: list[dict] = []
+    total = 0
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        content_tokens = estimate_text_tokens(str(message.get("content") or ""))
+        if selected_reversed and total + content_tokens > max_tokens:
+            break
+        selected_reversed.append(message)
+        total += content_tokens
+    return list(reversed(selected_reversed))
+
+
+def _select_recent_prompt_window(messages: list[dict], max_tokens: int, min_user_messages: int = 2) -> list[dict]:
+    if max_tokens <= 0:
+        return []
+    selected_blocks_reversed: list[list[dict]] = []
+    for block in reversed(_iter_message_blocks(messages)):
+        block_messages = block.get("messages") or []
+        if not block_messages or not block.get("valid_for_prompt"):
+            continue
+        candidate_blocks = [block_messages, *reversed(selected_blocks_reversed)]
+        candidate = [message for candidate_block in candidate_blocks for message in candidate_block]
+        if _estimate_prompt_tokens(build_api_messages(candidate)) > max_tokens:
+            break
+        selected_blocks_reversed.append(block_messages)
+
+    selected_messages: list[dict] = []
+    for block_messages in reversed(selected_blocks_reversed):
+        selected_messages.extend(block_messages)
+    return selected_messages
+
+
+def _build_budgeted_prompt_messages(
+    canonical_messages: list[dict],
+    settings: dict,
+    active_tool_names: list[str],
+    retrieved_context: dict | None,
+    tool_memory_context: str | None,
+) -> tuple[list[dict], dict]:
+    prompt_budget = max(2_000, get_prompt_max_input_tokens(settings) - get_prompt_response_token_reserve(settings))
+    base_runtime_message = prepend_runtime_context(
+        [],
+        settings["user_preferences"],
+        active_tool_names,
+        retrieved_context=None,
+        tool_memory_context=None,
+        scratchpad=settings.get("scratchpad", ""),
+    )[0]
+    base_system_tokens = estimate_text_tokens(str(base_runtime_message.get("content") or ""))
+    history_budget = max(1_000, prompt_budget - base_system_tokens)
+
+    ordered_messages = [message for message in canonical_messages if isinstance(message, dict)]
+    summary_messages = [message for message in ordered_messages if str(message.get("role") or "").strip() == "summary"]
+    recent_messages = [message for message in ordered_messages if str(message.get("role") or "").strip() != "summary"]
+
+    selected_recent = _select_recent_prompt_window(
+        recent_messages,
+        min(get_prompt_recent_history_max_tokens(settings), history_budget),
     )
-    message_count = len(source_messages)
-    if message_count == 0:
-        return base_batch_size
-    avg_tokens = total_tokens / message_count
-    if avg_tokens <= 0:
-        return base_batch_size
-    token_budget = 4_000
-    dynamic = int(token_budget / avg_tokens)
-    return max(5, min(base_batch_size, dynamic))
+    recent_tokens = count_visible_message_tokens(selected_recent)
+    remaining_for_summaries = max(0, history_budget - recent_tokens)
+    selected_summaries = _select_tail_messages_by_token_budget(
+        summary_messages,
+        min(get_prompt_summary_max_tokens(settings), remaining_for_summaries),
+    )
+
+    prompt_history = [*selected_summaries, *selected_recent]
+    prompt_history_api = build_api_messages(prompt_history)
+    history_tokens = _estimate_prompt_tokens(prompt_history_api)
+    remaining_context_budget = max(0, prompt_budget - base_system_tokens - history_tokens)
+
+    rag_context = _trim_rag_context_to_token_budget(
+        retrieved_context,
+        min(get_prompt_rag_max_tokens(settings), remaining_context_budget),
+    )
+    rag_tokens = estimate_text_tokens(json.dumps(rag_context, ensure_ascii=False)) if rag_context else 0
+    remaining_context_budget = max(0, remaining_context_budget - rag_tokens)
+    trimmed_tool_memory = _trim_text_sections_to_token_budget(
+        tool_memory_context,
+        min(get_prompt_tool_memory_max_tokens(settings), remaining_context_budget),
+    )
+
+    api_messages = prepend_runtime_context(
+        prompt_history_api,
+        settings["user_preferences"],
+        active_tool_names,
+        retrieved_context=rag_context,
+        tool_memory_context=trimmed_tool_memory,
+        scratchpad=settings.get("scratchpad", ""),
+    )
+
+    stats = {
+        "prompt_budget": prompt_budget,
+        "base_system_tokens": base_system_tokens,
+        "history_tokens": history_tokens,
+        "summary_tokens": count_visible_message_tokens(selected_summaries),
+        "recent_tokens": recent_tokens,
+        "rag_tokens": rag_tokens,
+        "tool_memory_tokens": estimate_text_tokens(trimmed_tool_memory or ""),
+        "estimated_total_tokens": _estimate_prompt_tokens(api_messages),
+        "summary_message_count": len(selected_summaries),
+        "recent_message_count": len(selected_recent),
+    }
+    return api_messages, stats
+
+
+def _select_summary_source_messages_by_token_budget(
+    canonical_messages: list[dict],
+    source_messages: list[dict],
+    target_tokens: int,
+    user_preferences: str,
+) -> list[dict]:
+    if not source_messages:
+        return []
+    if target_tokens <= 0:
+        return list(source_messages)
+
+    selected: list[dict] = []
+    for message in source_messages:
+        if not isinstance(message, dict):
+            continue
+        candidate_source_messages = [*selected, message]
+        expanded_candidate_messages = _expand_summary_source_messages(
+            canonical_messages,
+            candidate_source_messages,
+            source_messages,
+        )
+        prompt_messages, _ = _build_summary_prompt_payload(expanded_candidate_messages, user_preferences)
+        if selected and _estimate_prompt_tokens(prompt_messages) > target_tokens:
+            break
+        selected.append(message)
+    return selected
+
+
+def _maybe_run_preflight_summary(
+    conversation_id: int,
+    fallback_model: str,
+    settings: dict,
+    fetch_url_token_threshold: int,
+    fetch_url_clip_aggressiveness: int,
+    exclude_message_ids: set[int] | None = None,
+) -> dict | None:
+    canonical_messages = get_conversation_messages(conversation_id)
+    visible_token_count = count_visible_message_tokens(canonical_messages)
+    preflight_trigger = get_prompt_preflight_summary_token_count(settings)
+    if visible_token_count < preflight_trigger:
+        return None
+
+    last_outcome = None
+    for _ in range(2):
+        outcome = maybe_create_conversation_summary(
+            conversation_id,
+            fallback_model,
+            settings,
+            fetch_url_token_threshold,
+            fetch_url_clip_aggressiveness,
+            exclude_message_ids=exclude_message_ids,
+            force=True,
+        )
+        last_outcome = outcome
+        if not outcome.get("applied"):
+            break
+        canonical_messages = outcome.get("messages") or get_conversation_messages(conversation_id)
+        visible_token_count = count_visible_message_tokens(canonical_messages)
+        if visible_token_count < preflight_trigger:
+            break
+    return last_outcome
 
 
 def _coerce_bool(value, default: bool = False) -> bool:
@@ -342,6 +809,7 @@ def maybe_create_conversation_summary(
     fetch_url_clip_aggressiveness: int,
     exclude_message_ids: set[int] | None = None,
     force: bool = False,
+    bypass_mode: bool = False,
 ) -> dict:
     summary_lock = _get_summary_lock(conversation_id)
     if not summary_lock.acquire(blocking=False):
@@ -358,7 +826,6 @@ def maybe_create_conversation_summary(
         canonical_messages = get_conversation_messages(conversation_id)
         visible_token_count = count_visible_message_tokens(canonical_messages)
         trigger_token_count = _get_effective_summary_trigger_token_count(settings)
-        batch_size = get_chat_summary_batch_size(settings)
         checked_at = datetime.now().astimezone().isoformat(timespec="seconds")
         token_breakdown = _get_summary_token_breakdown(canonical_messages)
 
@@ -374,7 +841,7 @@ def maybe_create_conversation_summary(
                 **extra,
             }
 
-        if summary_mode == "never" and not force:
+        if summary_mode == "never" and not bypass_mode:
             return build_outcome(
                 applied=False,
                 reason="mode_never",
@@ -394,60 +861,79 @@ def maybe_create_conversation_summary(
 
         skip_first = get_summary_skip_first(settings)
         skip_last = get_summary_skip_last(settings)
-        use_dynamic_batch = get_summary_dynamic_batch(settings)
+        base_source_token_target = get_summary_source_target_tokens(settings)
+        retry_min_source_tokens = get_summary_retry_min_source_tokens(settings)
 
         all_candidates = get_unsummarized_visible_messages(
             canonical_messages, skip_first=skip_first, skip_last=skip_last,
         )
-        effective_batch_size = batch_size
-        if use_dynamic_batch and all_candidates:
-            effective_batch_size = _calculate_dynamic_batch_size(all_candidates, batch_size)
-
-        source_messages = all_candidates[:effective_batch_size] if effective_batch_size is not None else all_candidates
-        raw_source_message_count = len(source_messages)
-        if exclude_message_ids:
-            source_messages = [
-                m for m in source_messages
-                if int(m.get("id") or 0) not in exclude_message_ids
-            ]
-        excluded_message_count = raw_source_message_count - len(source_messages)
-        if not source_messages:
-            return build_outcome(
-                applied=False,
-                reason="no_source_messages",
-                failure_stage="no_source_messages",
-                failure_detail="There are no older unsummarized user or assistant messages left to compress.",
-                candidate_message_count=0,
-                excluded_message_count=excluded_message_count,
-            )
 
         summary_model = _resolve_summary_model(fallback_model)
-        prompt_messages, prompt_stats = _build_summary_prompt_payload(source_messages, settings.get("user_preferences", ""))
-        candidate_message_count = len(source_messages)
-        if prompt_stats["prompt_message_count"] == 0:
-            return build_outcome(
-                applied=False,
-                reason="no_prompt_messages",
-                failure_stage="no_prompt_messages",
-                failure_detail="All selected summary candidates were empty or invalid after prompt sanitization.",
-                candidate_message_count=candidate_message_count,
-                excluded_message_count=excluded_message_count,
-                **prompt_stats,
+        attempt_token_target = base_source_token_target
+        failure_payload = None
+        source_messages: list[dict] = []
+        summary_source_messages: list[dict] = []
+        prompt_stats: dict = {}
+        candidate_message_count = 0
+        excluded_message_count = 0
+        summary_text = ""
+        summary_errors: list[str] = []
+
+        while attempt_token_target >= retry_min_source_tokens:
+            candidate_source_messages = _select_summary_source_messages_by_token_budget(
+                canonical_messages,
+                all_candidates,
+                target_tokens=attempt_token_target,
+                user_preferences=settings.get("user_preferences", ""),
             )
-        result = collect_agent_response(
-            prompt_messages,
-            summary_model,
-            1,
-            [],
-            fetch_url_token_threshold=fetch_url_token_threshold,
-            fetch_url_clip_aggressiveness=fetch_url_clip_aggressiveness,
-        )
-        summary_text = (result.get("content") or "").strip()
-        summary_errors = result.get("errors") or []
-        is_error_text = summary_text.startswith(FINAL_ANSWER_ERROR_TEXT) or summary_text.startswith(FINAL_ANSWER_MISSING_TEXT)
-        if len(summary_text) < SUMMARY_MIN_TEXT_LENGTH or summary_errors or is_error_text:
+            raw_source_message_count = len(candidate_source_messages)
+            source_messages = candidate_source_messages
+            if exclude_message_ids:
+                source_messages = [
+                    m for m in candidate_source_messages
+                    if int(m.get("id") or 0) not in exclude_message_ids
+                ]
+            excluded_message_count = raw_source_message_count - len(source_messages)
+            candidate_message_count = len(source_messages)
+            if not source_messages:
+                return build_outcome(
+                    applied=False,
+                    reason="no_source_messages",
+                    failure_stage="no_source_messages",
+                    failure_detail="There are no older unsummarized user or assistant messages left to compress.",
+                    candidate_message_count=0,
+                    excluded_message_count=excluded_message_count,
+                )
+
+            summary_source_messages = _expand_summary_source_messages(canonical_messages, source_messages, all_candidates)
+            prompt_messages, prompt_stats = _build_summary_prompt_payload(summary_source_messages, settings.get("user_preferences", ""))
+            if prompt_stats["prompt_message_count"] == 0:
+                return build_outcome(
+                    applied=False,
+                    reason="no_prompt_messages",
+                    failure_stage="no_prompt_messages",
+                    failure_detail="All selected summary candidates were empty or invalid after prompt sanitization.",
+                    candidate_message_count=candidate_message_count,
+                    excluded_message_count=excluded_message_count,
+                    **prompt_stats,
+                )
+
+            result = collect_agent_response(
+                prompt_messages,
+                summary_model,
+                1,
+                [],
+                fetch_url_token_threshold=fetch_url_token_threshold,
+                fetch_url_clip_aggressiveness=fetch_url_clip_aggressiveness,
+            )
+            summary_text = (result.get("content") or "").strip()
+            summary_errors = result.get("errors") or []
+            is_error_text = summary_text.startswith(FINAL_ANSWER_ERROR_TEXT) or summary_text.startswith(FINAL_ANSWER_MISSING_TEXT)
+            if len(summary_text) >= SUMMARY_MIN_TEXT_LENGTH and not summary_errors and not is_error_text:
+                break
+
             failure_stage, failure_detail = _classify_summary_generation_failure(summary_text, summary_errors)
-            return build_outcome(
+            failure_payload = build_outcome(
                 applied=False,
                 reason="summary_generation_failed",
                 failure_stage=failure_stage,
@@ -457,10 +943,46 @@ def maybe_create_conversation_summary(
                 excluded_message_count=excluded_message_count,
                 returned_text_length=len(summary_text),
                 summary_error_count=len(summary_errors),
+                attempted_source_token_target=attempt_token_target,
+                **prompt_stats,
+            )
+            if failure_stage not in {"context_too_large", "provider_error", "empty_output"}:
+                return failure_payload
+            next_target = int(attempt_token_target * 0.65)
+            if next_target >= attempt_token_target:
+                next_target = attempt_token_target - 1
+            if next_target < retry_min_source_tokens:
+                return failure_payload
+            attempt_token_target = next_target
+
+        if len(summary_text) < SUMMARY_MIN_TEXT_LENGTH:
+            return failure_payload or build_outcome(
+                applied=False,
+                reason="summary_generation_failed",
+                failure_stage="empty_output",
+                failure_detail="The provider returned no usable summary output.",
+                error="summary_generation_failed",
+                candidate_message_count=candidate_message_count,
+                excluded_message_count=excluded_message_count,
+                returned_text_length=len(summary_text),
+                summary_error_count=len(summary_errors),
                 **prompt_stats,
             )
 
-        covered_message_ids = [int(message["id"]) for message in source_messages if int(message.get("id") or 0) > 0]
+        covered_visible_message_ids = [int(message["id"]) for message in source_messages if int(message.get("id") or 0) > 0]
+        covered_tool_call_message_ids = [
+            int(message["id"])
+            for message in summary_source_messages
+            if _is_tool_call_assistant_message(message) and int(message.get("id") or 0) > 0
+        ]
+        covered_tool_message_ids = [
+            int(message["id"])
+            for message in summary_source_messages
+            if _get_message_role(message) == "tool" and int(message.get("id") or 0) > 0
+        ]
+        covered_message_ids = list(
+            dict.fromkeys([*covered_visible_message_ids, *covered_tool_call_message_ids, *covered_tool_message_ids])
+        )
         if not covered_message_ids:
             return build_outcome(
                 applied=False,
@@ -488,13 +1010,18 @@ def maybe_create_conversation_summary(
             "summary_position": summary_position,
             "summary_insert_strategy": "replace_first_covered_message_preserve_positions",
                 "covered_message_count": len(source_messages),
+                "covered_tool_call_message_count": len(covered_tool_call_message_ids),
+                "covered_tool_message_count": len(covered_tool_message_ids),
                 "covered_message_ids": covered_message_ids,
+                "covered_visible_message_ids": covered_visible_message_ids,
+                "covered_tool_call_message_ids": covered_tool_call_message_ids,
+                "covered_tool_message_ids": covered_tool_message_ids,
                 "trigger_token_count": trigger_token_count,
                 "visible_token_count": visible_token_count,
-                "summary_batch_size": batch_size,
                 "summary_mode": summary_mode,
                 "summary_model": summary_model,
                 "generated_at": deleted_at,
+                "summary_source_token_target": attempt_token_target,
             }
         )
 
@@ -518,6 +1045,8 @@ def maybe_create_conversation_summary(
             "summary_message_id": summary_message_id,
             "messages": get_conversation_messages(conversation_id),
             "covered_message_count": len(source_messages),
+            "covered_tool_call_message_count": len(covered_tool_call_message_ids),
+            "covered_tool_message_count": len(covered_tool_message_ids),
             "trigger_token_count": trigger_token_count,
             "visible_token_count": visible_token_count,
             "mode": summary_mode,
@@ -528,11 +1057,39 @@ def maybe_create_conversation_summary(
             "excluded_message_count": excluded_message_count,
             "returned_text_length": len(summary_text),
             "summary_error_count": len(summary_errors),
+            "attempted_source_token_target": attempt_token_target,
             **token_breakdown,
             **prompt_stats,
         }
     finally:
         summary_lock.release()
+
+
+def _run_chat_post_response_tasks(
+    conversation_id: int,
+    model: str,
+    settings: dict,
+    fetch_url_token_threshold: int,
+    fetch_url_clip_aggressiveness: int,
+    current_turn_ids: set[int],
+) -> None:
+    try:
+        maybe_create_conversation_summary(
+            conversation_id,
+            model,
+            settings,
+            fetch_url_token_threshold,
+            fetch_url_clip_aggressiveness,
+            current_turn_ids,
+        )
+    except Exception:
+        LOGGER.exception("Background summary task failed for conversation_id=%s", conversation_id)
+
+    if RAG_ENABLED and conversation_id:
+        try:
+            sync_conversations_to_rag_safe(conversation_id=conversation_id)
+        except Exception:
+            LOGGER.exception("Background RAG sync failed for conversation_id=%s", conversation_id)
 
 
 def parse_chat_request_payload():
@@ -862,6 +1419,8 @@ def register_chat_routes(app) -> None:
                         "UPDATE conversations SET updated_at = datetime('now') WHERE id = ?",
                         (conv_id,),
                     )
+                if RAG_ENABLED:
+                    sync_conversations_to_rag_safe(conversation_id=conv_id)
                 persisted_user_message_id = edited_message_id
             elif persisted_user_content or user_message_metadata:
                 with get_db() as conn:
@@ -893,6 +1452,19 @@ def register_chat_routes(app) -> None:
         elif conv_id:
             canonical_messages = get_conversation_messages(conv_id)
 
+        preflight_summary_outcome = None
+        if conv_id and persisted_user_message_id is not None:
+            preflight_summary_outcome = _maybe_run_preflight_summary(
+                conv_id,
+                model,
+                settings,
+                fetch_url_token_threshold,
+                fetch_url_clip_aggressiveness,
+                exclude_message_ids={persisted_user_message_id},
+            )
+            if preflight_summary_outcome and preflight_summary_outcome.get("applied"):
+                canonical_messages = preflight_summary_outcome.get("messages") or get_conversation_messages(conv_id)
+
         retrieved_context = build_rag_auto_context(
             rag_query_text,
             get_rag_auto_inject_enabled(settings),
@@ -907,19 +1479,20 @@ def register_chat_routes(app) -> None:
             if get_tool_memory_auto_inject_enabled(settings)
             else None
         )
-        api_messages = prepend_runtime_context(
-            build_api_messages(canonical_messages),
-            settings["user_preferences"],
+        api_messages, prompt_budget_stats = _build_budgeted_prompt_messages(
+            canonical_messages,
+            settings,
             active_tool_names,
-            retrieved_context=retrieved_context,
-            tool_memory_context=tool_memory_context,
-            scratchpad=settings.get("scratchpad", ""),
+            retrieved_context,
+            tool_memory_context,
         )
         initial_canvas_documents = find_latest_canvas_documents(canonical_messages)
         if pre_created_canvas_state is not None:
             pre_docs = get_canvas_runtime_documents(pre_created_canvas_state)
             if pre_docs:
                 initial_canvas_documents = pre_docs
+
+        defer_post_response_tasks = not current_app.testing
 
         def generate():
             full_response = ""
@@ -937,6 +1510,40 @@ def register_chat_routes(app) -> None:
 
             if vision_event:
                 yield json.dumps(vision_event, ensure_ascii=False) + "\n"
+
+            if preflight_summary_outcome and preflight_summary_outcome.get("applied"):
+                yield json.dumps(
+                    {
+                        "type": "conversation_summary_applied",
+                        "summary_message_id": preflight_summary_outcome.get("summary_message_id"),
+                        "covered_message_count": preflight_summary_outcome.get("covered_message_count", 0),
+                        "covered_tool_message_count": preflight_summary_outcome.get("covered_tool_message_count", 0),
+                        "mode": preflight_summary_outcome.get("mode") or get_chat_summary_mode(settings),
+                        "trigger_token_count": preflight_summary_outcome.get("trigger_token_count"),
+                        "visible_token_count": preflight_summary_outcome.get("visible_token_count"),
+                        "summary_model": preflight_summary_outcome.get("summary_model") or _resolve_summary_model(model),
+                        "checked_at": preflight_summary_outcome.get("checked_at"),
+                        "candidate_message_count": preflight_summary_outcome.get("candidate_message_count"),
+                        "excluded_message_count": preflight_summary_outcome.get("excluded_message_count"),
+                        "prompt_message_count": preflight_summary_outcome.get("prompt_message_count"),
+                        "empty_message_count": preflight_summary_outcome.get("empty_message_count"),
+                        "merged_assistant_message_count": preflight_summary_outcome.get("merged_assistant_message_count"),
+                        "skipped_error_message_count": preflight_summary_outcome.get("skipped_error_message_count"),
+                        "returned_text_length": preflight_summary_outcome.get("returned_text_length"),
+                        "user_assistant_token_count": preflight_summary_outcome.get("user_assistant_token_count"),
+                        "tool_token_count": preflight_summary_outcome.get("tool_token_count"),
+                        "tool_message_count": preflight_summary_outcome.get("tool_message_count"),
+                        "preflight": True,
+                    },
+                    ensure_ascii=False,
+                ) + "\n"
+                yield json.dumps(
+                    {
+                        "type": "history_sync",
+                        "messages": canonical_messages,
+                    },
+                    ensure_ascii=False,
+                ) + "\n"
 
             if document_event:
                 yield json.dumps(document_event, ensure_ascii=False) + "\n"
@@ -970,6 +1577,8 @@ def register_chat_routes(app) -> None:
                     full_reasoning += event["text"]
                 elif event["type"] == "usage":
                     usage_data = event
+                    if isinstance(usage_data, dict):
+                        usage_data["preflight_prompt_budget"] = prompt_budget_stats
                 elif event["type"] in {"step_update", "tool_result", "tool_error"}:
                     upsert_tool_trace_entry(tool_trace_entries, tool_trace_by_call_id, event)
                 elif event["type"] == "tool_history":
@@ -1059,15 +1668,6 @@ def register_chat_routes(app) -> None:
                     i for i in [persisted_user_message_id, persisted_assistant_message_id]
                     if i is not None
                 }
-                summary_future = SUMMARY_EXECUTOR.submit(
-                    maybe_create_conversation_summary,
-                    conv_id,
-                    model,
-                    settings,
-                    fetch_url_token_threshold,
-                    fetch_url_clip_aggressiveness,
-                    current_turn_ids,
-                )
                 yield json.dumps(
                     {
                         "type": "history_sync",
@@ -1075,6 +1675,29 @@ def register_chat_routes(app) -> None:
                     },
                     ensure_ascii=False,
                 ) + "\n"
+
+                preflight_summary_applied = bool(preflight_summary_outcome and preflight_summary_outcome.get("applied"))
+
+                if defer_post_response_tasks and not preflight_summary_applied:
+                    POST_RESPONSE_EXECUTOR.submit(
+                        _run_chat_post_response_tasks,
+                        conv_id,
+                        model,
+                        dict(settings),
+                        fetch_url_token_threshold,
+                        fetch_url_clip_aggressiveness,
+                        current_turn_ids,
+                    )
+                elif not preflight_summary_applied:
+                    summary_future = SUMMARY_EXECUTOR.submit(
+                        maybe_create_conversation_summary,
+                        conv_id,
+                        model,
+                        settings,
+                        fetch_url_token_threshold,
+                        fetch_url_clip_aggressiveness,
+                        current_turn_ids,
+                    )
 
             if summary_future is not None:
                 try:
@@ -1096,6 +1719,7 @@ def register_chat_routes(app) -> None:
                             "type": "conversation_summary_applied",
                             "summary_message_id": summary_outcome.get("summary_message_id"),
                             "covered_message_count": summary_outcome.get("covered_message_count", 0),
+                            "covered_tool_message_count": summary_outcome.get("covered_tool_message_count", 0),
                             "mode": summary_outcome.get("mode") or get_chat_summary_mode(settings),
                             "trigger_token_count": summary_outcome.get("trigger_token_count"),
                             "visible_token_count": summary_outcome.get("visible_token_count"),
@@ -1285,6 +1909,7 @@ def register_chat_routes(app) -> None:
             fetch_url_clip_aggressiveness,
             exclude_message_ids=exclude_ids or None,
             force=force,
+            bypass_mode=force,
         )
 
         if outcome.get("applied"):
@@ -1330,8 +1955,17 @@ def register_chat_routes(app) -> None:
 
             summary_position = int(summary_row["position"] or 0)
             summary_insert_strategy = str(summary_metadata.get("summary_insert_strategy") or "replace_first_covered_message").strip()
-            restored_message_count = len(covered_message_ids)
-            restore_soft_deleted_messages(conn, conv_id, covered_message_ids)
+            canonical_messages = get_conversation_messages(conv_id, include_deleted=True)
+            resolved_covered_message_ids = _resolve_summary_restore_message_ids(
+                canonical_messages,
+                int(summary_row["id"] or 0),
+                summary_metadata,
+            )
+            if not resolved_covered_message_ids:
+                return jsonify({"error": "This summary cannot be undone because its source messages are missing."}), 400
+
+            restored_message_count = len(resolved_covered_message_ids)
+            restore_soft_deleted_messages(conn, conv_id, resolved_covered_message_ids)
             conn.execute(
                 "DELETE FROM messages WHERE conversation_id = ? AND id = ?",
                 (conv_id, summary_id),
@@ -1346,7 +1980,7 @@ def register_chat_routes(app) -> None:
                     conv_id,
                     summary_position + 1,
                     max(0, restored_message_count - 1),
-                    exclude_message_ids=covered_message_ids,
+                    exclude_message_ids=resolved_covered_message_ids,
                 )
             conn.execute(
                 "UPDATE conversations SET updated_at = datetime('now') WHERE id = ?",

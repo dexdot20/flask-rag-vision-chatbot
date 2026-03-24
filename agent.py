@@ -1139,6 +1139,51 @@ def _tool_input_preview(tool_name: str, tool_args: dict) -> str:
     return ""
 
 
+def _build_compact_tool_message_content(
+    tool_name: str,
+    tool_args: dict,
+    result,
+    summary: str,
+    transcript_result=None,
+    storage_entry: dict | None = None,
+) -> str:
+    del result
+    preferred_entry = storage_entry if isinstance(storage_entry, dict) else None
+    if preferred_entry:
+        content = _clean_tool_text(preferred_entry.get("content") or "", limit=RAG_TOOL_RESULT_MAX_TEXT_CHARS)
+        if content:
+            return content
+
+    if tool_name == "fetch_url" and isinstance(transcript_result, dict):
+        parts = []
+        title = _clean_tool_text(transcript_result.get("title") or "", limit=160)
+        url = _clean_tool_text(transcript_result.get("url") or tool_args.get("url") or "", limit=200)
+        notice = _clean_tool_text(transcript_result.get("summary_notice") or "", limit=240)
+        diagnostic = _clean_tool_text(transcript_result.get("fetch_diagnostic") or "", limit=280)
+        body = _clean_tool_text(transcript_result.get("content") or "", limit=4_000)
+        if title:
+            parts.append(f"Title: {title}")
+        if url:
+            parts.append(f"URL: {url}")
+        if summary:
+            parts.append(f"Summary: {_clean_tool_text(summary, limit=300)}")
+        if notice:
+            parts.append(f"Note: {notice}")
+        if diagnostic:
+            parts.append(f"Fetch status: {diagnostic}")
+        if body:
+            parts.append(body)
+        return "\n\n".join(parts).strip()
+
+    if isinstance(transcript_result, str):
+        return _clean_tool_text(transcript_result, limit=RAG_TOOL_RESULT_MAX_TEXT_CHARS)
+
+    try:
+        return _serialize_tool_message_content(transcript_result)
+    except Exception:
+        return _serialize_tool_message_content({"tool_name": tool_name, "summary": _clean_tool_text(summary, limit=300)})
+
+
 def _format_list_tool_result(items: list[dict], title: str, link_key: str, extra_keys: tuple[str, ...] = ()) -> str:
     lines = [title]
     added = 0
@@ -1700,11 +1745,25 @@ def run_agent_stream(
                     "summary": f"{cached_summary} (cached)",
                     "call_id": call_id,
                 }
+                cached_storage_entry = _build_tool_result_storage_entry(
+                    tool_name,
+                    tool_args,
+                    cached_result,
+                    cached_summary,
+                    transcript_result=transcript_result,
+                )
                 tool_messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": call_id,
-                        "content": _serialize_tool_message_content(transcript_result),
+                        "content": _build_compact_tool_message_content(
+                            tool_name,
+                            tool_args,
+                            cached_result,
+                            f"{cached_summary} (cached)",
+                            transcript_result=transcript_result,
+                            storage_entry=cached_storage_entry,
+                        ),
                     }
                 )
                 transcript_results.append(
@@ -1773,7 +1832,14 @@ def run_agent_stream(
                     {
                         "role": "tool",
                         "tool_call_id": call_id,
-                        "content": _serialize_tool_message_content(transcript_result),
+                        "content": _build_compact_tool_message_content(
+                            tool_name,
+                            tool_args,
+                            result,
+                            summary,
+                            transcript_result=transcript_result,
+                            storage_entry=storage_entry,
+                        ),
                     }
                 )
                 transcript_results.append(

@@ -445,7 +445,7 @@ def get_conversation_records_for_rag(conversation_id: int | None = None) -> list
         conversations = []
         for row in rows:
             messages = conn.execute(
-                "SELECT role, content, metadata FROM messages WHERE conversation_id = ? ORDER BY position, id",
+                "SELECT role, content, metadata FROM messages WHERE conversation_id = ? AND deleted_at IS NULL ORDER BY position, id",
                 (row["id"],),
             ).fetchall()
             conversation_messages = []

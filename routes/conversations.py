@@ -4,7 +4,17 @@ import re
 
 from flask import Response, jsonify, request
 
-from canvas_service import build_html_download, build_markdown_download, build_pdf_download, find_latest_canvas_document
+from canvas_service import (
+    build_html_download,
+    build_markdown_download,
+    build_pdf_download,
+    clear_canvas,
+    create_canvas_runtime_state,
+    delete_canvas_document,
+    find_latest_canvas_document,
+    find_latest_canvas_documents,
+    get_canvas_runtime_documents,
+)
 from conversation_export import (
     build_conversation_docx_download,
     build_conversation_markdown_download,
@@ -19,7 +29,15 @@ from config import (
     RAG_SOURCE_CONVERSATION,
     RAG_SOURCE_TOOL_RESULT,
 )
-from db import delete_conversation_file_assets, delete_conversation_image_assets, get_conversation_message_rows, get_db, message_row_to_dict
+from db import (
+    delete_conversation_file_assets,
+    delete_conversation_image_assets,
+    get_conversation_message_rows,
+    get_db,
+    insert_message,
+    message_row_to_dict,
+    serialize_message_metadata,
+)
 from rag import delete_source as rag_delete_source
 from rag_service import (
     conversation_rag_source_key,
@@ -164,6 +182,65 @@ def register_conversation_routes(app) -> None:
             headers={
                 "Content-Disposition": f'attachment; filename="{filename}"',
             },
+        )
+
+    @app.route("/api/conversations/<int:conv_id>/canvas", methods=["DELETE"])
+    def delete_canvas(conv_id):
+        clear_all = str(request.args.get("clear_all") or "").strip().lower() in {"1", "true", "yes", "on"}
+        document_id = str(request.args.get("document_id") or "").strip() or None
+
+        conversation, messages = _load_conversation_payload(conv_id)
+        if not conversation:
+            return jsonify({"error": "Not found."}), 404
+
+        runtime_state = create_canvas_runtime_state(find_latest_canvas_documents(messages))
+        current_documents = get_canvas_runtime_documents(runtime_state)
+        if not current_documents:
+            return jsonify({"error": "Canvas document not found."}), 404
+
+        try:
+            if clear_all:
+                result = clear_canvas(runtime_state)
+            else:
+                result = delete_canvas_document(runtime_state, document_id=document_id)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 404
+
+        next_documents = get_canvas_runtime_documents(runtime_state)
+        metadata = serialize_message_metadata(
+            {
+                "canvas_documents": next_documents,
+                "canvas_cleared": not next_documents,
+            }
+        )
+
+        with get_db() as conn:
+            insert_message(
+                conn,
+                conv_id,
+                "tool",
+                "",
+                metadata=metadata,
+            )
+            conn.execute(
+                "UPDATE conversations SET updated_at = datetime('now') WHERE id = ?",
+                (conv_id,),
+            )
+
+        if RAG_ENABLED:
+            sync_conversations_to_rag_safe(conversation_id=conv_id)
+
+        _, updated_messages = _load_conversation_payload(conv_id)
+        active_document_id = next_documents[-1]["id"] if next_documents else None
+        return jsonify(
+            {
+                "cleared": not next_documents,
+                "documents": next_documents,
+                "active_document_id": active_document_id,
+                "remaining_count": len(next_documents),
+                "deleted_document_id": result.get("deleted_id"),
+                "messages": updated_messages,
+            }
         )
 
     @app.route("/api/conversations/<int:conv_id>", methods=["DELETE"])

@@ -52,6 +52,7 @@ It is not a minimal “send prompt, get answer” demo. The app keeps chat histo
   - [Fetch / clipping behavior](#fetch--clipping-behavior)
   - [Chat summarization](#chat-summarization-1)
   - [Scratchpad administration](#scratchpad-administration)
+  - [Document upload](#document-upload)
   - [Built‑in runtime limits from code](#builtin-runtime-limits-from-code)
   - [Settings stored in SQLite via the UI](#settings-stored-in-sqlite-via-the-ui)
 - [Using the app](#using-the-app)
@@ -59,9 +60,11 @@ It is not a minimal “send prompt, get answer” demo. The app keeps chat histo
   - [Reading the Token Usage panel](#reading-the-token-usage-panel)
   - [Editing a previous user message](#editing-a-previous-user-message)
   - [Image‑assisted messages](#imageassisted-messages)
+  - [Document upload workflow](#document-upload-workflow)
   - [Scratchpad workflow](#scratchpad-workflow)
   - [Tool memory workflow](#tool-memory-workflow)
   - [Canvas documents workflow](#canvas-documents-workflow)
+  - [Exporting conversations](#exporting-conversations)
   - [Chat summarization workflow](#chat-summarization-workflow)
   - [Knowledge‑base workflow](#knowledgebase-workflow)
 - [Available tools](#available-tools)
@@ -272,7 +275,7 @@ The Usage & Cost panel separates provider‑reported usage from local prompt‑s
 ├── vision.py               # Local Qwen2.5‑VL image analysis pipeline
 ├── web_tools.py            # Web/news search, proxy loading, safe URL fetch, content extraction
 ├── canvas_service.py       # Canvas document storage and line‑level editing
-├── doc_service.py          # Document upload and text extraction (future extension)
+├── doc_service.py          # Document upload and text extraction
 ├── token_utils.py          # Token counting and prompt‑source estimation
 ├── conversation_export.py  # Conversation export utilities
 ├── routes/
@@ -441,8 +444,7 @@ Some settings come from environment variables, and some are stored in SQLite thr
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `CHAT_SUMMARY_TRIGGER_TOKEN_COUNT` | `6000` | Token count that triggers automatic summarization |
-| `CHAT_SUMMARY_BATCH_SIZE` | `20` | Number of messages to summarize at once |
+| `CHAT_SUMMARY_TRIGGER_TOKEN_COUNT` | `80000` | Visible-token count that triggers automatic summarization |
 | `CHAT_SUMMARY_MODE` | `auto` | `auto`, `never`, or `aggressive` |
 | `CHAT_SUMMARY_MODEL` | `deepseek‑chat` | Model used for summarization (must be available) |
 
@@ -453,6 +455,14 @@ Some settings come from environment variables, and some are stored in SQLite thr
 | `SCRATCHPAD_ADMIN_EDITING_ENABLED` | `false` | Enable manual scratchpad editing in the UI (admin feature) |
 | `MAX_USER_PREFERENCES_LENGTH` | `2000` | Maximum length of user preferences text |
 | `MAX_SCRATCHPAD_LENGTH` | `4000` | Maximum length of scratchpad text |
+
+### Document upload
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `DOCUMENT_STORAGE_DIR` | `./data/documents` | Directory where uploaded documents are stored (subdirectories by hash prefix) |
+
+Supported document formats: DOCX, PDF, plain text (TXT), CSV, and Markdown (MD). Uploaded documents are automatically extracted, stored as file assets, and can be opened in the Canvas editor.
 
 ### Built‑in runtime limits from code
 
@@ -481,7 +491,6 @@ The Settings panel persists these values in `app_settings`:
 - `fetch_url_token_threshold`
 - `fetch_url_clip_aggressiveness`
 - `chat_summary_trigger_token_count`
-- `chat_summary_batch_size`
 - `chat_summary_mode`
 
 ## Using the app
@@ -538,6 +547,15 @@ If you attach an image:
 4. Qwen2.5‑VL extracts OCR and visual context,
 5. that context is injected into the user message before the main model call.
 
+### Document upload workflow
+
+If you attach a document (DOCX, PDF, TXT, CSV, MD):
+
+1. the frontend validates file type and size,
+2. the backend extracts plain text from the document,
+3. the extracted text is stored as a file asset and can be opened in the Canvas editor,
+4. the text is also injected into the user message as a context block (truncated if too long).
+
 ### Scratchpad workflow
 
 - The scratchpad is a persistent text area visible in the Settings panel (if `SCRATCHPAD_ADMIN_EDITING_ENABLED` is true).
@@ -558,6 +576,18 @@ If you attach an image:
 - Existing documents can be rewritten (`rewrite_canvas_document`), edited line‑by‑line (`replace_canvas_lines`, `insert_canvas_lines`, `delete_canvas_lines`), or deleted (`delete_canvas_document`, `clear_canvas`).
 - Canvas documents are attached to the current conversation and are stored in SQLite.
 - The UI shows a collapsible canvas panel with the document’s content, allowing the user to view and manually edit it as well.
+
+### Exporting conversations
+
+You can export a conversation (including its messages, tool traces, reasoning, and canvas documents) in three formats:
+
+- **Markdown** (`/api/conversations/<id>/export?format=md`) – plain Markdown file.
+- **DOCX** (`/api/conversations/<id>/export?format=docx`) – Microsoft Word document.
+- **PDF** (`/api/conversations/<id>/export?format=pdf`) – PDF with formatting.
+
+Canvas documents can also be exported individually via `/api/conversations/<id>/canvas/export` (formats: Markdown, HTML, PDF).
+
+Exports include metadata (conversation title, model, export timestamp) and preserve the structure of the original conversation.
 
 ### Chat summarization workflow
 
@@ -760,6 +790,8 @@ Delete all canvas documents for the current conversation.
 | `PATCH` | `/api/conversations/<id>` | Rename a conversation |
 | `DELETE` | `/api/conversations/<id>` | Delete a conversation |
 | `POST` | `/api/conversations/<id>/generate‑title` | Generate a short title from the first turn |
+| `GET` | `/api/conversations/<id>/export` | Export conversation as Markdown, DOCX, or PDF |
+| `GET` | `/api/conversations/<id>/canvas/export` | Export canvas document as Markdown, HTML, or PDF |
 | `GET` | `/api/rag/documents` | List indexed RAG sources |
 | `DELETE` | `/api/rag/documents/<source_key>` | Delete one indexed RAG source |
 | `GET` | `/api/rag/search?q=...` | Search the knowledge base |

@@ -36,13 +36,20 @@ from db import (
     serialize_message_metadata,
 )
 from messages import (
+    SUMMARY_LABEL,
     build_api_messages,
     build_runtime_system_message,
     build_user_message_for_model,
     normalize_chat_messages,
     prepend_runtime_context,
 )
-from routes.chat import build_summary_prompt_messages
+from rag_service import get_conversation_records_for_rag
+from routes.chat import (
+    _estimate_prompt_tokens,
+    _select_recent_prompt_window,
+    _select_summary_source_messages_by_token_budget,
+    build_summary_prompt_messages,
+)
 from tool_registry import TOOL_SPEC_BY_NAME
 from web_tools import (
     _extract_html,
@@ -115,7 +122,6 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertTrue(payload["rag_auto_inject"])
         self.assertEqual(payload["chat_summary_mode"], "auto")
         self.assertEqual(payload["chat_summary_trigger_token_count"], 80000)
-        self.assertEqual(payload["chat_summary_batch_size"], 20)
         self.assertEqual(payload["fetch_url_token_threshold"], 3500)
         self.assertEqual(payload["fetch_url_clip_aggressiveness"], 50)
         self.assertEqual(payload["rag_sensitivity"], "normal")
@@ -132,7 +138,6 @@ class AppRoutesTestCase(unittest.TestCase):
                 "max_steps": 3,
                 "chat_summary_mode": "aggressive",
                 "chat_summary_trigger_token_count": 9000,
-                "chat_summary_batch_size": 15,
                 "fetch_url_token_threshold": 4200,
                 "fetch_url_clip_aggressiveness": 70,
                 "active_tools": ["fetch_url", "search_web"],
@@ -149,7 +154,6 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(payload["max_steps"], 3)
         self.assertEqual(payload["chat_summary_mode"], "aggressive")
         self.assertEqual(payload["chat_summary_trigger_token_count"], 9000)
-        self.assertEqual(payload["chat_summary_batch_size"], 15)
         self.assertEqual(payload["fetch_url_token_threshold"], 4200)
         self.assertEqual(payload["fetch_url_clip_aggressiveness"], 70)
         self.assertEqual(payload["active_tools"], ["fetch_url", "search_web"])
@@ -243,6 +247,120 @@ class AppRoutesTestCase(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         chat_sync.assert_called_once_with(conversation_id=conversation_id)
+
+    def test_get_conversation_records_for_rag_excludes_soft_deleted_messages(self):
+        conversation_id = self._create_conversation()
+        assistant_metadata = serialize_message_metadata(
+            {
+                "tool_results": [
+                    {
+                        "tool_name": "fetch_url",
+                        "content": "Stale tool result",
+                    }
+                ]
+            }
+        )
+
+        with get_db() as conn:
+            insert_message(conn, conversation_id, "user", "Original prompt")
+            deleted_assistant_id = insert_message(
+                conn,
+                conversation_id,
+                "assistant",
+                "Outdated answer",
+                metadata=assistant_metadata,
+            )
+            insert_message(conn, conversation_id, "assistant", "Current answer")
+            conn.execute(
+                "UPDATE messages SET deleted_at = datetime('now') WHERE id = ?",
+                (deleted_assistant_id,),
+            )
+
+        records = get_conversation_records_for_rag(conversation_id)
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(
+            records[0]["messages"],
+            [
+                {"role": "user", "content": "Original prompt"},
+                {"role": "assistant", "content": "Current answer"},
+            ],
+        )
+        self.assertEqual(records[0]["tool_results"], [])
+
+    def test_chat_edit_resyncs_rag_before_retrieval(self):
+        fake_events = iter(
+            [
+                {"type": "answer_start"},
+                {"type": "answer_delta", "text": "Updated answer."},
+                {"type": "tool_capture", "tool_results": [], "canvas_documents": []},
+                {"type": "done"},
+            ]
+        )
+
+        with patch("routes.conversations.sync_conversations_to_rag_safe"):
+            conversation_id = self._create_conversation()
+
+        with get_db() as conn:
+            edited_message_id = insert_message(conn, conversation_id, "user", "Original prompt")
+            insert_message(conn, conversation_id, "assistant", "Original answer")
+
+        def check_rag_context(*args, **kwargs):
+            self.assertTrue(chat_sync.called)
+            self.assertEqual(chat_sync.call_args.kwargs, {"conversation_id": conversation_id})
+            return None
+
+        with patch("routes.chat.run_agent_stream", return_value=fake_events), patch(
+            "routes.chat.sync_conversations_to_rag_safe"
+        ) as chat_sync, patch("routes.chat.build_rag_auto_context", side_effect=check_rag_context):
+            response = self.client.post(
+                "/chat",
+                json={
+                    "conversation_id": conversation_id,
+                    "model": "deepseek-chat",
+                    "edited_message_id": edited_message_id,
+                    "user_content": "Edited prompt",
+                    "messages": [{"role": "user", "content": "Edited prompt"}],
+                },
+            )
+            response.get_data(as_text=True)
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_chat_route_defers_postprocess_outside_testing(self):
+        fake_events = iter(
+            [
+                {"type": "answer_start"},
+                {"type": "answer_delta", "text": "Done."},
+                {"type": "tool_capture", "tool_results": [], "canvas_documents": []},
+                {"type": "done"},
+            ]
+        )
+
+        conversation_id = self._create_conversation()
+        previous_testing = self.app.config.get("TESTING", False)
+        self.app.config["TESTING"] = False
+
+        try:
+            with patch("routes.chat.run_agent_stream", return_value=fake_events), patch(
+                "routes.chat.POST_RESPONSE_EXECUTOR.submit"
+            ) as mocked_submit, patch("routes.chat.SUMMARY_EXECUTOR.submit") as mocked_summary_submit:
+                response = self.client.post(
+                    "/chat",
+                    json={
+                        "conversation_id": conversation_id,
+                        "model": "deepseek-chat",
+                        "user_content": "Hello",
+                        "messages": [{"role": "user", "content": "Hello"}],
+                    },
+                )
+                response.get_data(as_text=True)
+        finally:
+            self.app.config["TESTING"] = previous_testing
+
+        self.assertEqual(response.status_code, 200)
+        mocked_submit.assert_called_once()
+        mocked_summary_submit.assert_not_called()
 
     def test_generate_title_triggers_auto_rag_sync(self):
         with patch("routes.conversations.sync_conversations_to_rag_safe"):
@@ -791,6 +909,32 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn(".clarification-form", style_text)
         self.assertIn(".bubble.streaming-text", style_text)
 
+    def test_frontend_streaming_render_uses_typed_markdown_queue(self):
+        script_path = Path(__file__).resolve().parent.parent / "static" / "app.js"
+        script_text = script_path.read_text(encoding="utf-8")
+        style_path = Path(__file__).resolve().parent.parent / "static" / "style.css"
+        style_text = style_path.read_text(encoding="utf-8")
+        html_path = Path(__file__).resolve().parent.parent / "templates" / "index.html"
+        html_text = html_path.read_text(encoding="utf-8")
+
+        self.assertIn("const STREAM_TYPING_INTERVAL_MS = 24;", script_text)
+        self.assertIn("let visibleAnswer = \"\";", script_text)
+        self.assertIn("visibleAnswer = fullAnswer.slice(0, visibleAnswer.length + stepSize);", script_text)
+        self.assertIn("function confirmCanvasOpenForDocument(", script_text)
+        self.assertIn("function openCanvasConfirmModal(options = {})", script_text)
+        self.assertIn("function getConversationSignature(entries = history)", script_text)
+        self.assertIn("function scheduleConversationRefreshAfterStream()", script_text)
+        self.assertIn("async function refreshConversationFromServer()", script_text)
+        self.assertIn(".stream-cursor", style_text)
+        self.assertIn("@keyframes streamCursorBlink", style_text)
+        self.assertIn('id="canvas-confirm-modal"', html_text)
+        self.assertIn('id="canvas-confirm-open"', html_text)
+        self.assertIn('id="canvas-delete-btn"', html_text)
+        self.assertIn('id="canvas-clear-btn"', html_text)
+        self.assertIn('const canvasDeleteBtn = document.getElementById("canvas-delete-btn")', script_text)
+        self.assertIn('const canvasClearBtn = document.getElementById("canvas-clear-btn")', script_text)
+        self.assertIn("async function deleteCanvasDocuments(", script_text)
+
     def test_settings_ui_exposes_fetch_threshold_input(self):
         html = self.client.get("/").get_data(as_text=True)
         self.assertIn('value="append_scratchpad"', html)
@@ -799,7 +943,7 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn('id="scratchpad-add-btn"', html)
         self.assertIn('id="summary-mode-select"', html)
         self.assertIn('id="summary-trigger-input"', html)
-        self.assertIn('id="summary-batch-input"', html)
+        self.assertIn('id="summary-inspector-tool-messages"', html)
         self.assertIn('id="fetch-threshold-input"', html)
         self.assertIn('id="fetch-aggressiveness-input"', html)
         self.assertIn('id="rag-sensitivity-select"', html)
@@ -1526,6 +1670,56 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(html_response.mimetype, "text/html")
         self.assertIn("attachment; filename=\"Draft-Export.html\"", html_response.headers["Content-Disposition"])
         self.assertIn("<ul>", html_response.get_data(as_text=True))
+
+    def test_canvas_delete_endpoint_updates_canvas_state(self):
+        conversation_id = self._create_conversation()
+        metadata = serialize_message_metadata(
+            {
+                "canvas_documents": [
+                    {
+                        "id": "canvas-one",
+                        "title": "Draft One",
+                        "format": "markdown",
+                        "content": "# One",
+                    },
+                    {
+                        "id": "canvas-two",
+                        "title": "Draft Two",
+                        "format": "markdown",
+                        "content": "# Two",
+                    },
+                ]
+            }
+        )
+
+        with get_db() as conn:
+            insert_message(conn, conversation_id, "assistant", "Canvas ready.", metadata=metadata)
+
+        delete_response = self.client.delete(
+            f"/api/conversations/{conversation_id}/canvas?document_id=canvas-two"
+        )
+        self.assertEqual(delete_response.status_code, 200)
+        delete_payload = delete_response.get_json()
+        self.assertFalse(delete_payload["cleared"])
+        self.assertEqual(delete_payload["remaining_count"], 1)
+        self.assertEqual(delete_payload["deleted_document_id"], "canvas-two")
+        self.assertEqual(delete_payload["documents"][0]["id"], "canvas-one")
+
+        clear_response = self.client.delete(
+            f"/api/conversations/{conversation_id}/canvas?clear_all=true"
+        )
+        self.assertEqual(clear_response.status_code, 200)
+        clear_payload = clear_response.get_json()
+        self.assertTrue(clear_payload["cleared"])
+        self.assertEqual(clear_payload["remaining_count"], 0)
+        self.assertEqual(clear_payload["documents"], [])
+
+        conversation_response = self.client.get(f"/api/conversations/{conversation_id}")
+        self.assertEqual(conversation_response.status_code, 200)
+        messages = conversation_response.get_json()["messages"]
+        self.assertEqual(messages[-1]["role"], "tool")
+        self.assertEqual(messages[-1]["metadata"]["canvas_documents"], [])
+        self.assertTrue(messages[-1]["metadata"]["canvas_cleared"])
 
     def test_conversation_export_endpoint_returns_markdown_docx_and_pdf(self):
         conversation_id = self._create_conversation("Exportable Chat")
@@ -2704,10 +2898,8 @@ class AppRoutesTestCase(unittest.TestCase):
                 "rag_auto_inject": "false",
                 "chat_summary_mode": "auto",
                 "chat_summary_trigger_token_count": "1000",
-                "chat_summary_batch_size": "20",
                 "summary_skip_first": "0",
                 "summary_skip_last": "0",
-                "summary_dynamic_batch": "false",
             }
         )
 
@@ -2754,20 +2946,19 @@ class AppRoutesTestCase(unittest.TestCase):
         conversation_messages = conversation_response.get_json()["messages"]
         self.assertEqual(conversation_messages[0]["role"], "summary")
         self.assertTrue(conversation_messages[0]["metadata"]["is_summary"])
-        self.assertEqual(conversation_messages[0]["metadata"]["covered_message_count"], 20)
+        self.assertEqual(conversation_messages[0]["metadata"]["covered_message_count"], 39)
         self.assertEqual(conversation_messages[0]["metadata"]["summary_mode"], "auto")
         self.assertEqual(conversation_messages[0]["metadata"]["trigger_token_count"], 1000)
-        self.assertEqual(conversation_messages[0]["metadata"]["summary_batch_size"], 20)
         self.assertEqual(
             conversation_messages[0]["content"],
             "Conversation summary (generated from deleted messages):\n\nSummary of the first 20 messages with enough retained detail to meet the minimum length validation threshold for summaries.",
         )
-        self.assertEqual(len(conversation_messages), 22)
+        self.assertEqual(len(conversation_messages), 3)
         self.assertEqual(conversation_messages[-1]["role"], "assistant")
 
         summary_event = next((event for event in streamed_events if event["type"] == "conversation_summary_applied"), None)
         self.assertIsNotNone(summary_event)
-        self.assertEqual(summary_event["covered_message_count"], 20)
+        self.assertEqual(summary_event["covered_message_count"], 39)
         self.assertEqual(summary_event["mode"], "auto")
 
         history_sync_events = [event for event in streamed_events if event["type"] == "history_sync"]
@@ -2779,7 +2970,7 @@ class AppRoutesTestCase(unittest.TestCase):
                 "SELECT COUNT(*) AS count FROM messages WHERE conversation_id = ? AND deleted_at IS NOT NULL",
                 (conversation_id,),
             ).fetchone()["count"]
-        self.assertEqual(deleted_count, 20)
+        self.assertEqual(deleted_count, 39)
 
     def test_chat_rejects_edit_for_message_removed_by_summary(self):
         conversation_id = self._create_conversation()
@@ -2812,7 +3003,7 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.get_json()["error"], "This message can no longer be edited because it was summarized.")
 
-    def test_chat_summary_preserves_interleaved_tool_messages(self):
+    def test_chat_summary_covers_interleaved_tool_messages(self):
         conversation_id = self._create_conversation()
         dense_message = " ".join(["history"] * 120)
         save_app_settings(
@@ -2823,10 +3014,8 @@ class AppRoutesTestCase(unittest.TestCase):
                 "rag_auto_inject": "false",
                 "chat_summary_mode": "auto",
                 "chat_summary_trigger_token_count": "1000",
-                "chat_summary_batch_size": "5",
                 "summary_skip_first": "0",
                 "summary_skip_last": "0",
-                "summary_dynamic_batch": "false",
             }
         )
 
@@ -2893,19 +3082,9 @@ class AppRoutesTestCase(unittest.TestCase):
 
         self.assertEqual(
             [(row["role"], row["tool_call_id"]) for row in visible_rows],
-            [
-                ("summary", None),
-                ("tool", "call-1"),
-                ("user", None),
-                ("user", None),
-                ("user", None),
-                ("user", None),
-                ("user", None),
-                ("assistant", None),
-            ],
+            [("summary", None), ("user", None), ("assistant", None)],
         )
-        self.assertEqual(visible_rows[1]["content"], '{"ok":true}')
-        self.assertEqual(deleted_count, 5)
+        self.assertGreaterEqual(deleted_count, 6)
 
     def test_chat_summary_can_trigger_from_large_tool_history(self):
         conversation_id = self._create_conversation()
@@ -2929,10 +3108,8 @@ class AppRoutesTestCase(unittest.TestCase):
                 "rag_auto_inject": "false",
                 "chat_summary_mode": "auto",
                 "chat_summary_trigger_token_count": "1000",
-                "chat_summary_batch_size": "5",
                 "summary_skip_first": "0",
                 "summary_skip_last": "0",
-                "summary_dynamic_batch": "false",
             }
         )
 
@@ -2984,6 +3161,7 @@ class AppRoutesTestCase(unittest.TestCase):
         summary_event = next((event for event in streamed_events if event["type"] == "conversation_summary_applied"), None)
         self.assertIsNotNone(summary_event)
         self.assertEqual(summary_event["covered_message_count"], 2)
+        self.assertEqual(summary_event["covered_tool_message_count"], 1)
 
         with get_db() as conn:
             visible_rows = conn.execute(
@@ -2995,7 +3173,6 @@ class AppRoutesTestCase(unittest.TestCase):
             [(row["role"], row["tool_call_id"]) for row in visible_rows],
             [
                 ("summary", None),
-                ("tool", "call-1"),
                 ("user", None),
                 ("assistant", None),
             ],
@@ -3021,6 +3198,166 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn("USER:\nSecond user request", prompt_messages[1]["content"])
         self.assertNotIn(FINAL_ANSWER_ERROR_TEXT, prompt_messages[1]["content"])
 
+    def test_build_summary_prompt_messages_include_tool_findings_from_assistant_metadata(self):
+        prompt_messages = build_summary_prompt_messages(
+            [
+                {"role": "user", "content": "Research the market"},
+                {
+                    "role": "assistant",
+                    "content": "I reviewed the sources.",
+                    "metadata": {
+                        "tool_results": [
+                            {
+                                "tool_name": "fetch_url",
+                                "summary": "Revenue grew 18 percent year over year.",
+                                "content": "Very long tool payload that should not be needed when a summary is available.",
+                            },
+                            {
+                                "tool_name": "search_web",
+                                "content": "Analysts expect demand to remain strong through Q4 based on recent filings and channel checks.",
+                            },
+                        ]
+                    },
+                },
+            ],
+            "",
+        )
+
+        transcript = prompt_messages[1]["content"]
+        self.assertIn("Tool findings:", transcript)
+        self.assertIn("fetch_url: Revenue grew 18 percent year over year.", transcript)
+        self.assertIn("search_web: Analysts expect demand to remain strong through Q4", transcript)
+
+    def test_build_summary_prompt_messages_include_tool_role_messages(self):
+        prompt_messages = build_summary_prompt_messages(
+            [
+                {"role": "user", "content": "Check the source"},
+                {"role": "assistant", "content": "I will inspect the page."},
+                {"role": "tool", "content": '{"ok": true, "headline": "Market expands"}', "tool_call_id": "call-9"},
+            ],
+            "",
+        )
+
+        transcript = prompt_messages[1]["content"]
+        self.assertIn("TOOL RESULT:\ncall call-9: {\"ok\": true, \"headline\": \"Market expands\"}", transcript)
+
+    def test_estimate_prompt_tokens_counts_tool_call_payload(self):
+        plain_messages = [
+            {
+                "role": "assistant",
+                "content": "Done.",
+            }
+        ]
+        tool_call_messages = [
+            {
+                "role": "assistant",
+                "content": "Done.",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "search_web",
+                            "arguments": '{"queries":["token budgets"]}',
+                        },
+                    }
+                ],
+            }
+        ]
+
+        self.assertGreater(_estimate_prompt_tokens(tool_call_messages), _estimate_prompt_tokens(plain_messages))
+
+    def test_select_recent_prompt_window_respects_token_budget(self):
+        messages = [
+            {"role": "user", "content": "alpha " * 120},
+            {"role": "assistant", "content": "beta " * 120},
+            {"role": "user", "content": "gamma " * 120},
+        ]
+
+        selected = _select_recent_prompt_window(messages, max_tokens=120, min_user_messages=2)
+
+        self.assertLessEqual(_estimate_prompt_tokens(build_api_messages(selected)), 120)
+        self.assertLessEqual(sum(1 for message in selected if message["role"] == "user"), 2)
+
+    def test_select_recent_prompt_window_keeps_complete_tool_call_blocks(self):
+        messages = [
+            {"role": "user", "content": "older context " * 80, "position": 1, "id": 1},
+            {
+                "role": "assistant",
+                "content": "Calling a tool now.",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "search_web", "arguments": "{}"},
+                    }
+                ],
+                "position": 2,
+                "id": 2,
+            },
+            {"role": "tool", "content": '{"ok": true}', "tool_call_id": "call-1", "position": 3, "id": 3},
+            {"role": "user", "content": "latest question", "position": 4, "id": 4},
+        ]
+
+        selected = _select_recent_prompt_window(messages, max_tokens=200)
+
+        self.assertEqual([message["role"] for message in selected], ["assistant", "tool", "user"])
+        self.assertEqual(selected[0]["tool_calls"][0]["id"], "call-1")
+        self.assertEqual(selected[1]["tool_call_id"], "call-1")
+
+    def test_select_recent_prompt_window_skips_incomplete_tool_call_blocks(self):
+        messages = [
+            {
+                "role": "assistant",
+                "content": "Calling a tool now.",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "search_web", "arguments": "{}"},
+                    }
+                ],
+                "position": 1,
+                "id": 1,
+            },
+            {"role": "user", "content": "latest question", "position": 2, "id": 2},
+        ]
+
+        selected = _select_recent_prompt_window(messages, max_tokens=300)
+
+        self.assertEqual([message["role"] for message in selected], ["user"])
+
+    def test_summary_source_selection_uses_expanded_prompt_budget(self):
+        canonical_messages = [
+            {"id": 1, "position": 1, "role": "user", "content": "Kickoff"},
+            {
+                "id": 2,
+                "position": 2,
+                "role": "assistant",
+                "content": "Short reply",
+                "metadata": {
+                    "tool_results": [
+                        {
+                            "tool_name": "fetch_url",
+                            "summary": "Important result " * 60,
+                            "content": "Raw payload " * 300,
+                        }
+                    ]
+                },
+            },
+        ]
+
+        selected = _select_summary_source_messages_by_token_budget(
+            canonical_messages,
+            canonical_messages,
+            target_tokens=240,
+            user_preferences="",
+        )
+
+        self.assertEqual([message["role"] for message in selected], ["user"])
+        prompt_messages = build_summary_prompt_messages(selected, "")
+        self.assertLessEqual(_estimate_prompt_tokens(prompt_messages), 240)
+
     def test_chat_summary_status_reports_detailed_failure_stage(self):
         conversation_id = self._create_conversation()
         dense_message = " ".join(["context"] * 120)
@@ -3032,10 +3369,8 @@ class AppRoutesTestCase(unittest.TestCase):
                 "rag_auto_inject": "false",
                 "chat_summary_mode": "auto",
                 "chat_summary_trigger_token_count": "1000",
-                "chat_summary_batch_size": "5",
                 "summary_skip_first": "0",
                 "summary_skip_last": "0",
-                "summary_dynamic_batch": "false",
             }
         )
 
@@ -3097,10 +3432,8 @@ class AppRoutesTestCase(unittest.TestCase):
                 "rag_auto_inject": "false",
                 "chat_summary_mode": "auto",
                 "chat_summary_trigger_token_count": "1000",
-                "chat_summary_batch_size": "5",
                 "summary_skip_first": "0",
                 "summary_skip_last": "0",
-                "summary_dynamic_batch": "false",
             }
         )
 
@@ -3168,10 +3501,8 @@ class AppRoutesTestCase(unittest.TestCase):
                 "rag_auto_inject": "false",
                 "chat_summary_mode": "auto",
                 "chat_summary_trigger_token_count": "1000",
-                "chat_summary_batch_size": "5",
                 "summary_skip_first": "0",
                 "summary_skip_last": "0",
-                "summary_dynamic_batch": "false",
             }
         )
 
@@ -3229,22 +3560,103 @@ class AppRoutesTestCase(unittest.TestCase):
         messages = conversation_response.get_json()["messages"]
         summary_messages = [message for message in messages if message["role"] == "summary"]
 
-        self.assertEqual(len(summary_messages), 2)
+        self.assertEqual(len(summary_messages), 1)
         self.assertEqual(
             summary_messages[0]["content"],
             "Conversation summary (generated from deleted messages):\n\nFirst summary block with enough retained detail to satisfy the minimum length validation threshold for summary generation.",
         )
+        self.assertEqual(summary_messages[0]["metadata"]["covered_message_count"], 13)
         self.assertEqual(
-            summary_messages[1]["content"],
-            "Conversation summary (generated from deleted messages):\n\nSecond summary block with enough retained detail to satisfy the minimum length validation threshold for summary generation.",
+            [message["role"] for message in messages],
+            ["summary", "user", "assistant", "user", "assistant"],
         )
-        self.assertEqual(summary_messages[0]["metadata"]["covered_message_count"], 5)
-        self.assertEqual(summary_messages[1]["metadata"]["covered_message_count"], 5)
-        first_ids = set(summary_messages[0]["metadata"]["covered_message_ids"])
-        second_ids = set(summary_messages[1]["metadata"]["covered_message_ids"])
-        self.assertTrue(first_ids)
-        self.assertTrue(second_ids)
-        self.assertTrue(first_ids.isdisjoint(second_ids))
+
+    def test_chat_summary_covers_tool_call_assistant_messages(self):
+        conversation_id = self._create_conversation()
+        dense_message = " ".join(["history"] * 120)
+        save_app_settings(
+            {
+                "user_preferences": "",
+                "max_steps": "1",
+                "active_tools": "[]",
+                "rag_auto_inject": "false",
+                "chat_summary_mode": "never",
+                "chat_summary_trigger_token_count": "1000",
+                "summary_skip_first": "0",
+                "summary_skip_last": "0",
+            }
+        )
+
+        with get_db() as conn:
+            conn.execute(
+                "INSERT INTO messages (conversation_id, role, content, metadata, position) VALUES (?, 'user', ?, ?, ?)",
+                (conversation_id, f"First user {dense_message}", None, 1),
+            )
+            assistant_tool_id = conn.execute(
+                "INSERT INTO messages (conversation_id, role, content, tool_calls, position) VALUES (?, 'assistant', ?, ?, ?)",
+                (
+                    conversation_id,
+                    "I will use a tool.",
+                    json.dumps(
+                        [
+                            {
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {"name": "search_web", "arguments": "{}"},
+                            }
+                        ]
+                    ),
+                    2,
+                ),
+            ).lastrowid
+            tool_id = conn.execute(
+                "INSERT INTO messages (conversation_id, role, content, tool_call_id, position) VALUES (?, 'tool', ?, ?, ?)",
+                (conversation_id, '{"ok": true, "headline": "Important finding"}', "call-1", 3),
+            ).lastrowid
+            conn.execute(
+                "INSERT INTO messages (conversation_id, role, content, metadata, position) VALUES (?, 'user', ?, ?, ?)",
+                (conversation_id, f"Second user {dense_message}", None, 4),
+            )
+            conn.execute(
+                "INSERT INTO messages (conversation_id, role, content, metadata, position) VALUES (?, 'assistant', ?, ?, ?)",
+                (conversation_id, f"Plain answer {dense_message}", None, 5),
+            )
+
+        fake_summary = {
+            "content": "Summary block with enough retained detail to satisfy the minimum length validation threshold and preserve tool-chain coverage in metadata.",
+            "reasoning_content": "",
+            "usage": None,
+            "tool_results": [],
+            "errors": [],
+        }
+
+        with patch("routes.chat.collect_agent_response", return_value=fake_summary), patch(
+            "routes.chat.sync_conversations_to_rag_safe"
+        ):
+            response = self.client.post(
+                f"/api/conversations/{conversation_id}/summarize",
+                json={"force": True},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload["applied"])
+
+        summary_message = next(message for message in payload["messages"] if message["role"] == "summary")
+        self.assertEqual(summary_message["metadata"]["covered_tool_call_message_count"], 1)
+        self.assertEqual(summary_message["metadata"]["covered_tool_message_count"], 1)
+        self.assertIn(assistant_tool_id, summary_message["metadata"]["covered_message_ids"])
+        self.assertIn(tool_id, summary_message["metadata"]["covered_message_ids"])
+
+        with get_db() as conn:
+            visible_rows = conn.execute(
+                "SELECT id, role FROM messages WHERE conversation_id = ? AND deleted_at IS NULL ORDER BY position, id",
+                (conversation_id,),
+            ).fetchall()
+
+        visible_pairs = [(row["id"], row["role"]) for row in visible_rows]
+        self.assertNotIn((assistant_tool_id, "assistant"), visible_pairs)
+        self.assertNotIn((tool_id, "tool"), visible_pairs)
 
     def test_chat_summary_mode_never_skips_summary_even_above_token_threshold(self):
         conversation_id = self._create_conversation()
@@ -3257,10 +3669,8 @@ class AppRoutesTestCase(unittest.TestCase):
                 "rag_auto_inject": "false",
                 "chat_summary_mode": "never",
                 "chat_summary_trigger_token_count": "1000",
-                "chat_summary_batch_size": "5",
                 "summary_skip_first": "0",
                 "summary_skip_last": "0",
-                "summary_dynamic_batch": "false",
             }
         )
 
@@ -3477,20 +3887,57 @@ class AppRoutesTestCase(unittest.TestCase):
         result = get_unsummarized_visible_messages(messages, skip_first=1, skip_last=1)
         self.assertEqual([message["id"] for message in result], [3, 4])
 
-    def test_dynamic_batch_size_calculation(self):
-        from routes.chat import _calculate_dynamic_batch_size
+    def test_chat_preflight_summary_respects_mode_never(self):
+        conversation_id = self._create_conversation()
+        dense_message = " ".join(["preflight"] * 900)
+        save_app_settings(
+            {
+                "user_preferences": "",
+                "max_steps": "1",
+                "active_tools": "[]",
+                "rag_auto_inject": "false",
+                "chat_summary_mode": "never",
+                "chat_summary_trigger_token_count": "1000",
+                "summary_skip_first": "0",
+                "summary_skip_last": "0",
+            }
+        )
 
-        result = _calculate_dynamic_batch_size([], 20)
-        self.assertEqual(result, 20)
+        with get_db() as conn:
+            for index in range(8):
+                conn.execute(
+                    "INSERT INTO messages (conversation_id, role, content, metadata) VALUES (?, 'user', ?, ?)",
+                    (conversation_id, f"Seed {index + 1} {dense_message}", None),
+                )
 
-        messages = [{"content": "short"}] * 10
-        result = _calculate_dynamic_batch_size(messages, 20)
-        self.assertGreaterEqual(result, 5)
-        self.assertLessEqual(result, 20)
+        fake_events = iter(
+            [
+                {"type": "answer_start"},
+                {"type": "answer_delta", "text": "Main answer without preflight summary."},
+                {"type": "tool_capture", "tool_results": []},
+                {"type": "done"},
+            ]
+        )
 
-        dense_messages = [{"content": " ".join(["dense"] * 400)} for _ in range(12)]
-        dense_result = _calculate_dynamic_batch_size(dense_messages, 20)
-        self.assertLess(dense_result, 20)
+        with patch("routes.chat.collect_agent_response") as mocked_collect, patch(
+            "routes.chat.run_agent_stream", return_value=fake_events
+        ), patch("routes.chat.sync_conversations_to_rag_safe"):
+            response = self.client.post(
+                "/chat",
+                json={
+                    "conversation_id": conversation_id,
+                    "model": "deepseek-chat",
+                    "user_content": f"Latest {dense_message}",
+                    "messages": [{"role": "user", "content": f"Latest {dense_message}"}],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        events = [json.loads(line) for line in response.get_data(as_text=True).strip().splitlines()]
+        summary_status = next((event for event in events if event["type"] == "conversation_summary_status"), None)
+        self.assertIsNotNone(summary_status)
+        self.assertEqual(summary_status["reason"], "mode_never")
+        mocked_collect.assert_not_called()
 
     def test_manual_summarize_endpoint_returns_404_for_missing_conversation(self):
         response = self.client.post(
@@ -3510,10 +3957,8 @@ class AppRoutesTestCase(unittest.TestCase):
                 "rag_auto_inject": "false",
                 "chat_summary_mode": "never",
                 "chat_summary_trigger_token_count": "1000",
-                "chat_summary_batch_size": "5",
                 "summary_skip_first": "0",
                 "summary_skip_last": "0",
-                "summary_dynamic_batch": "false",
             }
         )
 
@@ -3554,10 +3999,8 @@ class AppRoutesTestCase(unittest.TestCase):
                 "rag_auto_inject": "false",
                 "chat_summary_mode": "never",
                 "chat_summary_trigger_token_count": "1000",
-                "chat_summary_batch_size": "5",
                 "summary_skip_first": "0",
                 "summary_skip_last": "0",
-                "summary_dynamic_batch": "false",
             }
         )
 
@@ -3590,10 +4033,8 @@ class AppRoutesTestCase(unittest.TestCase):
                 "rag_auto_inject": "false",
                 "chat_summary_mode": "never",
                 "chat_summary_trigger_token_count": "1000",
-                "chat_summary_batch_size": "10",
                 "summary_skip_first": "2",
                 "summary_skip_last": "2",
-                "summary_dynamic_batch": "false",
             }
         )
 
@@ -3671,10 +4112,8 @@ class AppRoutesTestCase(unittest.TestCase):
                 "rag_auto_inject": "false",
                 "chat_summary_mode": "never",
                 "chat_summary_trigger_token_count": "1000",
-                "chat_summary_batch_size": "10",
                 "summary_skip_first": "2",
                 "summary_skip_last": "2",
-                "summary_dynamic_batch": "false",
             }
         )
 
@@ -3771,6 +4210,102 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual([message["content"] for message in data["messages"]], [f"Message {index}" for index in range(1, 9)])
         self.assertEqual([message["position"] for message in data["messages"]], list(range(1, 9)))
 
+    def test_undo_summary_restores_tool_chain_missing_from_metadata(self):
+        conversation_id = self._create_conversation()
+
+        with get_db() as conn:
+            user_one_id = conn.execute(
+                "INSERT INTO messages (conversation_id, role, content, metadata, position) VALUES (?, 'user', ?, ?, ?)",
+                (conversation_id, "Message 1", None, 1),
+            ).lastrowid
+            assistant_tool_id = conn.execute(
+                "INSERT INTO messages (conversation_id, role, content, tool_calls, position) VALUES (?, 'assistant', ?, ?, ?)",
+                (
+                    conversation_id,
+                    "Working on it.",
+                    json.dumps(
+                        [
+                            {
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {"name": "search_web", "arguments": "{}"},
+                            }
+                        ]
+                    ),
+                    2,
+                ),
+            ).lastrowid
+            tool_id = conn.execute(
+                "INSERT INTO messages (conversation_id, role, content, tool_call_id, position) VALUES (?, 'tool', ?, ?, ?)",
+                (conversation_id, '{"ok": true}', "call-1", 3),
+            ).lastrowid
+            user_two_id = conn.execute(
+                "INSERT INTO messages (conversation_id, role, content, metadata, position) VALUES (?, 'user', ?, ?, ?)",
+                (conversation_id, "Message 4", None, 4),
+            ).lastrowid
+            user_three_id = conn.execute(
+                "INSERT INTO messages (conversation_id, role, content, metadata, position) VALUES (?, 'user', ?, ?, ?)",
+                (conversation_id, "Message 5", None, 5),
+            ).lastrowid
+
+            deleted_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            conn.execute(
+                "UPDATE messages SET deleted_at = ? WHERE conversation_id = ? AND id IN (?, ?, ?)",
+                (deleted_at, conversation_id, assistant_tool_id, tool_id, user_two_id),
+            )
+            summary_id = conn.execute(
+                "INSERT INTO messages (conversation_id, role, content, metadata, position) VALUES (?, 'summary', ?, ?, ?)",
+                (
+                    conversation_id,
+                    "Conversation summary (generated from deleted messages):\n\nSummary block.",
+                    serialize_message_metadata(
+                        {
+                            "is_summary": True,
+                            "summary_source": "conversation_history",
+                            "covers_from_position": 2,
+                            "covers_to_position": 4,
+                            "summary_insert_strategy": "replace_first_covered_message_preserve_positions",
+                            "covered_message_count": 1,
+                            "covered_message_ids": [user_two_id],
+                            "generated_at": deleted_at,
+                        }
+                    ),
+                    2,
+                ),
+            ).lastrowid
+
+        with patch("routes.chat.sync_conversations_to_rag_safe"):
+            response = self.client.post(
+                f"/api/conversations/{conversation_id}/summaries/{summary_id}/undo"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload["reverted"])
+        self.assertEqual(payload["restored_message_count"], 3)
+        self.assertEqual(
+            [(message["role"], message.get("tool_call_id")) for message in payload["messages"]],
+            [
+                ("user", None),
+                ("assistant", None),
+                ("tool", "call-1"),
+                ("user", None),
+                ("user", None),
+            ],
+        )
+        self.assertEqual([message["position"] for message in payload["messages"]], [1, 2, 3, 4, 5])
+
+        with get_db() as conn:
+            visible_ids = {
+                row["id"]
+                for row in conn.execute(
+                    "SELECT id FROM messages WHERE conversation_id = ? AND deleted_at IS NULL",
+                    (conversation_id,),
+                ).fetchall()
+            }
+
+        self.assertTrue({user_one_id, assistant_tool_id, tool_id, user_two_id, user_three_id}.issubset(visible_ids))
+
     def test_settings_include_new_summary_params(self):
         save_app_settings(
             {
@@ -3779,7 +4314,6 @@ class AppRoutesTestCase(unittest.TestCase):
                 "active_tools": "[]",
                 "summary_skip_first": "3",
                 "summary_skip_last": "2",
-                "summary_dynamic_batch": "false",
             }
         )
         response = self.client.get("/api/settings")
@@ -3787,19 +4321,17 @@ class AppRoutesTestCase(unittest.TestCase):
         data = response.get_json()
         self.assertEqual(data["summary_skip_first"], 3)
         self.assertEqual(data["summary_skip_last"], 2)
-        self.assertFalse(data["summary_dynamic_batch"])
 
     def test_settings_patch_validates_new_summary_params(self):
         response = self.client.patch(
             "/api/settings",
-            json={"summary_skip_first": 5, "summary_skip_last": 3, "summary_dynamic_batch": True},
+            json={"summary_skip_first": 5, "summary_skip_last": 3},
             content_type="application/json",
         )
         self.assertEqual(response.status_code, 200)
         data = response.get_json()
         self.assertEqual(data["summary_skip_first"], 5)
         self.assertEqual(data["summary_skip_last"], 3)
-        self.assertTrue(data["summary_dynamic_batch"])
 
     def test_settings_patch_rejects_invalid_skip_values(self):
         response = self.client.patch(
@@ -3824,6 +4356,177 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn("Unresolved Questions", system_content)
         self.assertIn("Important Context", system_content)
         self.assertIn("sufficient detail", system_content)
+
+    def test_chat_applies_preflight_summary_before_main_agent_run(self):
+        conversation_id = self._create_conversation()
+        dense_message = " ".join(["preflight"] * 900)
+        save_app_settings(
+            {
+                "user_preferences": "",
+                "max_steps": "1",
+                "active_tools": "[]",
+                "rag_auto_inject": "false",
+                "chat_summary_mode": "auto",
+                "chat_summary_trigger_token_count": "80000",
+                "summary_skip_first": "0",
+                "summary_skip_last": "0",
+            }
+        )
+
+        with get_db() as conn:
+            for index in range(20):
+                conn.execute(
+                    "INSERT INTO messages (conversation_id, role, content, metadata) VALUES (?, 'user', ?, ?)",
+                    (conversation_id, f"Seed {index + 1} {dense_message}", None),
+                )
+
+        fake_summary = {
+            "content": "Preflight summary block with enough retained detail to satisfy the minimum length validation threshold and reduce prompt size before the main answer.",
+            "reasoning_content": "",
+            "usage": None,
+            "tool_results": [],
+            "errors": [],
+        }
+        fake_events = iter(
+            [
+                {"type": "answer_start"},
+                {"type": "answer_delta", "text": "Main answer after preflight summary."},
+                {"type": "tool_capture", "tool_results": []},
+                {"type": "done"},
+            ]
+        )
+
+        with patch("routes.chat.collect_agent_response", return_value=fake_summary), patch(
+            "routes.chat.run_agent_stream", return_value=fake_events
+        ), patch("routes.chat.sync_conversations_to_rag_safe"):
+            response = self.client.post(
+                "/chat",
+                json={
+                    "conversation_id": conversation_id,
+                    "model": "deepseek-chat",
+                    "user_content": f"Latest {dense_message}",
+                    "messages": [{"role": "user", "content": f"Latest {dense_message}"}],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        events = [json.loads(line) for line in response.get_data(as_text=True).strip().splitlines()]
+        summary_event = next((event for event in events if event["type"] == "conversation_summary_applied"), None)
+        self.assertIsNotNone(summary_event)
+        self.assertTrue(summary_event["preflight"])
+        history_sync_event = next((event for event in events if event["type"] == "history_sync"), None)
+        self.assertIsNotNone(history_sync_event)
+        self.assertEqual(history_sync_event["messages"][0]["role"], "summary")
+        self.assertIn(SUMMARY_LABEL, history_sync_event["messages"][0]["content"])
+
+    def test_chat_preflight_summary_skips_second_summary_pass_in_same_request(self):
+        conversation_id = self._create_conversation()
+        dense_message = " ".join(["preflight"] * 900)
+        save_app_settings(
+            {
+                "user_preferences": "",
+                "max_steps": "1",
+                "active_tools": "[]",
+                "rag_auto_inject": "false",
+                "chat_summary_mode": "auto",
+                "chat_summary_trigger_token_count": "80000",
+                "summary_skip_first": "0",
+                "summary_skip_last": "0",
+            }
+        )
+
+        with get_db() as conn:
+            for index in range(20):
+                conn.execute(
+                    "INSERT INTO messages (conversation_id, role, content, metadata) VALUES (?, 'user', ?, ?)",
+                    (conversation_id, f"Seed {index + 1} {dense_message}", None),
+                )
+
+        fake_summary = {
+            "content": "Preflight summary block with enough retained detail to satisfy the minimum length validation threshold and reduce prompt size before the main answer.",
+            "reasoning_content": "",
+            "usage": None,
+            "tool_results": [],
+            "errors": [],
+        }
+        fake_events = iter(
+            [
+                {"type": "answer_start"},
+                {"type": "answer_delta", "text": "Main answer after preflight summary."},
+                {"type": "tool_capture", "tool_results": []},
+                {"type": "done"},
+            ]
+        )
+
+        with patch("routes.chat.collect_agent_response", return_value=fake_summary), patch(
+            "routes.chat.run_agent_stream", return_value=fake_events
+        ), patch("routes.chat.SUMMARY_EXECUTOR.submit") as mocked_summary_submit, patch(
+            "routes.chat.sync_conversations_to_rag_safe"
+        ):
+            response = self.client.post(
+                "/chat",
+                json={
+                    "conversation_id": conversation_id,
+                    "model": "deepseek-chat",
+                    "user_content": f"Latest {dense_message}",
+                    "messages": [{"role": "user", "content": f"Latest {dense_message}"}],
+                },
+            )
+            response.get_data(as_text=True)
+
+        self.assertEqual(response.status_code, 200)
+        mocked_summary_submit.assert_not_called()
+
+    def test_run_agent_stream_uses_compact_tool_message_content_for_followup_prompt(self):
+        responses = [
+            iter(
+                [
+                    self._tool_call_chunk("fetch_url", {"url": "https://example.com/compact"}),
+                    self._stream_chunk(usage=SimpleNamespace(prompt_tokens=3, completion_tokens=5, total_tokens=8)),
+                ]
+            ),
+            iter(
+                [
+                    self._stream_chunk(content="Compact answer."),
+                    self._stream_chunk(usage=SimpleNamespace(prompt_tokens=4, completion_tokens=6, total_tokens=10)),
+                ]
+            ),
+        ]
+
+        long_content = "\n\n".join(
+            [
+                "Overview block with broad context and repeated details. " * 12,
+                "Evidence block with implementation details and caveats. " * 12,
+                "Closing block with more raw detail that should stay out of the prompt-facing tool message. " * 12,
+            ]
+        )
+
+        with patch("agent.client.chat.completions.create", side_effect=responses) as mocked_create, patch(
+            "agent.fetch_url_tool",
+            return_value={
+                "url": "https://example.com/compact",
+                "title": "Compact Example",
+                "content": long_content,
+                "status": 200,
+                "content_format": "html",
+                "cleanup_applied": True,
+            },
+        ):
+            list(
+                run_agent_stream(
+                    [{"role": "user", "content": "Fetch and summarize compactly"}],
+                    "deepseek-chat",
+                    2,
+                    ["fetch_url"],
+                    fetch_url_token_threshold=50,
+                )
+            )
+
+        second_call_messages = mocked_create.call_args_list[1].kwargs["messages"]
+        tool_message = next(message for message in second_call_messages if message["role"] == "tool")
+        self.assertIn("Title: Compact Example", tool_message["content"])
+        self.assertIn("URL: https://example.com/compact", tool_message["content"])
+        self.assertNotIn("raw_content", tool_message["content"])
 
 
 if __name__ == "__main__":

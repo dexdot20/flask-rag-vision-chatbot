@@ -100,10 +100,18 @@ FETCH_SUMMARY_GENERAL_TOP_K = max(1, min(6, _parse_int_env("FETCH_SUMMARY_GENERA
 FETCH_SUMMARY_QUERY_TOP_K = max(1, min(8, _parse_int_env("FETCH_SUMMARY_QUERY_TOP_K", 4)))
 FETCH_SUMMARY_EXCERPT_MAX_CHARS = max(200, min(1200, _parse_int_env("FETCH_SUMMARY_EXCERPT_MAX_CHARS", 500)))
 CHAT_SUMMARY_TRIGGER_TOKEN_COUNT = max(1_000, min(200_000, _parse_int_env("CHAT_SUMMARY_TRIGGER_TOKEN_COUNT", 80_000)))
-CHAT_SUMMARY_BATCH_SIZE = max(5, min(100, _parse_int_env("CHAT_SUMMARY_BATCH_SIZE", 20)))
 CHAT_SUMMARY_MODE = (os.getenv("CHAT_SUMMARY_MODE") or "auto").strip().lower()
 CHAT_SUMMARY_MODEL = (os.getenv("CHAT_SUMMARY_MODEL") or "deepseek-chat").strip() or "deepseek-chat"
 CHAT_SUMMARY_ALLOWED_MODES = {"auto", "never", "aggressive"}
+PROMPT_MAX_INPUT_TOKENS = max(8_000, min(120_000, _parse_int_env("PROMPT_MAX_INPUT_TOKENS", 100_000)))
+PROMPT_RESPONSE_TOKEN_RESERVE = max(1_000, min(32_000, _parse_int_env("PROMPT_RESPONSE_TOKEN_RESERVE", 8_000)))
+PROMPT_RECENT_HISTORY_MAX_TOKENS = max(1_000, min(PROMPT_MAX_INPUT_TOKENS, _parse_int_env("PROMPT_RECENT_HISTORY_MAX_TOKENS", 70_000)))
+PROMPT_SUMMARY_MAX_TOKENS = max(500, min(PROMPT_MAX_INPUT_TOKENS, _parse_int_env("PROMPT_SUMMARY_MAX_TOKENS", 15_000)))
+PROMPT_RAG_MAX_TOKENS = max(0, min(PROMPT_MAX_INPUT_TOKENS, _parse_int_env("PROMPT_RAG_MAX_TOKENS", 6_000)))
+PROMPT_TOOL_MEMORY_MAX_TOKENS = max(0, min(PROMPT_MAX_INPUT_TOKENS, _parse_int_env("PROMPT_TOOL_MEMORY_MAX_TOKENS", 4_000)))
+PROMPT_PREFLIGHT_SUMMARY_TOKEN_COUNT = max(2_000, min(200_000, _parse_int_env("PROMPT_PREFLIGHT_SUMMARY_TOKEN_COUNT", 90_000)))
+SUMMARY_SOURCE_TARGET_TOKENS = max(1_000, min(40_000, _parse_int_env("SUMMARY_SOURCE_TARGET_TOKENS", 6_000)))
+SUMMARY_RETRY_MIN_SOURCE_TOKENS = max(500, min(SUMMARY_SOURCE_TARGET_TOKENS, _parse_int_env("SUMMARY_RETRY_MIN_SOURCE_TOKENS", 1_500)))
 
 DEFAULT_ACTIVE_TOOL_NAMES = [
     "append_scratchpad",
@@ -203,11 +211,9 @@ DEFAULT_SETTINGS = {
     "fetch_url_token_threshold": str(FETCH_SUMMARY_TOKEN_THRESHOLD),
     "fetch_url_clip_aggressiveness": "50",
     "chat_summary_trigger_token_count": str(CHAT_SUMMARY_TRIGGER_TOKEN_COUNT),
-    "chat_summary_batch_size": str(CHAT_SUMMARY_BATCH_SIZE),
     "chat_summary_mode": CHAT_SUMMARY_MODE if CHAT_SUMMARY_MODE in CHAT_SUMMARY_ALLOWED_MODES else "auto",
     "summary_skip_first": "2",
     "summary_skip_last": "1",
-    "summary_dynamic_batch": "true",
 }
 
 
