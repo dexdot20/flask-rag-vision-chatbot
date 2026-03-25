@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from html import escape
 from io import BytesIO
+import re
 from typing import Iterable
 from uuid import uuid4
 
@@ -44,6 +45,7 @@ _MONO_FONT = "DejaVuSansMono" if _UNICODE_FONTS else "Courier"
 CANVAS_MAX_DOCUMENTS = 12
 CANVAS_MAX_TITLE_LENGTH = 160
 CANVAS_MAX_CONTENT_LENGTH = 120_000
+CANVAS_MAX_LANGUAGE_LENGTH = 48
 CANVAS_ALLOWED_FORMATS = {"markdown"}
 
 
@@ -64,6 +66,11 @@ def _line_count(text: str) -> int:
     return len(text.split("\n"))
 
 
+def _normalize_canvas_language(value) -> str | None:
+    language = re.sub(r"[^a-z0-9_+.#-]", "", str(value or "").strip().lower())[:CANVAS_MAX_LANGUAGE_LENGTH]
+    return language or None
+
+
 def normalize_canvas_document(value, *, fallback_title: str = "Canvas") -> dict | None:
     if not isinstance(value, dict):
         return None
@@ -75,6 +82,7 @@ def normalize_canvas_document(value, *, fallback_title: str = "Canvas") -> dict 
         format_name = "markdown"
 
     content = _clip_text(value.get("content") or "", CANVAS_MAX_CONTENT_LENGTH)
+    language = _normalize_canvas_language(value.get("language"))
     created_at = str(value.get("created_at") or "").strip()[:80]
     updated_at = str(value.get("updated_at") or "").strip()[:80]
 
@@ -85,6 +93,9 @@ def normalize_canvas_document(value, *, fallback_title: str = "Canvas") -> dict 
         "content": content,
         "line_count": _line_count(content),
     }
+
+    if language:
+        cleaned["language"] = language
 
     if created_at:
         cleaned["created_at"] = created_at
@@ -177,24 +188,39 @@ def _store_canvas_document(runtime_state: dict, document: dict) -> dict:
     return normalized
 
 
-def create_canvas_document(runtime_state: dict, title: str, content: str, format_name: str = "markdown") -> dict:
+def create_canvas_document(
+    runtime_state: dict,
+    title: str,
+    content: str,
+    format_name: str = "markdown",
+    language_name: str | None = None,
+) -> dict:
     normalized = normalize_canvas_document(
         {
             "id": uuid4().hex,
             "title": title or "Canvas",
             "format": format_name,
             "content": content,
+            "language": language_name,
         }
     )
     return _store_canvas_document(runtime_state, normalized)
 
 
-def rewrite_canvas_document(runtime_state: dict, content: str, document_id: str | None = None, title: str | None = None) -> dict:
+def rewrite_canvas_document(
+    runtime_state: dict,
+    content: str,
+    document_id: str | None = None,
+    title: str | None = None,
+    language_name: str | None = None,
+) -> dict:
     _, document = _find_canvas_document(runtime_state, document_id=document_id)
     next_document = dict(document)
     next_document["content"] = _clip_text(content, CANVAS_MAX_CONTENT_LENGTH)
     if title is not None:
         next_document["title"] = str(title or "Canvas").strip()[:CANVAS_MAX_TITLE_LENGTH] or "Canvas"
+    if language_name is not None:
+        next_document["language"] = language_name
     return _store_canvas_document(runtime_state, next_document)
 
 
@@ -266,7 +292,7 @@ def build_canvas_tool_result(document: dict, *, action: str) -> dict:
     if not normalized:
         raise ValueError("Canvas document is invalid.")
     preview = normalized["content"][:2000]
-    return {
+    result = {
         "status": "ok",
         "action": action,
         "document": normalized,
@@ -277,6 +303,9 @@ def build_canvas_tool_result(document: dict, *, action: str) -> dict:
         "content": preview,
         "content_truncated": len(normalized["content"]) > len(preview),
     }
+    if normalized.get("language"):
+        result["language"] = normalized["language"]
+    return result
 
 
 def find_latest_canvas_documents(messages: list[dict]) -> list[dict]:

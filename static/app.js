@@ -111,6 +111,7 @@ let conversationRefreshGeneration = 0;
 let pendingConversationRefreshTimers = new Set();
 let lastConversationSignature = "";
 let pendingCanvasConfirmAction = null;
+let activeSidebarRename = null;
 const appSettings = bootstrapData.settings || {};
 const featureFlags = bootstrapData.features || appSettings.features || {};
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
@@ -214,6 +215,7 @@ function getCanvasDocuments(metadata) {
       id: String(document.id || "").trim(),
       title: String(document.title || "Canvas").trim() || "Canvas",
       format: String(document.format || "markdown").trim() || "markdown",
+      language: String(document.language || "").trim().toLowerCase(),
       content: String(document.content || ""),
       line_count: Number.isInteger(Number(document.line_count)) ? Number(document.line_count) : String(document.content || "").split("\n").length,
       source_message_id: Number.isInteger(Number(document.source_message_id)) ? Number(document.source_message_id) : null,
@@ -493,7 +495,8 @@ function renderCanvasPanel() {
   }
 
   activeCanvasDocumentId = activeDocument.id;
-  canvasSubtitle.textContent = `${documents.length} doc${documents.length === 1 ? "" : "s"} · ${activeDocument.title} · ${activeDocument.line_count} lines`;
+  const languageLabel = activeDocument.language ? ` · ${activeDocument.language}` : "";
+  canvasSubtitle.textContent = `${documents.length} doc${documents.length === 1 ? "" : "s"} · ${activeDocument.title} · ${activeDocument.line_count} lines${languageLabel}`;
   canvasEmptyState.hidden = true;
   canvasDocumentEl.hidden = false;
   canvasDocumentEl.innerHTML = renderMarkdown(activeDocument.content);
@@ -1936,6 +1939,7 @@ window.addEventListener("keydown", (event) => {
 });
 
 async function loadSidebar() {
+  cancelSidebarRename();
   const response = await fetch("/api/conversations");
   const list = await response.json();
   sidebarList.innerHTML = "";
@@ -1952,13 +1956,18 @@ async function loadSidebar() {
     item.dataset.id = conversation.id;
     item.innerHTML =
       `<span class="sidebar-title">${escHtml(conversation.title)}</span>` +
+      `<button class="sidebar-edit" title="Rename" aria-label="Rename" data-id="${conversation.id}">` +
+      `  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">` +
+      `    <path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/>` +
+      `  </svg>` +
+      `</button>` +
       `<button class="sidebar-del" title="Delete" data-id="${conversation.id}">` +
       `  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">` +
       `    <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>` +
       `  </svg>` +
       `</button>`;
     item.addEventListener("click", (event) => {
-      if (event.target.closest(".sidebar-del")) {
+      if (event.target.closest(".sidebar-del") || event.target.closest(".sidebar-edit")) {
         return;
       }
       if (conversation.id !== currentConvId) {
@@ -1966,12 +1975,137 @@ async function loadSidebar() {
         closeSidebarOnMobile();
       }
     });
+    item.querySelector(".sidebar-edit").addEventListener("click", (event) => {
+      event.stopPropagation();
+      startSidebarRename(conversation, item);
+    });
     item.querySelector(".sidebar-del").addEventListener("click", (event) => {
       event.stopPropagation();
+      if (!window.confirm("Bu sohbeti silmek istediğinizden emin misiniz?")) {
+        return;
+      }
       deleteConversation(conversation.id);
     });
     sidebarList.appendChild(item);
   });
+}
+
+function updateConversationTitleInState(conversationId, title) {
+  const normalizedTitle = String(title || "New Chat").trim() || "New Chat";
+  if (Number(conversationId) === Number(currentConvId)) {
+    currentConvTitle = normalizedTitle;
+    updateExportPanel();
+  }
+}
+
+function cancelSidebarRename() {
+  if (!activeSidebarRename) {
+    return;
+  }
+
+  const { item, originalTitle } = activeSidebarRename;
+  const titleInput = item.querySelector(".sidebar-title-input");
+  if (titleInput) {
+    titleInput.replaceWith(createSidebarTitleSpan(originalTitle));
+  }
+  item.classList.remove("editing");
+  activeSidebarRename = null;
+}
+
+function createSidebarTitleSpan(title) {
+  const span = document.createElement("span");
+  span.className = "sidebar-title";
+  span.textContent = String(title || "New Chat").trim() || "New Chat";
+  return span;
+}
+
+function startSidebarRename(conversation, item) {
+  if (!conversation || !item) {
+    return;
+  }
+
+  if (activeSidebarRename && activeSidebarRename.item !== item) {
+    cancelSidebarRename();
+  }
+
+  const titleNode = item.querySelector(".sidebar-title");
+  if (!titleNode || item.querySelector(".sidebar-title-input")) {
+    return;
+  }
+
+  const originalTitle = String(conversation.title || "New Chat").trim() || "New Chat";
+  const titleInput = document.createElement("input");
+  titleInput.type = "text";
+  titleInput.className = "sidebar-title-input";
+  titleInput.value = originalTitle;
+  titleInput.spellcheck = false;
+  titleInput.autocomplete = "off";
+  titleInput.setAttribute("aria-label", "Rename conversation");
+
+  item.classList.add("editing");
+  titleNode.replaceWith(titleInput);
+  activeSidebarRename = {
+    item,
+    conversationId: conversation.id,
+    originalTitle,
+    committing: false,
+  };
+
+  const submitRename = async () => {
+    if (!activeSidebarRename || activeSidebarRename.item !== item || activeSidebarRename.committing) {
+      return;
+    }
+
+    const nextTitle = titleInput.value.trim();
+    if (!nextTitle) {
+      cancelSidebarRename();
+      return;
+    }
+
+    activeSidebarRename.committing = true;
+    try {
+      const response = await fetch(`/api/conversations/${conversation.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: nextTitle }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data.error || "Unable to rename conversation.");
+      }
+
+      updateConversationTitleInState(conversation.id, data.title || nextTitle);
+      activeSidebarRename = null;
+      await loadSidebar();
+    } catch (error) {
+      activeSidebarRename = null;
+      showError(error.message || "Unable to rename conversation.");
+      await loadSidebar();
+    }
+  };
+
+  const cancelRename = () => {
+    if (!activeSidebarRename || activeSidebarRename.item !== item || activeSidebarRename.committing) {
+      return;
+    }
+    cancelSidebarRename();
+  };
+
+  titleInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      submitRename();
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      cancelRename();
+    }
+  });
+  titleInput.addEventListener("blur", () => {
+    window.setTimeout(cancelRename, 0);
+  });
+
+  titleInput.focus();
+  titleInput.select();
 }
 
 async function openConversation(id) {
@@ -3678,6 +3812,7 @@ async function sendMessage(options = {}) {
           id: String(document.id || "").trim(),
           title: String(document.title || "Canvas").trim() || "Canvas",
           format: String(document.format || "markdown").trim() || "markdown",
+          language: String(document.language || "").trim().toLowerCase(),
           content: String(document.content || ""),
           line_count: Number.isInteger(Number(document.line_count)) ? Number(document.line_count) : String(document.content || "").split("\n").length,
         })).filter((document) => document.id) : [];
@@ -3846,7 +3981,11 @@ async function sendMessage(options = {}) {
 
 async function generateTitle(convId) {
   try {
-    await fetch(`/api/conversations/${convId}/generate-title`, { method: "POST" });
+    const response = await fetch(`/api/conversations/${convId}/generate-title`, { method: "POST" });
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      console.warn(data.error || "Conversation title generation failed.");
+    }
   } finally {
     loadSidebar();
   }

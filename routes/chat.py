@@ -78,6 +78,7 @@ from rag_service import build_rag_auto_context, build_tool_memory_auto_context
 from rag_service import sync_conversations_to_rag_safe
 from routes.request_utils import is_valid_model_id, normalize_model_id, parse_messages_payload, parse_optional_int
 from token_utils import estimate_text_tokens
+from tool_registry import resolve_runtime_tool_names
 from vision import preload_local_ocr_engine, read_uploaded_image, run_image_vision_analysis
 
 
@@ -153,6 +154,51 @@ def _looks_related_to_source(title: str, source_text: str) -> bool:
         return False
 
     return any(token in source_tokens for token in title_tokens)
+
+
+def _build_fallback_title_from_source(source_text: str) -> str:
+    stopwords = {
+        "a",
+        "an",
+        "and",
+        "are",
+        "be",
+        "can",
+        "for",
+        "from",
+        "how",
+        "i",
+        "in",
+        "is",
+        "it",
+        "me",
+        "my",
+        "need",
+        "of",
+        "on",
+        "or",
+        "please",
+        "short",
+        "title",
+        "the",
+        "to",
+        "up",
+        "use",
+        "what",
+        "with",
+        "you",
+        "your",
+    }
+    tokens = [
+        token
+        for token in re.findall(r"[^\W_]+", str(source_text or "").lower(), flags=re.UNICODE)
+        if len(token) > 2 and token not in stopwords
+    ]
+    if not tokens:
+        return ""
+
+    title = " ".join(token.capitalize() for token in tokens[:4]).strip()
+    return _normalize_generated_title(title)
 
 
 def _get_summary_lock(conversation_id: int) -> Lock:
@@ -662,15 +708,18 @@ def _build_budgeted_prompt_messages(
     active_tool_names: list[str],
     retrieved_context: dict | None,
     tool_memory_context: str | None,
+    canvas_documents: list[dict] | None = None,
 ) -> tuple[list[dict], dict]:
+    runtime_tool_names = resolve_runtime_tool_names(active_tool_names, canvas_documents=canvas_documents)
     prompt_budget = max(2_000, get_prompt_max_input_tokens(settings) - get_prompt_response_token_reserve(settings))
     base_runtime_message = prepend_runtime_context(
         [],
         settings["user_preferences"],
-        active_tool_names,
+        runtime_tool_names,
         retrieved_context=None,
         tool_memory_context=None,
         scratchpad=settings.get("scratchpad", ""),
+        canvas_documents=canvas_documents,
     )[0]
     base_system_tokens = estimate_text_tokens(str(base_runtime_message.get("content") or ""))
     history_budget = max(1_000, prompt_budget - base_system_tokens)
@@ -709,10 +758,11 @@ def _build_budgeted_prompt_messages(
     api_messages = prepend_runtime_context(
         prompt_history_api,
         settings["user_preferences"],
-        active_tool_names,
+        runtime_tool_names,
         retrieved_context=rag_context,
         tool_memory_context=trimmed_tool_memory,
         scratchpad=settings.get("scratchpad", ""),
+        canvas_documents=canvas_documents,
     )
 
     stats = {
@@ -1479,18 +1529,20 @@ def register_chat_routes(app) -> None:
             if get_tool_memory_auto_inject_enabled(settings)
             else None
         )
-        api_messages, prompt_budget_stats = _build_budgeted_prompt_messages(
-            canonical_messages,
-            settings,
-            active_tool_names,
-            retrieved_context,
-            tool_memory_context,
-        )
         initial_canvas_documents = find_latest_canvas_documents(canonical_messages)
         if pre_created_canvas_state is not None:
             pre_docs = get_canvas_runtime_documents(pre_created_canvas_state)
             if pre_docs:
                 initial_canvas_documents = pre_docs
+        runtime_tool_names = resolve_runtime_tool_names(active_tool_names, canvas_documents=initial_canvas_documents)
+        api_messages, prompt_budget_stats = _build_budgeted_prompt_messages(
+            canonical_messages,
+            settings,
+            runtime_tool_names,
+            retrieved_context,
+            tool_memory_context,
+            canvas_documents=initial_canvas_documents,
+        )
 
         defer_post_response_tasks = not current_app.testing
 
@@ -1561,7 +1613,7 @@ def register_chat_routes(app) -> None:
                 api_messages,
                 model,
                 max_steps,
-                active_tool_names,
+                runtime_tool_names,
                 fetch_url_token_threshold=fetch_url_token_threshold,
                 fetch_url_clip_aggressiveness=fetch_url_clip_aggressiveness,
                 initial_canvas_documents=initial_canvas_documents,
@@ -1838,15 +1890,25 @@ def register_chat_routes(app) -> None:
             },
         ]
 
-        result = collect_agent_response(
-            prompt,
-            "deepseek-chat",
-            1,
-            [],
-        )
         source_text = " ".join(str(message["content"] or "") for message in title_source_messages)
+        try:
+            result = collect_agent_response(
+                prompt,
+                "deepseek-chat",
+                1,
+                [],
+            )
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            LOGGER.warning("Title generation failed for conversation %s: %s", conv_id, exc)
+            result = {"content": "", "errors": [str(exc)]}
+
         title = _normalize_generated_title(result.get("content") or "")
-        if not title or not _looks_related_to_source(title, source_text):
+        if not title:
+            if result.get("errors"):
+                title = _build_fallback_title_from_source(source_text)
+            if not title:
+                title = TITLE_FALLBACK
+        elif not _looks_related_to_source(title, source_text):
             title = TITLE_FALLBACK
 
         with get_db() as conn:

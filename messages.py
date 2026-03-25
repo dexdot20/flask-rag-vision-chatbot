@@ -3,15 +3,18 @@ from __future__ import annotations
 import json
 from datetime import datetime
 
+from canvas_service import extract_canvas_documents
 from config import (
     MAX_SCRATCHPAD_LENGTH,
     MAX_USER_PREFERENCES_LENGTH,
     RAG_ENABLED,
 )
 from db import parse_message_metadata, parse_message_tool_calls
-from tool_registry import get_prompt_tool_context
+from tool_registry import get_prompt_tool_context, resolve_runtime_tool_names
 
 SUMMARY_LABEL = "Conversation summary (generated from deleted messages):"
+CANVAS_PROMPT_MAX_CHARS = 12_000
+CANVAS_PROMPT_MAX_LINES = 400
 
 
 def _build_image_policy_payload(active_tool_names: list[str]) -> dict | None:
@@ -175,8 +178,41 @@ def build_api_messages(messages: list[dict]) -> list[dict]:
     return api_messages
 
 
-def build_tool_call_contract(active_tool_names: list[str]) -> dict | None:
-    tools = get_prompt_tool_context(active_tool_names)
+def _build_canvas_prompt_payload(canvas_documents) -> dict | None:
+    documents = extract_canvas_documents({"canvas_documents": canvas_documents or []})
+    if not documents:
+        return None
+
+    active_document = documents[-1]
+    content = str(active_document.get("content") or "")
+    all_lines = content.split("\n") if content else []
+    visible_lines = []
+    visible_char_count = 0
+
+    for index, line in enumerate(all_lines, start=1):
+        numbered_line = f"{index}: {line}"
+        extra_chars = len(numbered_line) + (1 if visible_lines else 0)
+        if visible_lines and (len(visible_lines) >= CANVAS_PROMPT_MAX_LINES or visible_char_count + extra_chars > CANVAS_PROMPT_MAX_CHARS):
+            break
+        if not visible_lines and extra_chars > CANVAS_PROMPT_MAX_CHARS:
+            visible_lines.append(numbered_line[:CANVAS_PROMPT_MAX_CHARS])
+            visible_char_count = len(visible_lines[0])
+            break
+        visible_lines.append(numbered_line)
+        visible_char_count += extra_chars
+
+    return {
+        "document_count": len(documents),
+        "active_document": active_document,
+        "visible_lines": visible_lines,
+        "is_truncated": len(visible_lines) < len(all_lines),
+        "visible_line_end": len(visible_lines),
+        "total_lines": int(active_document.get("line_count") or len(all_lines)),
+    }
+
+
+def build_tool_call_contract(active_tool_names: list[str], canvas_documents=None) -> dict | None:
+    tools = get_prompt_tool_context(active_tool_names, canvas_documents=canvas_documents)
     if not tools:
         return None
     return {
@@ -195,11 +231,12 @@ def build_runtime_system_message(
     tool_memory_context=None,
     now=None,
     scratchpad="",
+    canvas_documents=None,
 ):
     now = (now or datetime.now().astimezone()).astimezone()
     preferences_text = (user_preferences or "").strip()[:MAX_USER_PREFERENCES_LENGTH]
     scratchpad_text = (scratchpad or "").strip()[:MAX_SCRATCHPAD_LENGTH]
-    active_tool_names = active_tool_names or []
+    active_tool_names = resolve_runtime_tool_names(active_tool_names or [], canvas_documents=canvas_documents)
     offset = now.strftime("%z")
     timezone_label = f"UTC{offset[:3]}:{offset[3:]}" if offset else (now.tzname() or "UTC")
     
@@ -269,13 +306,37 @@ def build_runtime_system_message(
     if policies:
         parts.append("## Important Policies\n" + "\n".join(f"- {p}" for p in policies) + "\n")
 
+    canvas_payload = _build_canvas_prompt_payload(canvas_documents)
+    if canvas_payload:
+        active_document = canvas_payload["active_document"]
+        parts.append("## Active Canvas Document")
+        parts.append(f"- Document count: {canvas_payload['document_count']}")
+        parts.append(f"- Active document id: {active_document['id']}")
+        parts.append(f"- Title: {active_document['title']}")
+        parts.append(f"- Format: {active_document['format']}")
+        if active_document.get("language"):
+            parts.append(f"- Language: {active_document['language']}")
+        parts.append(f"- Total lines: {canvas_payload['total_lines']}")
+        parts.append(
+            f"- Visible lines in prompt: 1-{canvas_payload['visible_line_end']}"
+            + (" (truncated excerpt)" if canvas_payload["is_truncated"] else "")
+        )
+        parts.append(
+            "- Guidance: Use the visible line numbers for line-level canvas edits. "
+            "If the required region is outside the visible excerpt, prefer rewrite_canvas_document over guessing line numbers."
+        )
+        if canvas_payload["visible_lines"]:
+            parts.append("```json\n" + json.dumps(canvas_payload["visible_lines"], ensure_ascii=False, indent=2) + "\n```\n")
+        else:
+            parts.append("(The active canvas document is empty.)\n")
+
     # Tool capabilities
-    tools = get_prompt_tool_context(active_tool_names) if active_tool_names else None
+    tools = get_prompt_tool_context(active_tool_names, canvas_documents=canvas_documents) if active_tool_names else None
     if tools:
         parts.append("## Available Tools")
         parts.append("You have access to the following tools:\n```json\n" + json.dumps(tools, ensure_ascii=False, indent=2) + "\n```\n")
         
-        contract = build_tool_call_contract(active_tool_names)
+        contract = build_tool_call_contract(active_tool_names, canvas_documents=canvas_documents)
         if contract:
             parts.append("### How to Call Tools")
             for rule in contract["rules"]:
@@ -295,6 +356,7 @@ def prepend_runtime_context(
     retrieved_context=None,
     tool_memory_context=None,
     scratchpad="",
+    canvas_documents=None,
 ):
     summary_count = sum(1 for message in messages if message.get("role") == "summary")
     runtime_message = build_runtime_system_message(
@@ -303,6 +365,7 @@ def prepend_runtime_context(
         retrieved_context=retrieved_context,
         tool_memory_context=tool_memory_context,
         scratchpad=scratchpad,
+        canvas_documents=canvas_documents,
     )
     
     system_content = runtime_message["content"]

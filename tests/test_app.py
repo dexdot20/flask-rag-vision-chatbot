@@ -50,7 +50,7 @@ from routes.chat import (
     _select_summary_source_messages_by_token_budget,
     build_summary_prompt_messages,
 )
-from tool_registry import TOOL_SPEC_BY_NAME
+from tool_registry import TOOL_SPEC_BY_NAME, get_openai_tool_specs
 from web_tools import (
     _extract_html,
     fetch_url_tool,
@@ -464,6 +464,63 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn("Remembered web result", content)
         self.assertIn("Knowledge Base", content)
         self.assertIn("Context block", content)
+
+    def test_runtime_system_message_hides_canvas_edit_tools_without_canvas_document(self):
+        message = build_runtime_system_message(
+            active_tool_names=[
+                "create_canvas_document",
+                "rewrite_canvas_document",
+                "replace_canvas_lines",
+                "insert_canvas_lines",
+                "delete_canvas_lines",
+                "delete_canvas_document",
+                "clear_canvas",
+            ],
+        )
+
+        content = message["content"]
+        self.assertIn('"name": "create_canvas_document"', content)
+        self.assertNotIn('"name": "rewrite_canvas_document"', content)
+        self.assertNotIn('"name": "replace_canvas_lines"', content)
+        self.assertNotIn('"name": "clear_canvas"', content)
+
+    def test_runtime_system_message_includes_active_canvas_document_context(self):
+        message = build_runtime_system_message(
+            active_tool_names=[
+                "create_canvas_document",
+                "rewrite_canvas_document",
+                "replace_canvas_lines",
+            ],
+            canvas_documents=[
+                {
+                    "id": "canvas-1",
+                    "title": "main.py",
+                    "format": "markdown",
+                    "language": "python",
+                    "content": "print('hello')\nprint('world')",
+                }
+            ],
+        )
+
+        content = message["content"]
+        self.assertIn("## Active Canvas Document", content)
+        self.assertIn("- Language: python", content)
+        self.assertIn("1: print('hello')", content)
+        self.assertIn("2: print('world')", content)
+        self.assertIn('"name": "replace_canvas_lines"', content)
+
+    def test_openai_tool_specs_hide_canvas_edit_tools_without_canvas_document(self):
+        tools = get_openai_tool_specs(
+            [
+                "create_canvas_document",
+                "rewrite_canvas_document",
+                "replace_canvas_lines",
+                "clear_canvas",
+            ]
+        )
+
+        tool_names = [entry["function"]["name"] for entry in tools]
+        self.assertEqual(tool_names, ["create_canvas_document"])
 
     def test_prepend_runtime_context_places_datetime_system_message_first(self):
         messages = prepend_runtime_context(
@@ -1116,6 +1173,17 @@ class AppRoutesTestCase(unittest.TestCase):
 
         response = self.client.get(f"/api/conversations/{conversation_id}")
         self.assertEqual(response.status_code, 404)
+
+    def test_update_conversation_title_rejects_blank_values(self):
+        conversation_id = self._create_conversation()
+
+        response = self.client.patch(
+            f"/api/conversations/{conversation_id}",
+            json={"title": "   "},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()["error"], "Title required.")
 
     def test_rag_endpoints_safe_defaults(self):
         response = self.client.get("/api/rag/documents")
@@ -1808,6 +1876,19 @@ class AppRoutesTestCase(unittest.TestCase):
         )
 
         self.assertEqual(normalized["title"], "Canvas")
+
+    def test_normalize_canvas_document_preserves_language_metadata(self):
+        normalized = normalize_canvas_document(
+            {
+                "id": "canvas-python",
+                "title": "script.py",
+                "format": "markdown",
+                "language": " Python ",
+                "content": "print('hello')",
+            }
+        )
+
+        self.assertEqual(normalized["language"], "python")
 
     def test_run_agent_stream_executes_native_tool_calls(self):
         responses = [
@@ -2941,9 +3022,9 @@ class AppRoutesTestCase(unittest.TestCase):
             ]
         )
 
-        with patch("routes.chat.collect_agent_response", return_value=fake_summary), patch(
-            "routes.chat.run_agent_stream", return_value=fake_events
-        ), patch("routes.chat.sync_conversations_to_rag_safe"):
+        with patch("routes.chat.get_prompt_preflight_summary_token_count", return_value=1000), patch(
+            "routes.chat.collect_agent_response", return_value=fake_summary
+        ), patch("routes.chat.run_agent_stream", return_value=fake_events), patch("routes.chat.sync_conversations_to_rag_safe"):
             response = self.client.post(
                 "/chat",
                 json={
@@ -3069,9 +3150,9 @@ class AppRoutesTestCase(unittest.TestCase):
             ]
         )
 
-        with patch("routes.chat.collect_agent_response", return_value=fake_summary), patch(
-            "routes.chat.run_agent_stream", return_value=fake_events
-        ), patch("routes.chat.sync_conversations_to_rag_safe"):
+        with patch("routes.chat.get_prompt_preflight_summary_token_count", return_value=1000), patch(
+            "routes.chat.collect_agent_response", return_value=fake_summary
+        ), patch("routes.chat.run_agent_stream", return_value=fake_events), patch("routes.chat.sync_conversations_to_rag_safe"):
             response = self.client.post(
                 "/chat",
                 json={
@@ -3158,9 +3239,9 @@ class AppRoutesTestCase(unittest.TestCase):
             ]
         )
 
-        with patch("routes.chat.collect_agent_response", return_value=fake_summary), patch(
-            "routes.chat.run_agent_stream", return_value=fake_events
-        ), patch("routes.chat.sync_conversations_to_rag_safe"):
+        with patch("routes.chat.get_prompt_preflight_summary_token_count", return_value=1000), patch(
+            "routes.chat.collect_agent_response", return_value=fake_summary
+        ), patch("routes.chat.run_agent_stream", return_value=fake_events), patch("routes.chat.sync_conversations_to_rag_safe"):
             response = self.client.post(
                 "/chat",
                 json={
@@ -3823,6 +3904,24 @@ class AppRoutesTestCase(unittest.TestCase):
             row = conn.execute("SELECT title FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
         self.assertEqual(row["title"], "New Chat")
 
+    def test_generate_title_uses_source_fallback_when_model_errors(self):
+        conversation_id = self._create_conversation(title="Untitled")
+        with get_db() as conn:
+            conn.execute(
+                "INSERT INTO messages (conversation_id, role, content, metadata) VALUES (?, 'user', ?, ?)",
+                (conversation_id, "python list sorting", None),
+            )
+
+        with patch("routes.chat.collect_agent_response", side_effect=RuntimeError("model unavailable")):
+            response = self.client.post(f"/api/conversations/{conversation_id}/generate-title")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["title"], "Python List Sorting")
+
+        with get_db() as conn:
+            row = conn.execute("SELECT title FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
+        self.assertEqual(row["title"], "Python List Sorting")
+
     def test_generate_title_uses_minimal_prompt_without_runtime_context_or_tools(self):
         """Root-cause regression test: generate_title must NOT inject runtime context or tools."""
         conversation_id = self._create_conversation(title="Untitled")
@@ -4411,9 +4510,9 @@ class AppRoutesTestCase(unittest.TestCase):
             ]
         )
 
-        with patch("routes.chat.collect_agent_response", return_value=fake_summary), patch(
-            "routes.chat.run_agent_stream", return_value=fake_events
-        ), patch("routes.chat.sync_conversations_to_rag_safe"):
+        with patch("routes.chat.get_prompt_preflight_summary_token_count", return_value=1000), patch(
+            "routes.chat.collect_agent_response", return_value=fake_summary
+        ), patch("routes.chat.run_agent_stream", return_value=fake_events), patch("routes.chat.sync_conversations_to_rag_safe"):
             response = self.client.post(
                 "/chat",
                 json={
@@ -4473,11 +4572,11 @@ class AppRoutesTestCase(unittest.TestCase):
             ]
         )
 
-        with patch("routes.chat.collect_agent_response", return_value=fake_summary), patch(
-            "routes.chat.run_agent_stream", return_value=fake_events
-        ), patch("routes.chat.SUMMARY_EXECUTOR.submit") as mocked_summary_submit, patch(
-            "routes.chat.sync_conversations_to_rag_safe"
-        ):
+        with patch("routes.chat.get_prompt_preflight_summary_token_count", return_value=1000), patch(
+            "routes.chat.collect_agent_response", return_value=fake_summary
+        ), patch("routes.chat.run_agent_stream", return_value=fake_events), patch(
+            "routes.chat.SUMMARY_EXECUTOR.submit"
+        ) as mocked_summary_submit, patch("routes.chat.sync_conversations_to_rag_safe"):
             response = self.client.post(
                 "/chat",
                 json={

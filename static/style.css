@@ -1333,6 +1333,7 @@ kbd {
   color: var(--text-primary);
 }
 
+.sidebar-edit,
 .sidebar-del {
   display: none;
   background: transparent;
@@ -1346,16 +1347,53 @@ kbd {
   transition: color 0.15s, background 0.15s;
 }
 
+.sidebar-item:hover .sidebar-edit,
 .sidebar-item:hover .sidebar-del,
+.sidebar-item.active .sidebar-edit,
 .sidebar-item.active .sidebar-del {
   display: flex;
   align-items: center;
   justify-content: center;
 }
 
+.sidebar-item.editing .sidebar-edit,
+.sidebar-item.editing .sidebar-del {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.sidebar-edit:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.06);
+}
+
 .sidebar-del:hover {
   color: var(--danger);
   background: rgba(224, 85, 85, 0.1);
+}
+
+.sidebar-item.editing {
+  background: rgba(79, 110, 247, 0.08);
+}
+
+.sidebar-title-input {
+  flex: 1;
+  min-width: 0;
+  width: 100%;
+  border: 1px solid rgba(79, 110, 247, 0.28);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-primary);
+  font-size: 0.82rem;
+  line-height: 1.2;
+  padding: 5px 8px;
+  outline: none;
+}
+
+.sidebar-title-input:focus {
+  border-color: rgba(79, 110, 247, 0.55);
+  box-shadow: 0 0 0 2px rgba(79, 110, 247, 0.12);
 }
 
 .sidebar-overlay {

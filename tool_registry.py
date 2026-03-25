@@ -5,6 +5,15 @@ import json
 
 from config import RAG_ENABLED
 
+CANVAS_DOCUMENT_TOOL_NAMES = {
+    "rewrite_canvas_document",
+    "replace_canvas_lines",
+    "insert_canvas_lines",
+    "delete_canvas_lines",
+    "delete_canvas_document",
+    "clear_canvas",
+}
+
 TOOL_SPECS = [
     {
         "name": "append_scratchpad",
@@ -385,6 +394,10 @@ TOOL_SPECS = [
                     "type": "string",
                     "enum": ["markdown"],
                     "description": "Canvas document format. Only markdown is currently supported."
+                },
+                "language": {
+                    "type": "string",
+                    "description": "Optional dominant code language for the document, such as python, javascript, or sql."
                 }
             },
             "required": ["title", "content"]
@@ -394,7 +407,8 @@ TOOL_SPECS = [
             "inputs": {
                 "title": "document title",
                 "content": "full markdown body",
-                "format": "currently markdown"
+                "format": "currently markdown",
+                "language": "optional dominant code language"
             },
             "guidance": (
                 "Use this when the user would benefit from a persistent artifact that can be revised. "
@@ -416,6 +430,10 @@ TOOL_SPECS = [
                     "type": "string",
                     "description": "Optional replacement title."
                 },
+                "language": {
+                    "type": "string",
+                    "description": "Optional dominant code language for the updated document."
+                },
                 "document_id": {
                     "type": "string",
                     "description": "Optional target canvas document id. Defaults to the active document."
@@ -425,7 +443,7 @@ TOOL_SPECS = [
         },
         "prompt": {
             "purpose": "Replaces the full content of an existing canvas document.",
-            "inputs": {"content": "full markdown body", "title": "optional title", "document_id": "optional target id"},
+            "inputs": {"content": "full markdown body", "title": "optional title", "language": "optional dominant code language", "document_id": "optional target id"},
         },
     },
     {
@@ -539,9 +557,17 @@ def get_enabled_tool_specs(active_tool_names: list[str]) -> list[dict]:
     return specs
 
 
-def get_openai_tool_specs(active_tool_names: list[str]) -> list[dict]:
+def resolve_runtime_tool_names(active_tool_names: list[str], canvas_documents: list[dict] | None = None) -> list[str]:
+    names = list(active_tool_names or [])
+    if canvas_documents:
+        return names
+    return [name for name in names if name not in CANVAS_DOCUMENT_TOOL_NAMES]
+
+
+def get_openai_tool_specs(active_tool_names: list[str], canvas_documents: list[dict] | None = None) -> list[dict]:
     specs = []
-    for tool in get_enabled_tool_specs(active_tool_names):
+    runtime_tool_names = resolve_runtime_tool_names(active_tool_names, canvas_documents=canvas_documents)
+    for tool in get_enabled_tool_specs(runtime_tool_names):
         parameters = copy.deepcopy(tool.get("parameters") or {})
         if parameters.get("type") == "object":
             parameters.setdefault("additionalProperties", False)
@@ -568,9 +594,10 @@ def _compact_arg_type(arg_props: dict) -> str:
     return arg_type
 
 
-def get_prompt_tool_context(active_tool_names: list[str]) -> list[dict] | None:
+def get_prompt_tool_context(active_tool_names: list[str], canvas_documents: list[dict] | None = None) -> list[dict] | None:
     tools = []
-    for tool in get_enabled_tool_specs(active_tool_names):
+    runtime_tool_names = resolve_runtime_tool_names(active_tool_names, canvas_documents=canvas_documents)
+    for tool in get_enabled_tool_specs(runtime_tool_names):
         parameters = tool.get("parameters") if isinstance(tool.get("parameters"), dict) else {}
         properties = parameters.get("properties") if isinstance(parameters.get("properties"), dict) else {}
         required = parameters.get("required") if isinstance(parameters.get("required"), list) else []

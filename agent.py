@@ -991,6 +991,7 @@ def _run_create_canvas_document(tool_args: dict, runtime_state: dict):
         title=tool_args.get("title", "Canvas"),
         content=tool_args.get("content", ""),
         format_name=tool_args.get("format", "markdown"),
+        language_name=tool_args.get("language"),
     )
     return build_canvas_tool_result(document, action="created"), f"Canvas created: {document['title']}"
 
@@ -1002,6 +1003,7 @@ def _run_rewrite_canvas_document(tool_args: dict, runtime_state: dict):
         content=tool_args.get("content", ""),
         document_id=tool_args.get("document_id"),
         title=tool_args.get("title"),
+        language_name=tool_args.get("language"),
     )
     return build_canvas_tool_result(document, action="rewritten"), f"Canvas updated: {document['title']}"
 
@@ -1439,7 +1441,8 @@ def run_agent_stream(
             "stream_options": {"include_usage": True},
         }
         if allow_tools:
-            turn_tools = get_openai_tool_specs(enabled_tool_names)
+            current_canvas_documents = get_canvas_runtime_documents(runtime_state.get("canvas"))
+            turn_tools = get_openai_tool_specs(enabled_tool_names, canvas_documents=current_canvas_documents)
             if turn_tools:
                 request_kwargs["tools"] = turn_tools
                 request_kwargs["tool_choice"] = "auto"
