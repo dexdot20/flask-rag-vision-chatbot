@@ -1,0 +1,46 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+venv/
+.venv/
+
+# Local data stores and generated artifacts
+chatbot.db
+*.db
+*.db-shm
+*.db-wal
+chroma_db/
+data/
+logs/
+models/
+
+# Local config and secrets files
+proxies.txt
+
+# Project / editor generated files
+.github/
+.vscode/
+.idea/
+*.orig
+*.rej
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Other
+AGENTS.MD

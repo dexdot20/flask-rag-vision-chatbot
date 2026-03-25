@@ -10,7 +10,7 @@
   <script src="https://cdn.jsdelivr.net/npm/dompurify/dist/purify.min.js"></script>
   <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
 </head>
-<body>
+<body data-page="chat">
 
 <header>
   <div class="header-left">
@@ -39,7 +39,7 @@
       <span id="canvas-btn-indicator" class="canvas-btn-indicator" hidden aria-hidden="true"></span>
     </button>
     <button class="btn-ghost" id="export-btn" type="button">Export</button>
-    <button class="btn-ghost" id="settings-btn">Settings</button>
+    <a class="btn-ghost" id="settings-btn" href="/settings">Settings</a>
     <button class="btn-tokens" id="tokens-btn" title="Token usage and cost">
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>
@@ -73,7 +73,7 @@
   </div>
   <div class="mobile-tools-panel__section mobile-tools-panel__section--actions">
     <button class="mobile-tools-action" id="mobile-export-btn" type="button">Export chat</button>
-    <button class="mobile-tools-action" id="mobile-settings-btn" type="button">Settings</button>
+    <a class="mobile-tools-action" id="mobile-settings-btn" href="/settings">Settings</a>
     <button class="mobile-tools-action" id="mobile-tokens-btn" type="button">Usage &amp; cost</button>
   </div>
 </div>
@@ -196,152 +196,6 @@
   </div>
 </div>
 <div id="stats-overlay" class="stats-overlay"></div>
-
-<div id="settings-panel" class="settings-panel" aria-hidden="true">
-  <div class="settings-panel-header">
-    <span>Settings</span>
-    <button id="settings-close" title="Close">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
-        <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-      </svg>
-    </button>
-  </div>
-
-  <div class="settings-section">
-    <div class="settings-section-title">AI Preferences</div>
-    <p class="settings-copy">Saved here once, applied automatically on every message, and injected into the runtime system prompt as user preferences.</p>
-    <label class="settings-label" for="preferences-input">Response preferences</label>
-    <textarea id="preferences-input" rows="8" placeholder="Example: Reply in English, keep answers concise, and use bullet points when useful."></textarea>
-    <label class="settings-label" for="max-steps-input">Web search step limit (1–10)</label>
-    <input type="number" class="settings-number" id="max-steps-input" min="1" max="10" value="5" />
-    <label class="settings-label" for="summary-mode-select">Conversation summary mode</label>
-    <select id="summary-mode-select">
-      <option value="auto">Auto</option>
-      <option value="never">Never</option>
-      <option value="aggressive">Aggressive</option>
-    </select>
-    <label class="settings-label" for="summary-trigger-input">Conversation summary trigger in visible tokens (1000–200000)</label>
-    <input type="number" class="settings-number" id="summary-trigger-input" min="1000" max="200000" value="80000" />
-    <label class="settings-label" for="summary-skip-first-input">Protect first N messages from summary (0–20)</label>
-    <input type="number" class="settings-number" id="summary-skip-first-input" min="0" max="20" value="2" />
-    <label class="settings-label" for="summary-skip-last-input">Protect last N messages from summary (0–20)</label>
-    <input type="number" class="settings-number" id="summary-skip-last-input" min="0" max="20" value="1" />
-    <div class="summary-inspector" id="summary-inspector">
-      <div class="summary-inspector__header">
-        <span class="settings-label">Summary process</span>
-        <span class="summary-inspector__badge" id="summary-inspector-badge" data-tone="muted">Waiting</span>
-      </div>
-      <p class="summary-inspector__headline" id="summary-inspector-headline">Start chatting to see when automatic summary will run.</p>
-      <div class="summary-inspector__grid">
-        <div class="summary-inspector__metric">
-          <span>Counted now</span>
-          <strong id="summary-inspector-current">0</strong>
-        </div>
-        <div class="summary-inspector__metric">
-          <span>Trigger</span>
-          <strong id="summary-inspector-trigger">80,000</strong>
-        </div>
-        <div class="summary-inspector__metric">
-          <span>Gap</span>
-          <strong id="summary-inspector-gap">80,000 left</strong>
-        </div>
-      </div>
-      <p class="summary-inspector__detail" id="summary-inspector-detail">Counts user, assistant, tool, and summary history. Runtime system prompt, RAG context, and final-answer instructions are excluded.</p>
-      <p class="summary-inspector__detail" id="summary-inspector-reason">The latest summary decision will appear here after each completed assistant turn.</p>
-      <p class="summary-inspector__detail" id="summary-inspector-last">No summary pass has run in this conversation yet.</p>
-      <div class="summary-inspector__actions">
-        <button id="summary-now-btn" class="btn-ghost" type="button">Summarize now</button>
-        <button id="summary-undo-btn" class="btn-ghost" type="button">Undo last summary</button>
-      </div>
-    </div>
-    <label class="settings-label" for="fetch-threshold-input">Fetch URL clipping threshold in tokens (400–20000)</label>
-    <input type="number" class="settings-number" id="fetch-threshold-input" min="400" max="20000" value="3500" />
-    <label class="settings-label" for="fetch-aggressiveness-input">Fetch clipping aggressiveness (0–100)</label>
-    <input type="number" class="settings-number" id="fetch-aggressiveness-input" min="0" max="100" value="50" />
-    <label class="settings-label">Tool permissions</label>
-    <p class="settings-copy">Only selected tools are exposed in the runtime prompt contract and only they can be executed.</p>
-    <div class="tool-toggles" id="tool-toggles">
-      <label class="tool-toggle"><input type="checkbox" value="append_scratchpad" /> <span>Append persistent scratchpad</span></label>
-      <label class="tool-toggle"><input type="checkbox" value="ask_clarifying_question" /> <span>Ask interactive clarification questions</span></label>
-      <label class="tool-toggle"><input type="checkbox" value="image_explain" /> <span>Follow up on stored images</span></label>
-      <label class="tool-toggle"><input type="checkbox" value="search_knowledge_base" /> <span>Knowledge base search</span></label>
-      <label class="tool-toggle"><input type="checkbox" value="search_tool_memory" /> <span>Search tool memory</span></label>
-      <label class="tool-toggle"><input type="checkbox" value="search_web" /> <span>Web search</span></label>
-      <label class="tool-toggle"><input type="checkbox" value="fetch_url" /> <span>Read URL content</span></label>
-      <label class="tool-toggle"><input type="checkbox" value="search_news_ddgs" /> <span>Search news (DDGS)</span></label>
-      <label class="tool-toggle"><input type="checkbox" value="search_news_google" /> <span>Search news (Google)</span></label>
-      <label class="tool-toggle"><input type="checkbox" value="create_canvas_document" /> <span>Create canvas document</span></label>
-      <label class="tool-toggle"><input type="checkbox" value="rewrite_canvas_document" /> <span>Rewrite canvas document</span></label>
-      <label class="tool-toggle"><input type="checkbox" value="replace_canvas_lines" /> <span>Replace canvas lines</span></label>
-      <label class="tool-toggle"><input type="checkbox" value="insert_canvas_lines" /> <span>Insert canvas lines</span></label>
-      <label class="tool-toggle"><input type="checkbox" value="delete_canvas_lines" /> <span>Delete canvas lines</span></label>
-    </div>
-    <div class="settings-actions">
-      <span id="settings-status" class="settings-status">Not saved yet</span>
-      <button class="btn-primary" id="settings-save-btn">Save</button>
-    </div>
-  </div>
-
-  <div class="settings-section">
-    <div class="settings-section-title">Scratchpad</div>
-    <p class="settings-copy">This is AI-managed persistent memory. It is injected into each runtime system prompt and can be edited here as a list of durable notes.</p>
-    <div class="settings-label">Stored notes</div>
-    <div id="scratchpad-list" class="scratchpad-list" aria-label="Stored notes list"></div>
-    <div class="scratchpad-toolbar">
-      <button class="btn-ghost" id="scratchpad-add-btn" type="button">Add note</button>
-      <span id="scratchpad-count" class="scratchpad-count">0 notes</span>
-    </div>
-  </div>
-
-  <div class="settings-section">
-    <div class="settings-section-title">Tool Memory</div>
-    <p class="settings-copy">Web tool results (search, news, URL fetches) are automatically indexed into a vector store. When enabled, relevant past results are injected into each chat turn so the AI can reuse earlier findings without repeating requests.</p>
-    <p id="tool-memory-disabled-note" class="settings-copy" hidden>Tool memory requires RAG to be enabled in .env.</p>
-    <label class="tool-toggle"><input type="checkbox" id="tool-memory-auto-inject-toggle" /> <span>Auto inject remembered tool results into each chat turn</span></label>
-  </div>
-
-  <div class="settings-section">
-    <div class="settings-section-title">Knowledge Base (RAG)</div>
-    <p class="settings-copy">RAG now indexes only synced conversation history and successful text-like tool results. Legacy file, URL, and note ingestion is disabled.</p>
-    <p id="rag-disabled-note" class="settings-copy" hidden>RAG is disabled in .env, so knowledge-base sync and auto-injection are unavailable.</p>
-    <label class="tool-toggle"><input type="checkbox" id="rag-auto-inject-toggle" /> <span>Auto inject retrieved context into each chat turn</span></label>
-    <div id="rag-inject-options" class="rag-settings-grid">
-      <div class="rag-setting-group">
-        <label class="settings-label" for="rag-sensitivity-select">Injection sensitivity</label>
-        <select id="rag-sensitivity-select" class="settings-select">
-          <option value="flexible">Flexible</option>
-          <option value="normal">Normal</option>
-          <option value="strict">Strict</option>
-        </select>
-        <p id="rag-sensitivity-hint" class="settings-copy">Normal: balanced matching with an approximate threshold of 0.35.</p>
-      </div>
-
-      <div class="rag-setting-group">
-        <label class="settings-label" for="rag-context-size-select">Injected context size</label>
-        <select id="rag-context-size-select" class="settings-select">
-          <option value="small">Small (2 chunks)</option>
-          <option value="medium">Medium (5 chunks)</option>
-          <option value="large">Large (8 chunks)</option>
-        </select>
-        <p class="settings-copy">Limits how many retrieved chunks can be added to a single turn.</p>
-      </div>
-    </div>
-
-    <div class="kb-actions-row">
-      <button class="btn-ghost" id="kb-sync-btn" type="button">Sync chats</button>
-    </div>
-
-    <div class="settings-actions">
-      <span id="kb-status" class="settings-status">Knowledge base idle</span>
-    </div>
-
-    <div class="kb-documents-block">
-      <div class="settings-label">Indexed sources</div>
-      <div id="kb-documents-list" class="kb-documents-list"></div>
-    </div>
-  </div>
-</div>
-<div id="settings-overlay" class="settings-overlay"></div>
 
 <div id="canvas-panel" class="canvas-panel" aria-hidden="true" aria-labelledby="canvas-subtitle">
   <div class="canvas-panel-header">

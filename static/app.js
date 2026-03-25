@@ -16,36 +16,15 @@ const imageInputEl = document.getElementById("image-input");
 const docInputEl = document.getElementById("doc-input");
 const attachBtn = document.getElementById("attach-btn");
 const attachmentPreviewEl = document.getElementById("attachment-preview");
-const preferencesEl = document.getElementById("preferences-input");
-const scratchpadListEl = document.getElementById("scratchpad-list");
-const scratchpadAddBtn = document.getElementById("scratchpad-add-btn");
-const scratchpadCountEl = document.getElementById("scratchpad-count");
-const maxStepsEl = document.getElementById("max-steps-input");
-const summaryModeEl = document.getElementById("summary-mode-select");
-const summaryTriggerEl = document.getElementById("summary-trigger-input");
-const summarySkipFirstEl = document.getElementById("summary-skip-first-input");
-const summarySkipLastEl = document.getElementById("summary-skip-last-input");
 const summaryNowBtn = document.getElementById("summary-now-btn");
 const summaryUndoBtn = document.getElementById("summary-undo-btn");
-const fetchThresholdEl = document.getElementById("fetch-threshold-input");
-const fetchAggressivenessEl = document.getElementById("fetch-aggressiveness-input");
-const ragAutoInjectEl = document.getElementById("rag-auto-inject-toggle");
-const ragInjectOptionsEl = document.getElementById("rag-inject-options");
-const ragSensitivityEl = document.getElementById("rag-sensitivity-select");
-const ragSensitivityHintEl = document.getElementById("rag-sensitivity-hint");
-const ragContextSizeEl = document.getElementById("rag-context-size-select");
-const toolMemoryAutoInjectEl = document.getElementById("tool-memory-auto-inject-toggle");
-const toolMemoryDisabledNoteEl = document.getElementById("tool-memory-disabled-note");
-const toolToggleEls = Array.from(document.querySelectorAll("#tool-toggles input[type='checkbox']"));
 const kbSyncBtn = document.getElementById("kb-sync-btn");
 const kbStatusEl = document.getElementById("kb-status");
 const kbDocumentsListEl = document.getElementById("kb-documents-list");
 const cancelBtn = document.getElementById("cancel-btn");
-const settingsBtn = document.getElementById("settings-btn");
 const exportBtn = document.getElementById("export-btn");
 const fixBtn = document.getElementById("fix-btn");
 const sendBtn = document.getElementById("send-btn");
-const settingsSaveBtn = document.getElementById("settings-save-btn");
 const modelSel = document.getElementById("model-select");
 const mobileModelSel = document.getElementById("mobile-model-select");
 const emptyState = document.getElementById("empty-state");
@@ -53,16 +32,13 @@ const errorArea = document.getElementById("error-area");
 const editBanner = document.getElementById("edit-banner");
 const editBannerText = document.getElementById("edit-banner-text");
 const editBannerCancelBtn = document.getElementById("edit-banner-cancel");
-const settingsPanel = document.getElementById("settings-panel");
-const settingsOverlay = document.getElementById("settings-overlay");
-const settingsClose = document.getElementById("settings-close");
-const settingsStatus = document.getElementById("settings-status");
 const summaryInspectorBadge = document.getElementById("summary-inspector-badge");
 const summaryInspectorHeadline = document.getElementById("summary-inspector-headline");
 const summaryInspectorCurrent = document.getElementById("summary-inspector-current");
 const summaryInspectorTrigger = document.getElementById("summary-inspector-trigger");
 const summaryInspectorGap = document.getElementById("summary-inspector-gap");
 const summaryInspectorDetail = document.getElementById("summary-inspector-detail");
+const summaryInspectorToolMessages = document.getElementById("summary-inspector-tool-messages");
 const summaryInspectorReason = document.getElementById("summary-inspector-reason");
 const summaryInspectorLast = document.getElementById("summary-inspector-last");
 const canvasBtn = document.getElementById("canvas-btn");
@@ -103,7 +79,6 @@ const mobileToolsBtn = document.getElementById("mobile-tools-btn");
 const mobileToolsPanel = document.getElementById("mobile-tools-panel");
 const mobileToolsOverlay = document.getElementById("mobile-tools-overlay");
 const mobileToolsClose = document.getElementById("mobile-tools-close");
-const mobileSettingsBtn = document.getElementById("mobile-settings-btn");
 const mobileExportBtn = document.getElementById("mobile-export-btn");
 const mobileTokensBtn = document.getElementById("mobile-tokens-btn");
 const exportPanel = document.getElementById("export-panel");
@@ -351,7 +326,6 @@ function openCanvasConfirmModal(options = {}) {
 
   closeMobileTools();
   closeExportPanel();
-  closeSettings();
   closeStats();
   lastCanvasConfirmTriggerEl = document.activeElement instanceof HTMLElement ? document.activeElement : attachBtn;
   pendingCanvasConfirmAction = {
@@ -567,7 +541,6 @@ function renderCanvasPanel() {
 function openCanvas() {
   closeMobileTools();
   closeCanvasConfirmModal("cancel", false);
-  closeSettings();
   closeStats();
   closeExportPanel();
   canvasPanel?.classList.add("open");
@@ -590,7 +563,6 @@ function closeCanvas() {
 
 function openExportPanel() {
   closeMobileTools();
-  closeSettings();
   closeStats();
   closeCanvas();
   updateExportPanel();
@@ -1465,11 +1437,11 @@ function estimateLocalTokens(text) {
 }
 
 function getSummaryModeValue() {
-  return String(summaryModeEl?.value || appSettings.chat_summary_mode || "auto").trim() || "auto";
+  return String(appSettings.chat_summary_mode || "auto").trim() || "auto";
 }
 
 function getSummaryTriggerValue() {
-  const rawValue = parseInt(summaryTriggerEl?.value || appSettings.chat_summary_trigger_token_count || 80000, 10);
+  const rawValue = parseInt(appSettings.chat_summary_trigger_token_count || 80000, 10);
   return Number.isFinite(rawValue) ? rawValue : 80000;
 }
 
@@ -1641,6 +1613,20 @@ function renderSummaryInspector() {
   }
   summaryInspectorDetail.textContent = detailParts.join(" ");
 
+  if (summaryInspectorToolMessages) {
+    const toolMessageParts = [
+      "Assistant tool-call placeholders are excluded from the trigger estimate.",
+      "Tool outputs and cleaned assistant content still count toward summary readiness.",
+    ];
+    if (mergedAssistantCount > 0) {
+      toolMessageParts.push(`${fmt(mergedAssistantCount)} assistant blocks were merged during the latest cleanup pass.`);
+    }
+    if (skippedErrorCount > 0) {
+      toolMessageParts.push(`${fmt(skippedErrorCount)} assistant error placeholders were skipped.`);
+    }
+    summaryInspectorToolMessages.textContent = toolMessageParts.join(" ");
+  }
+
   if (summaryInspectorReason) {
     let reasonText = "The latest summary decision will appear here after each completed assistant turn.";
     if (latestSummaryStatus) {
@@ -1686,7 +1672,6 @@ function renderSummaryInspector() {
 
 function openStats() {
   closeMobileTools();
-  closeSettings();
   closeCanvas();
   closeExportPanel();
   statsPanel.classList.add("open");
@@ -1698,23 +1683,7 @@ function closeStats() {
   statsOverlay.classList.remove("open");
 }
 
-function openSettings() {
-  closeMobileTools();
-  closeStats();
-  closeCanvas();
-  closeExportPanel();
-  settingsPanel.classList.add("open");
-  settingsOverlay.classList.add("open");
-  void refreshSettings();
-}
-
-function closeSettings() {
-  settingsPanel.classList.remove("open");
-  settingsOverlay.classList.remove("open");
-}
-
 function openMobileTools() {
-  closeSettings();
   closeStats();
   closeCanvas();
   closeExportPanel();
@@ -1739,11 +1708,6 @@ function syncModelSelectors(value) {
   if (mobileModelSel && mobileModelSel.value !== nextValue) {
     mobileModelSel.value = nextValue;
   }
-}
-
-function setSettingsStatus(message, tone = "muted") {
-  settingsStatus.textContent = message;
-  settingsStatus.dataset.tone = tone;
 }
 
 function isMobileViewport() {
@@ -1807,9 +1771,6 @@ function closeSidebarOnMobile() {
 tokensBtn.addEventListener("click", openStats);
 statsClose.addEventListener("click", closeStats);
 statsOverlay.addEventListener("click", closeStats);
-settingsBtn.addEventListener("click", openSettings);
-settingsClose.addEventListener("click", closeSettings);
-settingsOverlay.addEventListener("click", closeSettings);
 if (canvasBtn) {
   canvasBtn.addEventListener("click", openCanvas);
 }
@@ -1909,12 +1870,6 @@ if (canvasConfirmLaterBtn) {
 }
 if (canvasConfirmOpenBtn) {
   canvasConfirmOpenBtn.addEventListener("click", () => closeCanvasConfirmModal("confirm"));
-}
-if (mobileSettingsBtn) {
-  mobileSettingsBtn.addEventListener("click", () => {
-    openSettings();
-    closeMobileTools();
-  });
 }
 if (mobileTokensBtn) {
   mobileTokensBtn.addEventListener("click", () => {
@@ -2322,367 +2277,9 @@ function autoResize(element) {
   element.style.height = "auto";
   element.style.height = element.scrollHeight + "px";
 }
-
-function normalizeScratchpadNote(value) {
-  return String(value || "").replace(/\s+/g, " ").trim();
-}
-
-function readScratchpadNotesFromList() {
-  if (!scratchpadListEl) {
-    return [];
-  }
-
-  const notes = [];
-  const seen = new Set();
-  for (const input of scratchpadListEl.querySelectorAll(".scratchpad-note-input")) {
-    const note = normalizeScratchpadNote(input.value);
-    if (!note || seen.has(note)) {
-      continue;
-    }
-    seen.add(note);
-    notes.push(note);
-  }
-
-  return notes;
-}
-
-function updateScratchpadCount() {
-  if (!scratchpadCountEl) {
-    return;
-  }
-
-  const count = readScratchpadNotesFromList().length;
-  scratchpadCountEl.textContent = count === 1 ? "1 note" : `${count} notes`;
-}
-
-function setScratchpadEmptyState() {
-  if (!scratchpadListEl) {
-    return;
-  }
-
-  scratchpadListEl.replaceChildren();
-  const emptyState = document.createElement("div");
-  emptyState.className = "scratchpad-empty-state";
-  emptyState.textContent = "No scratchpad entries yet. Add a note to get started.";
-  scratchpadListEl.append(emptyState);
-  updateScratchpadCount();
-}
-
-function createScratchpadNoteRow(note = "") {
-  const row = document.createElement("div");
-  row.className = "scratchpad-note-row";
-
-  const input = document.createElement("input");
-  input.type = "text";
-  input.className = "settings-text scratchpad-note-input";
-  input.placeholder = "One durable note";
-  input.value = note;
-  input.addEventListener("input", () => {
-    setSettingsStatus("Unsaved changes", "warning");
-    updateScratchpadCount();
-  });
-
-  const removeBtn = document.createElement("button");
-  removeBtn.type = "button";
-  removeBtn.className = "btn-ghost btn-ghost--danger scratchpad-note-remove";
-  removeBtn.textContent = "Remove";
-  removeBtn.addEventListener("click", () => {
-    row.remove();
-    if (!scratchpadListEl || !scratchpadListEl.querySelector(".scratchpad-note-row")) {
-      setScratchpadEmptyState();
-    } else {
-      updateScratchpadCount();
-    }
-    setSettingsStatus("Unsaved changes", "warning");
-  });
-
-  row.append(input, removeBtn);
-  return row;
-}
-
-function renderScratchpadList(notes) {
-  if (!scratchpadListEl) {
-    return;
-  }
-
-  const noteList = Array.isArray(notes) ? notes : [];
-  scratchpadListEl.replaceChildren();
-
-  if (!noteList.length) {
-    setScratchpadEmptyState();
-    return;
-  }
-
-  for (const note of noteList) {
-    scratchpadListEl.append(createScratchpadNoteRow(note));
-  }
-
-  updateScratchpadCount();
-}
-
-function addScratchpadNote(note = "") {
-  if (!scratchpadListEl) {
-    return;
-  }
-
-  const emptyState = scratchpadListEl.querySelector(".scratchpad-empty-state");
-  if (emptyState) {
-    emptyState.remove();
-  }
-
-  const row = createScratchpadNoteRow(note);
-  scratchpadListEl.append(row);
-  row.querySelector(".scratchpad-note-input")?.focus();
-  updateScratchpadCount();
-  setSettingsStatus("Unsaved changes", "warning");
-}
-
 inputEl.addEventListener("input", () => {
   autoResize(inputEl);
 });
-
-preferencesEl.addEventListener("input", () => {
-  setSettingsStatus("Unsaved changes", "warning");
-  autoResize(preferencesEl);
-});
-
-if (scratchpadAddBtn) {
-  scratchpadAddBtn.addEventListener("click", () => {
-    addScratchpadNote();
-  });
-}
-
-maxStepsEl.addEventListener("input", () => {
-  setSettingsStatus("Unsaved changes", "warning");
-});
-
-summaryModeEl.addEventListener("change", () => {
-  setSettingsStatus("Unsaved changes", "warning");
-  renderSummaryInspector();
-});
-
-summaryTriggerEl.addEventListener("input", () => {
-  setSettingsStatus("Unsaved changes", "warning");
-  renderSummaryInspector();
-});
-
-fetchThresholdEl.addEventListener("input", () => {
-  setSettingsStatus("Unsaved changes", "warning");
-});
-
-fetchAggressivenessEl.addEventListener("input", () => {
-  setSettingsStatus("Unsaved changes", "warning");
-});
-
-ragAutoInjectEl.addEventListener("change", () => {
-  setSettingsStatus("Unsaved changes", "warning");
-});
-
-ragSensitivityEl.addEventListener("change", () => {
-  updateRagSensitivityHint();
-  setSettingsStatus("Unsaved changes", "warning");
-});
-
-ragContextSizeEl.addEventListener("change", () => {
-  setSettingsStatus("Unsaved changes", "warning");
-});
-
-if (toolMemoryAutoInjectEl) {
-  toolMemoryAutoInjectEl.addEventListener("change", () => {
-    setSettingsStatus("Unsaved changes", "warning");
-  });
-}
-
-toolToggleEls.forEach((element) => {
-  element.addEventListener("change", () => {
-    setSettingsStatus("Unsaved changes", "warning");
-  });
-});
-
-function getSelectedTools() {
-  return toolToggleEls.filter((element) => element.checked).map((element) => element.value);
-}
-
-function applySelectedTools(selected) {
-  const active = new Set(Array.isArray(selected) ? selected : []);
-  toolToggleEls.forEach((element) => {
-    element.checked = active.has(element.value);
-  });
-}
-
-function renderScratchpad() {
-  if (!scratchpadListEl) {
-    return;
-  }
-  const notes = String(appSettings.scratchpad || "")
-    .replace(/\r\n/g, "\n")
-    .replace(/\r/g, "\n")
-    .split("\n")
-    .map((line) => normalizeScratchpadNote(line))
-    .filter((line) => line.length > 0);
-
-  renderScratchpadList(notes);
-}
-
-function updateRagSensitivityHint() {
-  if (!ragSensitivityHintEl || !ragSensitivityEl) {
-    return;
-  }
-  const sensitivity = ragSensitivityEl.value || "normal";
-  ragSensitivityHintEl.textContent = RAG_SENSITIVITY_HINTS[sensitivity] || RAG_SENSITIVITY_HINTS.normal;
-}
-
-function applySettingsToForm() {
-  preferencesEl.value = appSettings.user_preferences || "";
-  maxStepsEl.value = String(appSettings.max_steps || 5);
-  summaryModeEl.value = appSettings.chat_summary_mode || "auto";
-  summaryTriggerEl.value = String(appSettings.chat_summary_trigger_token_count || 80000);
-  if (summarySkipFirstEl) summarySkipFirstEl.value = String(appSettings.summary_skip_first ?? 2);
-  if (summarySkipLastEl) summarySkipLastEl.value = String(appSettings.summary_skip_last ?? 1);
-  fetchThresholdEl.value = String(appSettings.fetch_url_token_threshold || 3500);
-  fetchAggressivenessEl.value = String(appSettings.fetch_url_clip_aggressiveness || 50);
-  applySelectedTools(appSettings.active_tools || []);
-  ragAutoInjectEl.checked = Boolean(featureFlags.rag_enabled ? appSettings.rag_auto_inject : false);
-  ragSensitivityEl.value = appSettings.rag_sensitivity || "normal";
-  ragContextSizeEl.value = appSettings.rag_context_size || "medium";
-  if (toolMemoryAutoInjectEl) {
-    toolMemoryAutoInjectEl.checked = Boolean(featureFlags.rag_enabled ? appSettings.tool_memory_auto_inject : false);
-  }
-  updateRagSensitivityHint();
-  autoResize(preferencesEl);
-  renderScratchpad();
-  renderSummaryInspector();
-}
-
-async function refreshSettings() {
-  try {
-    const response = await fetch("/api/settings");
-    const data = await response.json();
-    if (!response.ok) {
-      throw new Error(data.error || "Failed to load settings.");
-    }
-
-    appSettings.user_preferences = data.user_preferences || "";
-    appSettings.scratchpad = data.scratchpad || "";
-    appSettings.max_steps = data.max_steps || 5;
-    appSettings.chat_summary_mode = data.chat_summary_mode || "auto";
-    appSettings.chat_summary_trigger_token_count = data.chat_summary_trigger_token_count || 80000;
-    appSettings.summary_skip_first = data.summary_skip_first ?? 2;
-    appSettings.summary_skip_last = data.summary_skip_last ?? 1;
-    appSettings.fetch_url_token_threshold = data.fetch_url_token_threshold || 3500;
-    appSettings.fetch_url_clip_aggressiveness = data.fetch_url_clip_aggressiveness ?? 50;
-    appSettings.active_tools = Array.isArray(data.active_tools) ? data.active_tools : [];
-    appSettings.rag_auto_inject = Boolean(data.rag_auto_inject);
-    appSettings.rag_sensitivity = data.rag_sensitivity || "normal";
-    appSettings.rag_context_size = data.rag_context_size || "medium";
-    appSettings.tool_memory_auto_inject = Boolean(data.tool_memory_auto_inject);
-    if (data.features && typeof data.features === "object") {
-      Object.assign(featureFlags, data.features);
-    }
-    applySettingsToForm();
-    applyFeatureAvailability();
-    renderSummaryInspector();
-  } catch (_) {
-    renderScratchpad();
-    renderSummaryInspector();
-  }
-}
-
-function applyFeatureAvailability() {
-  const ragEnabled = Boolean(featureFlags.rag_enabled);
-  const visionEnabled = Boolean(featureFlags.vision_enabled);
-
-  ragAutoInjectEl.disabled = !ragEnabled;
-  ragSensitivityEl.disabled = !ragEnabled;
-  ragContextSizeEl.disabled = !ragEnabled;
-  if (ragInjectOptionsEl) {
-    ragInjectOptionsEl.classList.toggle("is-disabled", !ragEnabled);
-  }
-  kbSyncBtn.disabled = !ragEnabled;
-  if (ragDisabledNoteEl) {
-    ragDisabledNoteEl.hidden = ragEnabled;
-  }
-  if (!ragEnabled) {
-    setKbStatus("RAG disabled in .env", "warning");
-  }
-
-  if (toolMemoryAutoInjectEl) {
-    toolMemoryAutoInjectEl.disabled = !ragEnabled;
-  }
-  if (toolMemoryDisabledNoteEl) {
-    toolMemoryDisabledNoteEl.hidden = ragEnabled;
-  }
-
-  attachBtn.hidden = false;
-  imageInputEl.disabled = !visionEnabled;
-  if (visionDisabledNoteEl) {
-    visionDisabledNoteEl.hidden = visionEnabled;
-  }
-  if (!visionEnabled) {
-    clearSelectedImage();
-  }
-}
-
-async function saveSettings() {
-  const payload = {
-    user_preferences: preferencesEl.value.trim(),
-    max_steps: parseInt(maxStepsEl.value, 10) || 5,
-    chat_summary_mode: summaryModeEl.value || "auto",
-    chat_summary_trigger_token_count: parseInt(summaryTriggerEl.value, 10) || 80000,
-    summary_skip_first: summarySkipFirstEl ? parseInt(summarySkipFirstEl.value, 10) || 0 : 2,
-    summary_skip_last: summarySkipLastEl ? parseInt(summarySkipLastEl.value, 10) || 0 : 1,
-    fetch_url_token_threshold: parseInt(fetchThresholdEl.value, 10) || 3500,
-    fetch_url_clip_aggressiveness: parseInt(fetchAggressivenessEl.value, 10) || 50,
-    active_tools: getSelectedTools(),
-    rag_auto_inject: featureFlags.rag_enabled ? ragAutoInjectEl.checked : false,
-    rag_sensitivity: ragSensitivityEl.value || "normal",
-    rag_context_size: ragContextSizeEl.value || "medium",
-    tool_memory_auto_inject: featureFlags.rag_enabled && toolMemoryAutoInjectEl ? toolMemoryAutoInjectEl.checked : false,
-    scratchpad: readScratchpadNotesFromList().join("\n"),
-  };
-
-  setSettingsStatus("Saving…");
-  settingsSaveBtn.disabled = true;
-
-  try {
-    const response = await fetch("/api/settings", {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    const data = await response.json();
-    if (!response.ok) {
-      throw new Error(data.error || "Failed to save settings.");
-    }
-
-    appSettings.user_preferences = data.user_preferences || "";
-    appSettings.scratchpad = data.scratchpad || "";
-    appSettings.max_steps = data.max_steps || 5;
-    appSettings.chat_summary_mode = data.chat_summary_mode || "auto";
-    appSettings.chat_summary_trigger_token_count = data.chat_summary_trigger_token_count || 80000;
-    appSettings.summary_skip_first = data.summary_skip_first ?? 2;
-    appSettings.summary_skip_last = data.summary_skip_last ?? 1;
-    appSettings.fetch_url_token_threshold = data.fetch_url_token_threshold || 3500;
-    appSettings.fetch_url_clip_aggressiveness = data.fetch_url_clip_aggressiveness ?? 50;
-    appSettings.active_tools = Array.isArray(data.active_tools) ? data.active_tools : [];
-    appSettings.rag_auto_inject = Boolean(data.rag_auto_inject);
-    appSettings.rag_sensitivity = data.rag_sensitivity || "normal";
-    appSettings.rag_context_size = data.rag_context_size || "medium";
-    appSettings.tool_memory_auto_inject = Boolean(data.tool_memory_auto_inject);
-    if (data.features && typeof data.features === "object") {
-      Object.assign(featureFlags, data.features);
-    }
-    applySettingsToForm();
-    applyFeatureAvailability();
-    setSettingsStatus("Saved", "success");
-  } catch (error) {
-    setSettingsStatus(error.message, "error");
-  } finally {
-    settingsSaveBtn.disabled = false;
-  }
-}
-
-settingsSaveBtn.addEventListener("click", saveSettings);
 
 if (summaryNowBtn) {
   summaryNowBtn.addEventListener("click", async () => {
@@ -4240,11 +3837,7 @@ async function generateTitle(convId) {
 }
 
 setKbStatus("Knowledge base idle");
-autoResize(preferencesEl);
 clearEditTarget();
-
-applySettingsToForm();
-applyFeatureAvailability();
 updateHeaderOffset();
 const initialSidebarPref = readSidebarPreference();
 setSidebarOpen(initialSidebarPref === null ? !isMobileViewport() : initialSidebarPref, false);

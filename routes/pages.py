@@ -33,55 +33,45 @@ from db import (
 )
 
 
+def build_settings_payload() -> dict:
+    raw = get_app_settings()
+    return {
+        "user_preferences": raw["user_preferences"],
+        "scratchpad": raw.get("scratchpad", ""),
+        "max_steps": int(raw.get("max_steps", DEFAULT_SETTINGS["max_steps"])),
+        "active_tools": get_active_tool_names(raw),
+        "rag_auto_inject": get_rag_auto_inject_enabled(raw),
+        "rag_sensitivity": get_rag_sensitivity(raw),
+        "rag_context_size": get_rag_context_size(raw),
+        "tool_memory_auto_inject": get_tool_memory_auto_inject_enabled(raw),
+        "chat_summary_mode": get_chat_summary_mode(raw),
+        "chat_summary_trigger_token_count": get_chat_summary_trigger_token_count(raw),
+        "summary_skip_first": get_summary_skip_first(raw),
+        "summary_skip_last": get_summary_skip_last(raw),
+        "fetch_url_token_threshold": get_fetch_url_token_threshold(raw),
+        "fetch_url_clip_aggressiveness": get_fetch_url_clip_aggressiveness(raw),
+        "features": get_feature_flags(),
+    }
+
+
 def register_page_routes(app) -> None:
     @app.route("/")
     def index():
-        raw = get_app_settings()
-        settings = {
-            "user_preferences": raw["user_preferences"],
-            "scratchpad": raw.get("scratchpad", ""),
-            "max_steps": int(raw.get("max_steps", DEFAULT_SETTINGS["max_steps"])),
-            "active_tools": get_active_tool_names(raw),
-            "rag_auto_inject": get_rag_auto_inject_enabled(raw),
-            "rag_sensitivity": get_rag_sensitivity(raw),
-            "rag_context_size": get_rag_context_size(raw),
-            "tool_memory_auto_inject": get_tool_memory_auto_inject_enabled(raw),
-            "chat_summary_mode": get_chat_summary_mode(raw),
-            "chat_summary_trigger_token_count": get_chat_summary_trigger_token_count(raw),
-            "summary_skip_first": get_summary_skip_first(raw),
-            "summary_skip_last": get_summary_skip_last(raw),
-            "fetch_url_token_threshold": get_fetch_url_token_threshold(raw),
-            "fetch_url_clip_aggressiveness": get_fetch_url_clip_aggressiveness(raw),
-            "features": get_feature_flags(),
-        }
+        settings = build_settings_payload()
         return render_template(
             "index.html",
             models=AVAILABLE_MODELS,
             settings=settings,
         )
 
+    @app.route("/settings")
+    def settings_page():
+        settings = build_settings_payload()
+        return render_template("settings.html", settings=settings)
+
     @app.route("/api/settings", methods=["GET"])
     def get_settings():
-        raw = get_app_settings()
-        return jsonify(
-            {
-                "user_preferences": raw["user_preferences"],
-                "scratchpad": raw.get("scratchpad", ""),
-                "max_steps": int(raw.get("max_steps", DEFAULT_SETTINGS["max_steps"])),
-                "active_tools": get_active_tool_names(raw),
-                "rag_auto_inject": get_rag_auto_inject_enabled(raw),
-                "rag_sensitivity": get_rag_sensitivity(raw),
-                "rag_context_size": get_rag_context_size(raw),
-                "tool_memory_auto_inject": get_tool_memory_auto_inject_enabled(raw),
-                "chat_summary_mode": get_chat_summary_mode(raw),
-                "chat_summary_trigger_token_count": get_chat_summary_trigger_token_count(raw),
-                "summary_skip_first": get_summary_skip_first(raw),
-                "summary_skip_last": get_summary_skip_last(raw),
-                "fetch_url_token_threshold": get_fetch_url_token_threshold(raw),
-                "fetch_url_clip_aggressiveness": get_fetch_url_clip_aggressiveness(raw),
-                "features": get_feature_flags(),
-            }
-        )
+        return jsonify(build_settings_payload())
 
     @app.route("/api/settings", methods=["PATCH"])
     def update_settings():

@@ -599,9 +599,21 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn("marked/marked.min.js", html)
         self.assertIn("dompurify/dist/purify.min.js", html)
         self.assertIn('id="app-bootstrap"', html)
-        self.assertIn('id="scratchpad-list"', html)
-        self.assertIn('id="scratchpad-add-btn"', html)
-        self.assertIn('id="scratchpad-count"', html)
+        self.assertIn('href="/settings"', html)
+        self.assertNotIn('id="scratchpad-list"', html)
+        self.assertNotIn('id="settings-panel"', html)
+
+    def test_settings_page_renders_dedicated_layout(self):
+        response = self.client.get("/settings")
+        self.assertEqual(response.status_code, 200)
+        html = response.get_data(as_text=True)
+        self.assertIn("Separate page, grouped controls, less noise", html)
+        self.assertIn('data-settings-tab="assistant"', html)
+        self.assertIn('data-settings-tab="memory"', html)
+        self.assertIn('data-settings-tab="tools"', html)
+        self.assertIn('data-settings-tab="knowledge"', html)
+        self.assertIn('src="/static/settings.js"', html)
+        self.assertIn('id="kb-sync-btn"', html)
 
     def test_build_user_message_for_model_includes_stored_image_reference(self):
         content = build_user_message_for_model(
@@ -859,11 +871,6 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertTrue(script_path.exists())
         script_text = script_path.read_text(encoding="utf-8")
         self.assertIn('document.getElementById("app-bootstrap")', script_text)
-        self.assertIn('document.getElementById("scratchpad-list")', script_text)
-        self.assertIn('document.getElementById("scratchpad-add-btn")', script_text)
-        self.assertIn("function renderScratchpad", script_text)
-        self.assertIn("function addScratchpadNote", script_text)
-        self.assertIn('fetch("/api/settings")', script_text)
         self.assertIn("globalThis.marked", script_text)
         self.assertIn("function renderMarkdown", script_text)
         self.assertIn("INPUT_BREAKDOWN_ORDER", script_text)
@@ -875,6 +882,16 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn("clearEditTarget();", script_text)
         self.assertIn("const fragment = document.createDocumentFragment();", script_text)
         self.assertIn("messagesEl.replaceChildren(fragment);", script_text)
+
+    def test_external_settings_script_exists_and_contains_tabbed_settings_logic(self):
+        script_path = Path(__file__).resolve().parent.parent / "static" / "settings.js"
+        self.assertTrue(script_path.exists())
+        script_text = script_path.read_text(encoding="utf-8")
+        self.assertIn('document.getElementById("app-bootstrap")', script_text)
+        self.assertIn("function activateTab", script_text)
+        self.assertIn("void loadKnowledgeBaseDocuments();", script_text)
+        self.assertIn("void refreshSettings();", script_text)
+        self.assertIn("window.addEventListener(\"beforeunload\"", script_text)
 
     def test_reasoning_panel_uses_markdown_rendering(self):
         script_path = Path(__file__).resolve().parent.parent / "static" / "app.js"
@@ -936,14 +953,13 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn("async function deleteCanvasDocuments(", script_text)
 
     def test_settings_ui_exposes_fetch_threshold_input(self):
-        html = self.client.get("/").get_data(as_text=True)
+        html = self.client.get("/settings").get_data(as_text=True)
         self.assertIn('value="append_scratchpad"', html)
         self.assertIn('value="ask_clarifying_question"', html)
         self.assertIn('id="scratchpad-list"', html)
         self.assertIn('id="scratchpad-add-btn"', html)
         self.assertIn('id="summary-mode-select"', html)
         self.assertIn('id="summary-trigger-input"', html)
-        self.assertIn('id="summary-inspector-tool-messages"', html)
         self.assertIn('id="fetch-threshold-input"', html)
         self.assertIn('id="fetch-aggressiveness-input"', html)
         self.assertIn('id="rag-sensitivity-select"', html)
@@ -953,7 +969,6 @@ class AppRoutesTestCase(unittest.TestCase):
         script_path = Path(__file__).resolve().parent.parent / "static" / "app.js"
         script_text = script_path.read_text(encoding="utf-8")
         self.assertIn("const RAG_SENSITIVITY_HINTS = {", script_text)
-        self.assertIn('rag_context_size', script_text)
 
     def test_run_agent_stream_executes_append_scratchpad_tool(self):
         responses = [
