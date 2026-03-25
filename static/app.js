@@ -2418,7 +2418,7 @@ attachBtn.addEventListener("contextmenu", (e) => {
   e.preventDefault();
   docInputEl.click();
 });
-kbSyncBtn.addEventListener("click", syncKnowledgeBaseConversations);
+kbSyncBtn?.addEventListener("click", syncKnowledgeBaseConversations);
 
 imageInputEl.addEventListener("change", () => {
   const file = imageInputEl.files && imageInputEl.files[0];
@@ -2506,11 +2506,17 @@ function showError(message) {
 }
 
 function setKbStatus(message, tone = "muted") {
+  if (!kbStatusEl) {
+    return;
+  }
   kbStatusEl.textContent = message;
   kbStatusEl.dataset.tone = tone;
 }
 
 async function loadKnowledgeBaseDocuments() {
+  if (!kbDocumentsListEl || !kbStatusEl) {
+    return;
+  }
   if (!Boolean(featureFlags.rag_enabled)) {
     renderKnowledgeBaseDocuments([]);
     setKbStatus("RAG disabled in .env", "warning");
@@ -2531,6 +2537,9 @@ async function loadKnowledgeBaseDocuments() {
 }
 
 function renderKnowledgeBaseDocuments(docs) {
+  if (!kbDocumentsListEl) {
+    return;
+  }
   kbDocumentsListEl.innerHTML = "";
 
   if (!docs.length) {
@@ -2587,12 +2596,17 @@ async function deleteKnowledgeBaseDocument(sourceKey) {
 }
 
 async function syncKnowledgeBaseConversations() {
+  if (!kbSyncBtn) {
+    return;
+  }
   if (!Boolean(featureFlags.rag_enabled)) {
     setKbStatus("RAG disabled in .env", "warning");
     return;
   }
   setKbStatus("Syncing conversations into RAG…");
-  kbSyncBtn.disabled = true;
+  if (kbSyncBtn) {
+    kbSyncBtn.disabled = true;
+  }
   try {
     const response = await fetch("/api/rag/sync-conversations", {
       method: "POST",
@@ -2608,7 +2622,9 @@ async function syncKnowledgeBaseConversations() {
   } catch (error) {
     setKbStatus(error.message, "error");
   } finally {
-    kbSyncBtn.disabled = false;
+    if (kbSyncBtn) {
+      kbSyncBtn.disabled = false;
+    }
   }
 }
 
@@ -3844,4 +3860,4 @@ setSidebarOpen(initialSidebarPref === null ? !isMobileViewport() : initialSideba
 syncModelSelectors(modelSel ? modelSel.value : "");
 loadSidebar();
 updateExportPanel();
-loadKnowledgeBaseDocuments();
+void loadKnowledgeBaseDocuments();

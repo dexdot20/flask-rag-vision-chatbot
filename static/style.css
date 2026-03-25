@@ -48,7 +48,7 @@ body {
 ::-webkit-scrollbar       { width: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: #2a2a38; border-radius: 99px; }
-::-webkit-scrollbar-thumb:active { background: #3a3a4e; }
+::-webkit-scrollbar-thumb:hover { background: #3a3a4e; }
 
 /* ── Header ─────────────────────────────────────────────── */
 header {
