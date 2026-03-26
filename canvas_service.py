@@ -188,7 +188,28 @@ def _build_canvas_summary(title: str, path: str | None, role: str | None, conten
     return f"{role_label.capitalize()} {label}"[:CANVAS_MAX_SUMMARY_LENGTH]
 
 
-def _number_canvas_lines(content: str, *, max_lines: int = CANVAS_CONTEXT_MAX_LINES, max_chars: int = CANVAS_CONTEXT_MAX_CHARS) -> tuple[list[str], bool]:
+def scale_canvas_char_limit(max_lines: int | None, *, default_lines: int, default_chars: int) -> int:
+    try:
+        normalized_max_lines = int(max_lines or 0)
+    except (TypeError, ValueError):
+        return default_chars
+    if normalized_max_lines <= 0 or default_lines <= 0 or default_chars <= 0:
+        return default_chars
+    return max(1, int(round(default_chars * (normalized_max_lines / default_lines))))
+
+
+def _number_canvas_lines(
+    content: str,
+    *,
+    max_lines: int = CANVAS_CONTEXT_MAX_LINES,
+    max_chars: int | None = None,
+) -> tuple[list[str], bool]:
+    if max_chars is None:
+        max_chars = scale_canvas_char_limit(
+            max_lines,
+            default_lines=CANVAS_CONTEXT_MAX_LINES,
+            default_chars=CANVAS_CONTEXT_MAX_CHARS,
+        )
     normalized = _normalize_line_endings(content)
     all_lines = normalized.split("\n") if normalized else []
     visible_lines = []
@@ -789,6 +810,71 @@ def delete_canvas_lines(
     return replace_canvas_lines(runtime_state, start_line, end_line, [], document_id=document_id, document_path=document_path)
 
 
+def scroll_canvas_document(
+    runtime_state: dict,
+    start_line: int,
+    end_line: int,
+    document_id: str | None = None,
+    document_path: str | None = None,
+    max_window_lines: int = 200,
+    max_chars: int | None = None,
+) -> dict:
+    _, document = _find_canvas_document(runtime_state, document_id=document_id, document_path=document_path)
+    existing_lines = list_canvas_lines(document.get("content") or "")
+    total_lines = len(existing_lines)
+    if start_line < 1 or end_line < start_line:
+        raise ValueError("start_line and end_line must define a valid 1-based inclusive range.")
+    if total_lines == 0:
+        return {
+            "status": "ok",
+            "action": "scrolled",
+            "document_id": document.get("id"),
+            "document_path": document.get("path"),
+            "title": document.get("title"),
+            "start_line": 1,
+            "end_line_actual": 0,
+            "total_lines": 0,
+            "visible_lines": [],
+            "has_more_above": False,
+            "has_more_below": False,
+        }
+
+    window_limit = max(1, int(max_window_lines or 1))
+    effective_start = min(start_line, total_lines)
+    effective_end = min(total_lines, end_line, effective_start + window_limit - 1)
+    if max_chars is None:
+        max_chars = scale_canvas_char_limit(max_window_lines, default_lines=200, default_chars=8_000)
+
+    visible_lines = []
+    visible_char_count = 0
+    for index in range(effective_start, effective_end + 1):
+        numbered_line = f"{index}: {existing_lines[index - 1]}"
+        extra_chars = len(numbered_line) + (1 if visible_lines else 0)
+        if visible_lines and visible_char_count + extra_chars > max_chars:
+            effective_end = index - 1
+            break
+        if not visible_lines and extra_chars > max_chars:
+            visible_lines.append(numbered_line[:max_chars])
+            effective_end = index
+            break
+        visible_lines.append(numbered_line)
+        visible_char_count += extra_chars
+
+    return {
+        "status": "ok",
+        "action": "scrolled",
+        "document_id": document.get("id"),
+        "document_path": document.get("path"),
+        "title": document.get("title"),
+        "start_line": effective_start,
+        "end_line_actual": effective_end,
+        "total_lines": total_lines,
+        "visible_lines": visible_lines,
+        "has_more_above": effective_start > 1,
+        "has_more_below": effective_end < total_lines,
+    }
+
+
 def delete_canvas_document(
     runtime_state: dict,
     document_id: str | None = None,
@@ -858,13 +944,19 @@ def build_canvas_document_context_result(
     *,
     document_id: str | None = None,
     document_path: str | None = None,
+    max_lines: int | None = None,
+    max_chars: int | None = None,
 ) -> dict:
     _, document = _find_canvas_document(runtime_state, document_id=document_id, document_path=document_path)
     normalized = normalize_canvas_document(document)
     if not normalized:
         raise ValueError("Canvas document is invalid.")
 
-    numbered_lines, is_truncated = _number_canvas_lines(normalized.get("content") or "")
+    numbered_lines, is_truncated = _number_canvas_lines(
+        normalized.get("content") or "",
+        max_lines=max_lines or CANVAS_CONTEXT_MAX_LINES,
+        max_chars=max_chars,
+    )
     documents = get_canvas_runtime_documents(runtime_state)
     manifest = build_canvas_project_manifest(documents, active_document_id=get_canvas_runtime_active_document_id(runtime_state))
     relationship_map = build_canvas_relationship_map(documents)

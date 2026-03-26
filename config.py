@@ -111,6 +111,9 @@ PROMPT_SUMMARY_MAX_TOKENS = max(500, min(PROMPT_MAX_INPUT_TOKENS, _parse_int_env
 PROMPT_RAG_MAX_TOKENS = max(0, min(PROMPT_MAX_INPUT_TOKENS, _parse_int_env("PROMPT_RAG_MAX_TOKENS", 6_000)))
 PROMPT_TOOL_MEMORY_MAX_TOKENS = max(0, min(PROMPT_MAX_INPUT_TOKENS, _parse_int_env("PROMPT_TOOL_MEMORY_MAX_TOKENS", 4_000)))
 PROMPT_PREFLIGHT_SUMMARY_TOKEN_COUNT = max(2_000, min(200_000, _parse_int_env("PROMPT_PREFLIGHT_SUMMARY_TOKEN_COUNT", 90_000)))
+CANVAS_PROMPT_DEFAULT_MAX_LINES = max(100, min(3_000, _parse_int_env("CANVAS_PROMPT_DEFAULT_MAX_LINES", 800)))
+CANVAS_EXPAND_DEFAULT_MAX_LINES = max(100, min(4_000, _parse_int_env("CANVAS_EXPAND_DEFAULT_MAX_LINES", 1_600)))
+CANVAS_SCROLL_WINDOW_LINES = max(50, min(800, _parse_int_env("CANVAS_SCROLL_WINDOW_LINES", 200)))
 AGENT_CONTEXT_COMPACTION_THRESHOLD = max(0.5, min(0.98, _parse_float_env("AGENT_CONTEXT_COMPACTION_THRESHOLD", 0.85)))
 AGENT_CONTEXT_COMPACTION_KEEP_RECENT_ROUNDS = max(
     0,
@@ -136,6 +139,7 @@ DEFAULT_ACTIVE_TOOL_NAMES = [
     "search_news_google",
     "create_canvas_document",
     "expand_canvas_document",
+    "scroll_canvas_document",
     "plan_project_workspace",
     "get_project_workflow_status",
     "rewrite_canvas_document",
@@ -251,6 +255,9 @@ DEFAULT_SETTINGS = {
     "tool_memory_auto_inject": "true",
     "fetch_url_token_threshold": str(FETCH_SUMMARY_TOKEN_THRESHOLD),
     "fetch_url_clip_aggressiveness": "50",
+    "canvas_prompt_max_lines": str(CANVAS_PROMPT_DEFAULT_MAX_LINES),
+    "canvas_expand_max_lines": str(CANVAS_EXPAND_DEFAULT_MAX_LINES),
+    "canvas_scroll_window_lines": str(CANVAS_SCROLL_WINDOW_LINES),
     "chat_summary_trigger_token_count": str(CHAT_SUMMARY_TRIGGER_TOKEN_COUNT),
     "chat_summary_mode": CHAT_SUMMARY_MODE if CHAT_SUMMARY_MODE in CHAT_SUMMARY_ALLOWED_MODES else "auto",
     "summary_skip_first": "2",

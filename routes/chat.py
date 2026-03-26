@@ -22,6 +22,9 @@ from canvas_service import (
 from config import CHAT_SUMMARY_MODEL, RAG_ENABLED, RAG_SENSITIVITY_PRESETS, VISION_DISABLED_FEATURE_ERROR, VISION_ENABLED
 from db import (
     build_user_profile_system_context,
+    get_canvas_expand_max_lines,
+    get_canvas_prompt_max_lines,
+    get_canvas_scroll_window_lines,
     count_visible_message_tokens,
     create_file_asset,
     create_image_asset,
@@ -896,6 +899,7 @@ def _build_budgeted_prompt_messages(
     tool_memory_context: str | None,
     canvas_documents: list[dict] | None = None,
     canvas_active_document_id: str | None = None,
+    canvas_prompt_max_lines: int | None = None,
     workspace_root: str | None = None,
     project_workflow: dict | None = None,
 ) -> tuple[list[dict], dict]:
@@ -915,6 +919,7 @@ def _build_budgeted_prompt_messages(
         scratchpad=settings.get("scratchpad", ""),
         canvas_documents=canvas_documents,
         canvas_active_document_id=canvas_active_document_id,
+        canvas_prompt_max_lines=canvas_prompt_max_lines,
         workspace_root=workspace_root,
         project_workflow=project_workflow,
     )[0]
@@ -969,6 +974,7 @@ def _build_budgeted_prompt_messages(
         scratchpad=settings.get("scratchpad", ""),
         canvas_documents=canvas_documents,
         canvas_active_document_id=canvas_active_document_id,
+        canvas_prompt_max_lines=canvas_prompt_max_lines,
         workspace_root=workspace_root,
         project_workflow=project_workflow,
     )
@@ -1840,6 +1846,7 @@ def register_chat_routes(app) -> None:
             tool_memory_context,
             canvas_documents=initial_canvas_documents,
             canvas_active_document_id=initial_canvas_active_document_id,
+            canvas_prompt_max_lines=get_canvas_prompt_max_lines(settings),
             workspace_root=workspace_root,
             project_workflow=initial_project_workflow,
         )
@@ -1920,6 +1927,8 @@ def register_chat_routes(app) -> None:
                 fetch_url_clip_aggressiveness=fetch_url_clip_aggressiveness,
                 initial_canvas_documents=initial_canvas_documents,
                 initial_canvas_active_document_id=initial_canvas_active_document_id,
+                canvas_expand_max_lines=get_canvas_expand_max_lines(settings),
+                canvas_scroll_window_lines=get_canvas_scroll_window_lines(settings),
                 workspace_runtime_state=workspace_runtime_state,
                 initial_project_workflow=initial_project_workflow,
             ):

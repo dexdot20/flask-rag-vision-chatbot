@@ -118,6 +118,33 @@
           <div class="settings-page-section-card">
             <div class="settings-page-section-card__header">
               <div>
+                <span class="settings-section-kicker">Canvas visibility</span>
+                <h3>Canvas limits</h3>
+              </div>
+              <p>Control how much of large canvas files the assistant can see by default and per targeted read.</p>
+            </div>
+            <div class="settings-page-grid settings-page-grid--two">
+              <div>
+                <label class="settings-label" for="canvas-prompt-lines-input">Prompt max lines (100-3000)</label>
+                <input type="number" class="settings-number" id="canvas-prompt-lines-input" min="100" max="3000" value="800" />
+                <p class="settings-copy">Injected automatically into each turn for the active canvas document.</p>
+              </div>
+              <div>
+                <label class="settings-label" for="canvas-expand-lines-input">Expand max lines (100-4000)</label>
+                <input type="number" class="settings-number" id="canvas-expand-lines-input" min="100" max="4000" value="1600" />
+                <p class="settings-copy">Used when the assistant calls the larger canvas expansion tool.</p>
+              </div>
+              <div>
+                <label class="settings-label" for="canvas-scroll-lines-input">Scroll window lines (50-800)</label>
+                <input type="number" class="settings-number" id="canvas-scroll-lines-input" min="50" max="800" value="200" />
+                <p class="settings-copy">Caps how many lines a single targeted canvas scroll can return.</p>
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-page-section-card">
+            <div class="settings-page-section-card__header">
+              <div>
                 <span class="settings-section-kicker">Conversation compression</span>
                 <h3>Summary policy</h3>
               </div>

@@ -55,6 +55,7 @@ const canvasTreeCount = document.getElementById("canvas-tree-count");
 const canvasTreeEl = document.getElementById("canvas-tree");
 const canvasSubtitle = document.getElementById("canvas-subtitle");
 const canvasStatus = document.getElementById("canvas-status");
+const canvasHint = document.getElementById("canvas-hint");
 const canvasDiffEl = document.getElementById("canvas-diff");
 const canvasEmptyState = document.getElementById("canvas-empty-state");
 const canvasEditorEl = document.getElementById("canvas-editor");
@@ -472,8 +473,7 @@ function renderHighlightedCodeBlock(codeText, rawLang = null) {
   }).join("");
   const langClass = lang ? ` language-${lang}` : "";
   const langLabel = lang ? `<span class="canvas-code-lang">${escHtml(lang)}</span>` : "";
-  const encodedCopy = encodeURIComponent(normalizedCode);
-  return `<pre class="canvas-code-block" data-copy-source="${encodedCopy}">${langLabel}<button class="canvas-code-copy-btn" type="button">Copy</button><code class="hljs${langClass}">${renderedLines}</code></pre>`;
+  return `<pre class="canvas-code-block">${langLabel}<code class="hljs${langClass}">${renderedLines}</code></pre>`;
 }
 
 if (markdownEngine && typeof markdownEngine.use === "function") {
@@ -603,28 +603,6 @@ function renderCanvasDiffPreview(activeDocument) {
   canvasDiffEl.querySelector('[data-action="dismiss-canvas-diff"]')?.addEventListener("click", () => {
     pendingCanvasDiff = null;
     renderCanvasDiffPreview(getActiveCanvasDocument());
-  });
-}
-
-function enhanceCanvasDocument() {
-  if (!canvasDocumentEl) {
-    return;
-  }
-  canvasDocumentEl.querySelectorAll(".canvas-code-copy-btn").forEach((button) => {
-    button.addEventListener("click", async () => {
-      const pre = button.closest("pre");
-      const raw = pre?.dataset.copySource ? decodeURIComponent(pre.dataset.copySource) : "";
-      if (!navigator.clipboard) {
-        setCanvasStatus("Clipboard is not available.", "warning");
-        return;
-      }
-      try {
-        await navigator.clipboard.writeText(raw);
-        setCanvasStatus("Code block copied.", "success");
-      } catch (_) {
-        setCanvasStatus("Code block copy failed.", "danger");
-      }
-    });
   });
 }
 
@@ -814,6 +792,24 @@ function setCanvasStatus(message, tone = "muted") {
   }
   canvasStatus.textContent = String(message || "").trim() || "Canvas idle";
   canvasStatus.dataset.tone = tone;
+}
+
+function setCanvasHint(message, tone = "muted") {
+  if (!canvasHint) {
+    return;
+  }
+
+  const text = String(message || "").trim();
+  if (!text) {
+    canvasHint.hidden = true;
+    canvasHint.textContent = "";
+    canvasHint.dataset.tone = tone;
+    return;
+  }
+
+  canvasHint.hidden = false;
+  canvasHint.textContent = text;
+  canvasHint.dataset.tone = tone;
 }
 
 function setPendingDocumentCanvasOpen(file) {
@@ -1009,6 +1005,7 @@ function renderCanvasPanel() {
     return;
   }
 
+  const isCanvasPanelOpen = Boolean(canvasPanel?.classList.contains("open"));
   const documents = getCanvasRenderableDocuments();
   syncCanvasFilterControls(documents);
   const visibleDocuments = getCanvasVisibleDocuments(documents);
@@ -1022,6 +1019,7 @@ function renderCanvasPanel() {
     isCanvasEditing = false;
     editingCanvasDocumentId = null;
     canvasSubtitle.textContent = "No canvas document yet.";
+    setCanvasHint("");
     canvasEmptyState.hidden = false;
     if (canvasEditorEl) {
       canvasEditorEl.hidden = true;
@@ -1051,6 +1049,7 @@ function renderCanvasPanel() {
     }
     if (canvasCopyBtn) {
       canvasCopyBtn.disabled = true;
+      canvasCopyBtn.hidden = true;
     }
     if (canvasDeleteBtn) {
       canvasDeleteBtn.disabled = true;
@@ -1087,6 +1086,7 @@ function renderCanvasPanel() {
     isCanvasEditing = false;
     editingCanvasDocumentId = null;
     canvasSubtitle.textContent = `Project mode · ${documents.length} files · no matches`;
+    setCanvasHint("");
     canvasEmptyState.hidden = false;
     canvasEmptyState.innerHTML = "<h3>No files match the current filters</h3><p>Adjust the search term, role, or path filter to bring files back into view.</p>";
     if (canvasEditorEl) {
@@ -1113,6 +1113,7 @@ function renderCanvasPanel() {
     }
     if (canvasCopyBtn) {
       canvasCopyBtn.disabled = true;
+      canvasCopyBtn.hidden = true;
     }
     if (canvasDeleteBtn) {
       canvasDeleteBtn.disabled = true;
@@ -1144,6 +1145,19 @@ function renderCanvasPanel() {
   const roleLabel = activeDocument.role ? ` · ${activeDocument.role}` : "";
   const languageLabel = activeDocument.language ? ` · ${activeDocument.language}` : "";
   canvasSubtitle.textContent = `${modeLabel} · ${visibleDocuments.length}/${documents.length} files · ${detailLabel} · ${activeDocument.line_count} lines${roleLabel}${languageLabel}`;
+  const promptLineLimit = Number(appSettings.canvas_prompt_max_lines || 800);
+  const expandLineLimit = Number(appSettings.canvas_expand_max_lines || 1600);
+  if (Number.isFinite(activeDocument.line_count) && activeDocument.line_count > promptLineLimit) {
+    const hasExpandedRoom = activeDocument.line_count > expandLineLimit;
+    setCanvasHint(
+      hasExpandedRoom
+        ? `Large canvas detected. The default view is truncated. Use scroll_canvas_document for a targeted range or expand_canvas_document for a wider slice.`
+        : `Large canvas detected. The default view is truncated to the first ${promptLineLimit} lines; use scroll_canvas_document for a targeted range.`,
+      "warning"
+    );
+  } else {
+    setCanvasHint("");
+  }
   canvasEmptyState.hidden = true;
   canvasEmptyState.innerHTML = "<h3>No canvas document yet</h3><p>Ask the assistant to draft something substantial, then continue refining it with line-based edits.</p>";
   if (canvasFormatSelect) {
@@ -1186,7 +1200,6 @@ function renderCanvasPanel() {
     if (canvasEditorEl) {
       canvasEditorEl.hidden = true;
     }
-    enhanceCanvasDocument();
   }
 
   if (canvasDocumentTabsEl) {
@@ -1210,6 +1223,7 @@ function renderCanvasPanel() {
   const matchCount = !isCanvasEditing && !isStreamingPreviewActive ? applyCanvasSearchHighlight(searchTerm) : 0;
   if (canvasCopyBtn) {
     canvasCopyBtn.disabled = !String(activeDocument.content || "").length;
+    canvasCopyBtn.hidden = !isCanvasPanelOpen;
   }
   if (canvasDeleteBtn) {
     canvasDeleteBtn.disabled = isStreamingPreviewActive;
@@ -1253,6 +1267,9 @@ function closeCanvas() {
   canvasPanel?.classList.remove("open");
   canvasOverlay?.classList.remove("open");
   canvasPanel?.setAttribute("aria-hidden", "true");
+  if (canvasCopyBtn) {
+    canvasCopyBtn.hidden = true;
+  }
   if (lastCanvasTriggerEl && typeof lastCanvasTriggerEl.focus === "function") {
     lastCanvasTriggerEl.focus();
   }

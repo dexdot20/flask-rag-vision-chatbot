@@ -17,6 +17,9 @@ from config import (
 from db import (
     get_active_tool_names,
     get_app_settings,
+    get_canvas_expand_max_lines,
+    get_canvas_prompt_max_lines,
+    get_canvas_scroll_window_lines,
     get_chat_summary_mode,
     get_chat_summary_trigger_token_count,
     get_fetch_url_clip_aggressiveness,
@@ -47,6 +50,9 @@ def build_settings_payload() -> dict:
         "rag_sensitivity": get_rag_sensitivity(raw),
         "rag_context_size": get_rag_context_size(raw),
         "tool_memory_auto_inject": get_tool_memory_auto_inject_enabled(raw),
+        "canvas_prompt_max_lines": get_canvas_prompt_max_lines(raw),
+        "canvas_expand_max_lines": get_canvas_expand_max_lines(raw),
+        "canvas_scroll_window_lines": get_canvas_scroll_window_lines(raw),
         "chat_summary_mode": get_chat_summary_mode(raw),
         "chat_summary_trigger_token_count": get_chat_summary_trigger_token_count(raw),
         "summary_skip_first": get_summary_skip_first(raw),
@@ -98,6 +104,9 @@ def register_page_routes(app) -> None:
         pruning_batch_size_raw = data.get("pruning_batch_size")
         fetch_url_token_threshold_raw = data.get("fetch_url_token_threshold")
         fetch_url_clip_aggressiveness_raw = data.get("fetch_url_clip_aggressiveness")
+        canvas_prompt_max_lines_raw = data.get("canvas_prompt_max_lines")
+        canvas_expand_max_lines_raw = data.get("canvas_expand_max_lines")
+        canvas_scroll_window_lines_raw = data.get("canvas_scroll_window_lines")
         scratchpad = data.get("scratchpad")
 
         if (
@@ -118,6 +127,9 @@ def register_page_routes(app) -> None:
             and pruning_batch_size_raw is None
             and fetch_url_token_threshold_raw is None
             and fetch_url_clip_aggressiveness_raw is None
+            and canvas_prompt_max_lines_raw is None
+            and canvas_expand_max_lines_raw is None
+            and canvas_scroll_window_lines_raw is None
         ):
             return jsonify({"error": "No settings provided."}), 400
 
@@ -259,6 +271,33 @@ def register_page_routes(app) -> None:
                 return jsonify({"error": "fetch_url_clip_aggressiveness must be between 0 and 100."}), 400
             settings["fetch_url_clip_aggressiveness"] = str(fetch_url_clip_aggressiveness)
 
+        if canvas_prompt_max_lines_raw is not None:
+            try:
+                canvas_prompt_max_lines = int(canvas_prompt_max_lines_raw)
+            except (TypeError, ValueError):
+                return jsonify({"error": "canvas_prompt_max_lines must be an integer."}), 400
+            if not (100 <= canvas_prompt_max_lines <= 3_000):
+                return jsonify({"error": "canvas_prompt_max_lines must be between 100 and 3000."}), 400
+            settings["canvas_prompt_max_lines"] = str(canvas_prompt_max_lines)
+
+        if canvas_expand_max_lines_raw is not None:
+            try:
+                canvas_expand_max_lines = int(canvas_expand_max_lines_raw)
+            except (TypeError, ValueError):
+                return jsonify({"error": "canvas_expand_max_lines must be an integer."}), 400
+            if not (100 <= canvas_expand_max_lines <= 4_000):
+                return jsonify({"error": "canvas_expand_max_lines must be between 100 and 4000."}), 400
+            settings["canvas_expand_max_lines"] = str(canvas_expand_max_lines)
+
+        if canvas_scroll_window_lines_raw is not None:
+            try:
+                canvas_scroll_window_lines = int(canvas_scroll_window_lines_raw)
+            except (TypeError, ValueError):
+                return jsonify({"error": "canvas_scroll_window_lines must be an integer."}), 400
+            if not (50 <= canvas_scroll_window_lines <= 800):
+                return jsonify({"error": "canvas_scroll_window_lines must be between 50 and 800."}), 400
+            settings["canvas_scroll_window_lines"] = str(canvas_scroll_window_lines)
+
         save_app_settings(settings)
         return jsonify(
             {
@@ -270,6 +309,9 @@ def register_page_routes(app) -> None:
                 "rag_sensitivity": get_rag_sensitivity(settings),
                 "rag_context_size": get_rag_context_size(settings),
                 "tool_memory_auto_inject": get_tool_memory_auto_inject_enabled(settings),
+                "canvas_prompt_max_lines": get_canvas_prompt_max_lines(settings),
+                "canvas_expand_max_lines": get_canvas_expand_max_lines(settings),
+                "canvas_scroll_window_lines": get_canvas_scroll_window_lines(settings),
                 "chat_summary_mode": get_chat_summary_mode(settings),
                 "chat_summary_trigger_token_count": get_chat_summary_trigger_token_count(settings),
                 "summary_skip_first": get_summary_skip_first(settings),

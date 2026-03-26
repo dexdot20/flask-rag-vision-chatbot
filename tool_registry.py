@@ -7,6 +7,7 @@ from config import RAG_ENABLED
 
 CANVAS_DOCUMENT_TOOL_NAMES = {
     "expand_canvas_document",
+    "scroll_canvas_document",
     "rewrite_canvas_document",
     "replace_canvas_lines",
     "insert_canvas_lines",
@@ -20,7 +21,7 @@ TOOL_SPECS = [
         "name": "append_scratchpad",
         "description": (
             "Append one durable user-specific fact or preference to the persistent scratchpad. "
-            "Use this only for long-lived information that will likely help in future turns. "
+            "Use this only for long-lived, high-signal information that will likely change future answers or actions. "
             "Do not store temporary task details, sensitive secrets, one-off requests, or speculative inferences."
         ),
         "parameters": {
@@ -34,12 +35,12 @@ TOOL_SPECS = [
             "required": ["note"],
         },
         "prompt": {
-            "purpose": "Saves one short durable user fact or preference into persistent scratchpad memory.",
+            "purpose": "Saves one short durable user fact or preference into persistent scratchpad memory only when it is likely to matter later.",
             "inputs": {"note": "single short durable memory line"},
             "guidance": (
-                "Use very sparingly. Save only durable user-specific facts, recurring constraints, or stable preferences that will likely matter later. "
-                "Do not save temporary requests, current-task details, large summaries, tool outputs, speculative guesses, or sensitive data. "
-                "Prefer one short standalone line instead of paragraphs."
+                "Use very sparingly. Save only durable user-specific facts, recurring constraints, or stable preferences that are likely to matter in future conversations. "
+                "Do not save temporary requests, current-task details, large summaries, tool outputs, web/search results, speculative guesses, or sensitive data. "
+                "If the information would not change future responses or behavior, do not store it. Prefer one short standalone line instead of paragraphs."
             ),
         },
     },
@@ -65,7 +66,7 @@ TOOL_SPECS = [
             "inputs": {"new_content": "the new complete scratchpad content"},
             "guidance": (
                 "Use carefully to prune or reorganize existing facts. Ensure you do not accidentally delete important existing preferences. "
-                "Keep the final text compact, usually a bulleted list of facts."
+                "Keep the final text compact and only include durable, high-signal facts. Prefer a short bulleted list over paragraphs."
             ),
         },
     },
@@ -398,6 +399,48 @@ TOOL_SPECS = [
             "inputs": {"document_id": "optional target id", "document_path": "optional target project-relative path"},
             "guidance": (
                 "Use this when the manifest and active-document excerpt are insufficient and you need another canvas file in full detail. "
+                "In project mode, prefer document_path over document_id so file targeting stays stable."
+            ),
+        },
+    },
+    {
+        "name": "scroll_canvas_document",
+        "description": (
+            "Read a targeted line range from a specific canvas document when you need lines outside the visible excerpt. "
+            "Prefer targeting by document_path in project mode."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "document_id": {
+                    "type": "string",
+                    "description": "Optional target canvas document id."
+                },
+                "document_path": {
+                    "type": "string",
+                    "description": "Optional target project-relative path. Prefer this in project mode."
+                },
+                "start_line": {
+                    "type": "integer",
+                    "description": "1-based starting line number to read."
+                },
+                "end_line": {
+                    "type": "integer",
+                    "description": "1-based ending line number to read."
+                }
+            },
+            "required": ["start_line", "end_line"]
+        },
+        "prompt": {
+            "purpose": "Reads a focused line window from one canvas document without loading the entire file into the prompt.",
+            "inputs": {
+                "document_id": "optional target id",
+                "document_path": "optional target project-relative path",
+                "start_line": "1-based starting line",
+                "end_line": "1-based ending line"
+            },
+            "guidance": (
+                "Use this when you know which region you need and the active excerpt is truncated. "
                 "In project mode, prefer document_path over document_id so file targeting stays stable."
             ),
         },

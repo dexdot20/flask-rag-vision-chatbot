@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 
-from canvas_service import build_canvas_project_manifest, extract_canvas_documents
+from canvas_service import build_canvas_project_manifest, extract_canvas_documents, scale_canvas_char_limit
 from config import (
     MAX_SCRATCHPAD_LENGTH,
     MAX_USER_PREFERENCES_LENGTH,
@@ -178,10 +178,23 @@ def build_api_messages(messages: list[dict]) -> list[dict]:
     return api_messages
 
 
-def _build_canvas_prompt_payload(canvas_documents, active_document_id: str | None = None) -> dict | None:
+def _build_canvas_prompt_payload(
+    canvas_documents,
+    active_document_id: str | None = None,
+    *,
+    max_lines: int = CANVAS_PROMPT_MAX_LINES,
+    max_chars: int | None = None,
+) -> dict | None:
     documents = extract_canvas_documents({"canvas_documents": canvas_documents or []})
     if not documents:
         return None
+
+    if max_chars is None:
+        max_chars = scale_canvas_char_limit(
+            max_lines,
+            default_lines=CANVAS_PROMPT_MAX_LINES,
+            default_chars=CANVAS_PROMPT_MAX_CHARS,
+        )
 
     manifest = build_canvas_project_manifest(documents, active_document_id=active_document_id)
     resolved_active_document_id = str((manifest or {}).get("active_document_id") or "").strip()
@@ -200,10 +213,10 @@ def _build_canvas_prompt_payload(canvas_documents, active_document_id: str | Non
     for index, line in enumerate(all_lines, start=1):
         numbered_line = f"{index}: {line}"
         extra_chars = len(numbered_line) + (1 if visible_lines else 0)
-        if visible_lines and (len(visible_lines) >= CANVAS_PROMPT_MAX_LINES or visible_char_count + extra_chars > CANVAS_PROMPT_MAX_CHARS):
+        if visible_lines and (len(visible_lines) >= max_lines or visible_char_count + extra_chars > max_chars):
             break
-        if not visible_lines and extra_chars > CANVAS_PROMPT_MAX_CHARS:
-            visible_lines.append(numbered_line[:CANVAS_PROMPT_MAX_CHARS])
+        if not visible_lines and extra_chars > max_chars:
+            visible_lines.append(numbered_line[:max_chars])
             visible_char_count = len(visible_lines[0])
             break
         visible_lines.append(numbered_line)
@@ -251,6 +264,7 @@ def build_runtime_system_message(
     scratchpad="",
     canvas_documents=None,
     canvas_active_document_id: str | None = None,
+    canvas_prompt_max_lines: int | None = None,
     workspace_root: str | None = None,
     project_workflow: dict | None = None,
 ):
@@ -289,13 +303,11 @@ def build_runtime_system_message(
         if any(name in {"append_scratchpad", "replace_scratchpad"} for name in active_tool_names):
             parts.append(
                 "\n### Memory Write Policy\n"
-                "- **DO save**: Durable user facts, preferences, confirmed personal details, and cross-conversation insights.\n"
-                "- **DO NOT save**: One-off tasks, secrets, passwords, large summaries, raw tool outputs, or speculation.\n"
-                "- **Web findings**: After every valuable web search, news lookup, or URL fetch, append a concise dated note "
-                "(in English) summarizing the key finding — but ONLY when the result is likely to matter in future conversations. "
-                "Format: `[YYYY-MM-DD] <topic>: <one-line summary>`.\n"
-                "- **Critical rule**: When a web tool call returns information the user explicitly asked for, "
-                "always evaluate whether it deserves a scratchpad entry. Err on the side of saving if in doubt."
+                "- **DO save**: Only durable, high-signal facts that are likely to change future answers or actions. Examples: stable user preferences, long-lived constraints, confirmed identity details, and recurring requirements.\n"
+                "- **DO NOT save**: One-off tasks, transient project state, raw tool outputs, web/search results, speculative inferences, broad summaries, or details already obvious from the current chat.\n"
+                "- **Before saving**: Ask whether this information will still matter in a future conversation and whether it is specific enough to be useful as a single short note. If not, do not save it.\n"
+                "- **Web findings**: Do not turn search/news/URL results into scratchpad entries unless the result is clearly durable and the user would reasonably expect it to be remembered later. Never save them just because they were requested.\n"
+                "- **Style**: Prefer one short line per fact. Avoid paragraphs, lists of facts, or duplicated variants of the same note."
             )
         parts.append("")
 
@@ -357,7 +369,11 @@ def build_runtime_system_message(
         parts.append("## Project Workflow")
         parts.append("```json\n" + json.dumps(project_workflow, ensure_ascii=False, indent=2) + "\n```\n")
 
-    canvas_payload = _build_canvas_prompt_payload(canvas_documents, active_document_id=canvas_active_document_id)
+    canvas_payload = _build_canvas_prompt_payload(
+        canvas_documents,
+        active_document_id=canvas_active_document_id,
+        max_lines=canvas_prompt_max_lines or CANVAS_PROMPT_MAX_LINES,
+    )
     if canvas_payload:
         manifest = canvas_payload.get("manifest")
         if manifest and canvas_payload.get("mode") == "project":
@@ -388,8 +404,9 @@ def build_runtime_system_message(
             + (" (truncated excerpt)" if canvas_payload["is_truncated"] else "")
         )
         parts.append(
-            "- Guidance: Use the visible line numbers for line-level canvas edits. "
-            "If the required region is outside the visible excerpt, prefer rewrite_canvas_document over guessing line numbers."
+            "- Guidance: Use visible line numbers for line-level canvas edits. "
+            "If this excerpt is truncated, call expand_canvas_document for a larger view or scroll_canvas_document for a targeted range before editing. "
+            "Never guess line numbers outside the visible excerpt."
         )
         if canvas_payload["visible_lines"]:
             parts.append("```json\n" + json.dumps(canvas_payload["visible_lines"], ensure_ascii=False, indent=2) + "\n```\n")
@@ -430,6 +447,7 @@ def prepend_runtime_context(
     scratchpad="",
     canvas_documents=None,
     canvas_active_document_id: str | None = None,
+    canvas_prompt_max_lines: int | None = None,
     workspace_root: str | None = None,
     project_workflow: dict | None = None,
 ):
@@ -444,6 +462,7 @@ def prepend_runtime_context(
         scratchpad=scratchpad,
         canvas_documents=canvas_documents,
         canvas_active_document_id=canvas_active_document_id,
+        canvas_prompt_max_lines=canvas_prompt_max_lines,
         workspace_root=workspace_root,
         project_workflow=project_workflow,
     )

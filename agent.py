@@ -24,6 +24,8 @@ from canvas_service import (
     insert_canvas_lines,
     replace_canvas_lines,
     rewrite_canvas_document,
+    scroll_canvas_document,
+    scale_canvas_char_limit,
 )
 from project_workspace_service import (
     bulk_update_workspace_files,
@@ -83,6 +85,7 @@ MISSING_FINAL_ANSWER_MARKER = "[INSTRUCTION: MISSING FINAL ANSWER"
 TOOL_EXECUTION_RESULTS_MARKER = "[TOOL EXECUTION RESULTS]"
 CANVAS_TOOL_NAMES = {
     "expand_canvas_document",
+    "scroll_canvas_document",
     "create_canvas_document",
     "rewrite_canvas_document",
     "replace_canvas_lines",
@@ -1431,13 +1434,33 @@ def _run_create_canvas_document(tool_args: dict, runtime_state: dict):
 
 def _run_expand_canvas_document(tool_args: dict, runtime_state: dict):
     canvas_state = _get_canvas_runtime_state(runtime_state)
+    canvas_limits = runtime_state.get("canvas_limits") if isinstance(runtime_state.get("canvas_limits"), dict) else {}
+    expand_max_lines = int(canvas_limits.get("expand_max_lines") or 0) or None
     result = build_canvas_document_context_result(
         canvas_state,
         document_id=tool_args.get("document_id"),
         document_path=tool_args.get("document_path"),
+        max_lines=expand_max_lines,
+        max_chars=scale_canvas_char_limit(expand_max_lines, default_lines=800, default_chars=20_000) if expand_max_lines else None,
     )
     target_label = str(result.get("document_path") or result.get("title") or "Canvas").strip()
     return result, f"Canvas expanded: {target_label}"
+
+
+def _run_scroll_canvas_document(tool_args: dict, runtime_state: dict):
+    canvas_state = _get_canvas_runtime_state(runtime_state)
+    canvas_limits = runtime_state.get("canvas_limits") if isinstance(runtime_state.get("canvas_limits"), dict) else {}
+    scroll_window_lines = int(canvas_limits.get("scroll_window_lines") or 0) or 200
+    result = scroll_canvas_document(
+        canvas_state,
+        start_line=int(tool_args.get("start_line") or 0),
+        end_line=int(tool_args.get("end_line") or 0),
+        document_id=tool_args.get("document_id"),
+        document_path=tool_args.get("document_path"),
+        max_window_lines=scroll_window_lines,
+    )
+    target_label = str(result.get("document_path") or result.get("title") or "Canvas").strip()
+    return result, f"Canvas scrolled: {target_label} {result.get('start_line')}-{result.get('end_line_actual')}"
 
 
 def _get_workspace_runtime_state(runtime_state: dict) -> dict:
@@ -1710,6 +1733,7 @@ _TOOL_EXECUTORS = {
     "search_news_google": _run_search_news_google,
     "fetch_url": _run_fetch_url,
     "expand_canvas_document": _run_expand_canvas_document,
+    "scroll_canvas_document": _run_scroll_canvas_document,
     "plan_project_workspace": _run_plan_project_workspace,
     "get_project_workflow_status": _run_get_project_workflow_status,
     "create_directory": _run_create_directory,
@@ -2130,6 +2154,8 @@ def run_agent_stream(
     fetch_url_clip_aggressiveness: int | None = None,
     initial_canvas_documents: list[dict] | None = None,
     initial_canvas_active_document_id: str | None = None,
+    canvas_expand_max_lines: int | None = None,
+    canvas_scroll_window_lines: int | None = None,
     workspace_runtime_state: dict | None = None,
     initial_project_workflow: dict | None = None,
 ):
@@ -2159,6 +2185,10 @@ def run_agent_stream(
             initial_canvas_documents,
             active_document_id=initial_canvas_active_document_id,
         ),
+        "canvas_limits": {
+            "expand_max_lines": int(canvas_expand_max_lines or 800),
+            "scroll_window_lines": int(canvas_scroll_window_lines or 200),
+        },
         "workspace": workspace_runtime_state if isinstance(workspace_runtime_state, dict) else create_workspace_runtime_state(),
         "project_workflow": create_project_workflow_runtime_state(initial_project_workflow),
     }

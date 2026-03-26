@@ -2131,6 +2131,24 @@ kbd {
 .canvas-status[data-tone="warning"]  { color: #f1cf7a; }
 .canvas-status[data-tone="danger"]   { color: #f08b8b; }
 
+.canvas-hint {
+  padding: 8px 16px 11px;
+  border-bottom: 1px solid var(--border);
+  background: linear-gradient(180deg, rgba(79, 110, 247, 0.08), rgba(79, 110, 247, 0.03));
+  color: #dce2ff;
+  font-size: 0.76rem;
+  line-height: 1.45;
+}
+
+.canvas-hint[data-tone="warning"] {
+  color: #f1cf7a;
+  background: linear-gradient(180deg, rgba(241, 207, 122, 0.12), rgba(241, 207, 122, 0.05));
+}
+
+.canvas-hint[data-tone="muted"] {
+  color: #dce2ff;
+}
+
 .canvas-workspace-shell {
   flex: 1;
   min-height: 0;
@@ -2503,26 +2521,6 @@ kbd {
   letter-spacing: 0.06em;
   text-transform: uppercase;
   user-select: none;
-}
-
-.canvas-code-copy-btn {
-  position: absolute;
-  top: 10px;
-  right: 10px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  background: rgba(255, 255, 255, 0.05);
-  color: var(--text-secondary);
-  border-radius: 6px;
-  font-size: 0.72rem;
-  padding: 4px 8px;
-  cursor: pointer;
-  transition: background 0.15s, border-color 0.15s, color 0.15s;
-}
-
-.canvas-code-copy-btn:hover {
-  background: rgba(79, 110, 247, 0.12);
-  border-color: rgba(79, 110, 247, 0.28);
-  color: var(--text-primary);
 }
 
 .canvas-document pre > code {

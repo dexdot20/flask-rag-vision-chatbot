@@ -37,6 +37,7 @@ from canvas_service import (
     get_canvas_runtime_active_document_id,
     normalize_canvas_document,
     replace_canvas_lines,
+    scroll_canvas_document,
 )
 from doc_service import build_canvas_markdown, infer_canvas_format, infer_canvas_language
 from db import (
@@ -44,6 +45,9 @@ from db import (
     append_to_scratchpad,
     count_visible_message_tokens,
     create_image_asset,
+    get_canvas_expand_max_lines,
+    get_canvas_prompt_max_lines,
+    get_canvas_scroll_window_lines,
     get_active_tool_names,
     get_app_settings,
     get_db,
@@ -60,6 +64,7 @@ from prune_service import _build_pruning_messages
 from project_workspace_service import create_workspace_runtime_state
 from messages import (
     SUMMARY_LABEL,
+    _build_canvas_prompt_payload,
     build_api_messages,
     build_runtime_system_message,
     build_user_message_for_model,
@@ -147,6 +152,9 @@ class AppRoutesTestCase(unittest.TestCase):
         payload = response.get_json()
         self.assertEqual(payload["scratchpad"], "")
         self.assertEqual(payload["max_steps"], 5)
+        self.assertEqual(payload["canvas_prompt_max_lines"], 800)
+        self.assertEqual(payload["canvas_expand_max_lines"], 1600)
+        self.assertEqual(payload["canvas_scroll_window_lines"], 200)
         self.assertTrue(payload["rag_auto_inject"])
         self.assertEqual(payload["chat_summary_mode"], "auto")
         self.assertEqual(payload["chat_summary_trigger_token_count"], 80000)
@@ -174,6 +182,9 @@ class AppRoutesTestCase(unittest.TestCase):
                 "pruning_batch_size": 4,
                 "fetch_url_token_threshold": 4200,
                 "fetch_url_clip_aggressiveness": 70,
+                "canvas_prompt_max_lines": 1200,
+                "canvas_expand_max_lines": 2200,
+                "canvas_scroll_window_lines": 150,
                 "active_tools": ["fetch_url", "search_web"],
                 "rag_auto_inject": False,
                 "rag_sensitivity": "strict",
@@ -193,6 +204,9 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(payload["pruning_batch_size"], 4)
         self.assertEqual(payload["fetch_url_token_threshold"], 4200)
         self.assertEqual(payload["fetch_url_clip_aggressiveness"], 70)
+        self.assertEqual(payload["canvas_prompt_max_lines"], 1200)
+        self.assertEqual(payload["canvas_expand_max_lines"], 2200)
+        self.assertEqual(payload["canvas_scroll_window_lines"], 150)
         self.assertEqual(payload["active_tools"], ["fetch_url", "search_web"])
         self.assertFalse(payload["rag_auto_inject"])
         self.assertEqual(payload["rag_sensitivity"], "strict")
@@ -232,6 +246,130 @@ class AppRoutesTestCase(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertIn("pruning_batch_size", response.get_json()["error"])
+
+    def test_settings_patch_rejects_invalid_canvas_values(self):
+        response = self.client.patch(
+            "/api/settings",
+            json={"canvas_prompt_max_lines": 99},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("canvas_prompt_max_lines", response.get_json()["error"])
+
+        response = self.client.patch(
+            "/api/settings",
+            json={"canvas_expand_max_lines": 5000},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("canvas_expand_max_lines", response.get_json()["error"])
+
+        response = self.client.patch(
+            "/api/settings",
+            json={"canvas_scroll_window_lines": 49},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("canvas_scroll_window_lines", response.get_json()["error"])
+
+    def test_canvas_limit_getters_clamp_values(self):
+        settings = get_app_settings()
+        settings["canvas_prompt_max_lines"] = "50000"
+        settings["canvas_expand_max_lines"] = "-1"
+        settings["canvas_scroll_window_lines"] = "nope"
+
+        self.assertEqual(get_canvas_prompt_max_lines(settings), 3000)
+        self.assertEqual(get_canvas_expand_max_lines(settings), 100)
+        self.assertEqual(get_canvas_scroll_window_lines(settings), 200)
+
+    def test_build_canvas_prompt_payload_respects_max_lines(self):
+        content = "\n".join(f"line {index}" for index in range(1, 51))
+        document = normalize_canvas_document(
+            {
+                "id": "doc-1",
+                "title": "Large file",
+                "format": "code",
+                "language": "python",
+                "content": content,
+            }
+        )
+
+        payload = _build_canvas_prompt_payload([document], max_lines=10)
+
+        self.assertIsNotNone(payload)
+        self.assertEqual(len(payload["visible_lines"]), 10)
+        self.assertEqual(payload["visible_line_end"], 10)
+        self.assertTrue(payload["is_truncated"])
+
+    def test_scroll_canvas_document_returns_window_flags(self):
+        content = "\n".join(f"line {index}" for index in range(1, 101))
+        runtime_state = create_canvas_runtime_state(
+            [
+                {
+                    "id": "doc-1",
+                    "title": "Large file",
+                    "format": "code",
+                    "language": "python",
+                    "content": content,
+                }
+            ]
+        )
+
+        result = scroll_canvas_document(runtime_state, 20, 60, max_window_lines=15)
+
+        self.assertEqual(result["start_line"], 20)
+        self.assertEqual(result["end_line_actual"], 34)
+        self.assertEqual(len(result["visible_lines"]), 15)
+        self.assertTrue(result["has_more_above"])
+        self.assertTrue(result["has_more_below"])
+
+    def test_execute_tool_scroll_canvas_document_uses_runtime_window_limit(self):
+        content = "\n".join(f"line {index}" for index in range(1, 101))
+        runtime_state = {
+            "canvas": create_canvas_runtime_state(
+                [
+                    {
+                        "id": "doc-1",
+                        "title": "Large file",
+                        "format": "code",
+                        "language": "python",
+                        "content": content,
+                    }
+                ]
+            ),
+            "canvas_limits": {"scroll_window_lines": 12},
+        }
+
+        result, summary = _execute_tool(
+            "scroll_canvas_document",
+            {"start_line": 5, "end_line": 99},
+            runtime_state=runtime_state,
+        )
+
+        self.assertEqual(result["action"], "scrolled")
+        self.assertEqual(result["start_line"], 5)
+        self.assertEqual(result["end_line_actual"], 16)
+        self.assertIn("Canvas scrolled", summary)
+
+    def test_runtime_system_message_mentions_canvas_scroll_for_truncated_excerpt(self):
+        content = "\n".join(f"line {index}" for index in range(1, 51))
+        document = normalize_canvas_document(
+            {
+                "id": "doc-1",
+                "title": "Large file",
+                "format": "code",
+                "language": "python",
+                "content": content,
+            }
+        )
+
+        message = build_runtime_system_message(
+            canvas_documents=[document],
+            canvas_prompt_max_lines=10,
+        )
+
+        self.assertIn("scroll_canvas_document", message["content"])
+        self.assertIn("expand_canvas_document", message["content"])
 
     def test_extract_partial_json_string_value_handles_partial_escapes(self):
         arguments_text = "{\"title\":\"Plan\",\"content\":\"Line 1\\nLine 2\\u00e7 ve \\\"quote\\\""
@@ -656,8 +794,11 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn("User Preferences\nKeep answers short.", content)
         self.assertIn("Scratchpad (AI Persistent Memory)", content)
         self.assertIn("The user is 22 years old.", content)
-        self.assertIn("Durable user facts", content)
+        self.assertIn("Only durable, high-signal facts", content)
         self.assertIn("Web findings", content)
+        self.assertIn("If the information would not change future responses or behavior, do not store it.", content)
+        self.assertIn("Never save them just because they were requested.", content)
+        self.assertNotIn("Err on the side of saving if in doubt.", content)
         self.assertIn("Clarification**: If a good answer depends", content)
         self.assertIn("Image Follow-up**: Use for follow-up questions", content)
         self.assertIn("Tool Memory", content)

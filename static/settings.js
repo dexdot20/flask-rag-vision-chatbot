@@ -27,6 +27,9 @@ const pruningTokenThresholdEl = document.getElementById("pruning-token-threshold
 const pruningBatchSizeEl = document.getElementById("pruning-batch-size-input");
 const fetchThresholdEl = document.getElementById("fetch-threshold-input");
 const fetchAggressivenessEl = document.getElementById("fetch-aggressiveness-input");
+const canvasPromptLinesEl = document.getElementById("canvas-prompt-lines-input");
+const canvasExpandLinesEl = document.getElementById("canvas-expand-lines-input");
+const canvasScrollLinesEl = document.getElementById("canvas-scroll-lines-input");
 const ragAutoInjectEl = document.getElementById("rag-auto-inject-toggle");
 const ragInjectOptionsEl = document.getElementById("rag-inject-options");
 const ragSensitivityEl = document.getElementById("rag-sensitivity-select");
@@ -269,6 +272,9 @@ function applySettingsToForm() {
   if (pruningBatchSizeEl) pruningBatchSizeEl.value = String(appSettings.pruning_batch_size || 10);
   if (fetchThresholdEl) fetchThresholdEl.value = String(appSettings.fetch_url_token_threshold || 3500);
   if (fetchAggressivenessEl) fetchAggressivenessEl.value = String(appSettings.fetch_url_clip_aggressiveness || 50);
+  if (canvasPromptLinesEl) canvasPromptLinesEl.value = String(appSettings.canvas_prompt_max_lines || 800);
+  if (canvasExpandLinesEl) canvasExpandLinesEl.value = String(appSettings.canvas_expand_max_lines || 1600);
+  if (canvasScrollLinesEl) canvasScrollLinesEl.value = String(appSettings.canvas_scroll_window_lines || 200);
   applySelectedTools(appSettings.active_tools || []);
   if (ragAutoInjectEl) {
     ragAutoInjectEl.checked = Boolean(featureFlags.rag_enabled ? appSettings.rag_auto_inject : false);
@@ -330,6 +336,9 @@ async function refreshSettings() {
     appSettings.pruning_batch_size = data.pruning_batch_size || 10;
     appSettings.fetch_url_token_threshold = data.fetch_url_token_threshold || 3500;
     appSettings.fetch_url_clip_aggressiveness = data.fetch_url_clip_aggressiveness ?? 50;
+    appSettings.canvas_prompt_max_lines = data.canvas_prompt_max_lines || 800;
+    appSettings.canvas_expand_max_lines = data.canvas_expand_max_lines || 1600;
+    appSettings.canvas_scroll_window_lines = data.canvas_scroll_window_lines || 200;
     appSettings.active_tools = Array.isArray(data.active_tools) ? data.active_tools : [];
     appSettings.rag_auto_inject = Boolean(data.rag_auto_inject);
     appSettings.rag_sensitivity = data.rag_sensitivity || "normal";
@@ -362,6 +371,9 @@ async function saveSettings() {
     pruning_batch_size: parseInt(pruningBatchSizeEl?.value || "", 10) || 10,
     fetch_url_token_threshold: parseInt(fetchThresholdEl?.value || "", 10) || 3500,
     fetch_url_clip_aggressiveness: parseInt(fetchAggressivenessEl?.value || "", 10) || 50,
+    canvas_prompt_max_lines: parseInt(canvasPromptLinesEl?.value || "", 10) || 800,
+    canvas_expand_max_lines: parseInt(canvasExpandLinesEl?.value || "", 10) || 1600,
+    canvas_scroll_window_lines: parseInt(canvasScrollLinesEl?.value || "", 10) || 200,
     active_tools: getSelectedTools(),
     rag_auto_inject: featureFlags.rag_enabled ? Boolean(ragAutoInjectEl?.checked) : false,
     rag_sensitivity: ragSensitivityEl?.value || "normal",
@@ -399,6 +411,9 @@ async function saveSettings() {
     appSettings.pruning_batch_size = data.pruning_batch_size || 10;
     appSettings.fetch_url_token_threshold = data.fetch_url_token_threshold || 3500;
     appSettings.fetch_url_clip_aggressiveness = data.fetch_url_clip_aggressiveness ?? 50;
+    appSettings.canvas_prompt_max_lines = data.canvas_prompt_max_lines || 800;
+    appSettings.canvas_expand_max_lines = data.canvas_expand_max_lines || 1600;
+    appSettings.canvas_scroll_window_lines = data.canvas_scroll_window_lines || 200;
     appSettings.active_tools = Array.isArray(data.active_tools) ? data.active_tools : [];
     appSettings.rag_auto_inject = Boolean(data.rag_auto_inject);
     appSettings.rag_sensitivity = data.rag_sensitivity || "normal";
@@ -587,6 +602,9 @@ function registerDirtyListeners() {
   pruningBatchSizeEl?.addEventListener("input", markDirty);
   fetchThresholdEl?.addEventListener("input", markDirty);
   fetchAggressivenessEl?.addEventListener("input", markDirty);
+  canvasPromptLinesEl?.addEventListener("input", markDirty);
+  canvasExpandLinesEl?.addEventListener("input", markDirty);
+  canvasScrollLinesEl?.addEventListener("input", markDirty);
   ragAutoInjectEl?.addEventListener("change", markDirty);
   ragSensitivityEl?.addEventListener("change", () => {
     updateRagSensitivityHint();

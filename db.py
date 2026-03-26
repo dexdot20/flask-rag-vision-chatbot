@@ -13,6 +13,9 @@ from flask import current_app, has_app_context
 from canvas_service import extract_canvas_active_document_id, extract_canvas_documents
 from config import (
     CACHE_TTL_HOURS,
+    CANVAS_EXPAND_DEFAULT_MAX_LINES,
+    CANVAS_PROMPT_DEFAULT_MAX_LINES,
+    CANVAS_SCROLL_WINDOW_LINES,
     CHAT_SUMMARY_ALLOWED_MODES,
     CHAT_SUMMARY_MODE,
     CHAT_SUMMARY_TRIGGER_TOKEN_COUNT,
@@ -1579,6 +1582,36 @@ def get_summary_skip_last(settings: dict | None = None) -> int:
     except (TypeError, ValueError):
         value = 1
     return max(0, min(20, value))
+
+
+def get_canvas_prompt_max_lines(settings: dict | None = None) -> int:
+    source = settings if settings is not None else get_app_settings()
+    raw_value = source.get("canvas_prompt_max_lines", DEFAULT_SETTINGS["canvas_prompt_max_lines"])
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        value = CANVAS_PROMPT_DEFAULT_MAX_LINES
+    return max(100, min(3_000, value))
+
+
+def get_canvas_expand_max_lines(settings: dict | None = None) -> int:
+    source = settings if settings is not None else get_app_settings()
+    raw_value = source.get("canvas_expand_max_lines", DEFAULT_SETTINGS["canvas_expand_max_lines"])
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        value = CANVAS_EXPAND_DEFAULT_MAX_LINES
+    return max(100, min(4_000, value))
+
+
+def get_canvas_scroll_window_lines(settings: dict | None = None) -> int:
+    source = settings if settings is not None else get_app_settings()
+    raw_value = source.get("canvas_scroll_window_lines", DEFAULT_SETTINGS["canvas_scroll_window_lines"])
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        value = CANVAS_SCROLL_WINDOW_LINES
+    return max(50, min(800, value))
 
 
 def get_prompt_max_input_tokens(settings: dict | None = None) -> int:
