@@ -2080,7 +2080,11 @@ async function pruneMessage(messageId) {
   }
 }
 
-function renderConversationHistory() {
+function renderConversationHistory(options = {}) {
+  const preserveScroll = options && options.preserveScroll === true;
+  const previousDistanceFromBottom = preserveScroll
+    ? messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight
+    : 0;
   const fragment = document.createDocumentFragment();
   fragment.appendChild(emptyState);
 
@@ -2107,7 +2111,15 @@ function renderConversationHistory() {
     }));
   });
   messagesEl.replaceChildren(fragment);
-  scrollToBottom();
+  if (preserveScroll) {
+    if (previousDistanceFromBottom <= 100) {
+      scrollToBottom();
+    } else {
+      messagesEl.scrollTop = Math.max(0, messagesEl.scrollHeight - messagesEl.clientHeight - previousDistanceFromBottom);
+    }
+  } else {
+    scrollToBottom();
+  }
   renderSummaryInspector();
 }
 
@@ -2139,7 +2151,7 @@ async function refreshConversationFromServer() {
   resetStreamingCanvasPreview();
   activeCanvasDocumentId = getActiveCanvasDocument(history)?.id || null;
   lastConversationSignature = serverSignature;
-  renderConversationHistory();
+  renderConversationHistory({ preserveScroll: true });
   renderCanvasPanel();
   updateExportPanel();
   rebuildTokenStatsFromHistory();
@@ -2214,6 +2226,21 @@ function createAssistantStreamingGroup() {
   scrollToBottom();
 
   return { asstGroup, stepLog, asstBubble };
+}
+
+function finalizeAssistantStreamingGroup(asstGroup, stepLog, metadata) {
+  if (!asstGroup) {
+    return;
+  }
+
+  if (stepLog) {
+    stepLog.style.display = "none";
+  }
+
+  updateAssistantFetchBadge(asstGroup, metadata);
+  updateAssistantToolTrace(asstGroup, metadata);
+  updateReasoningPanel(asstGroup, getReasoningText(metadata));
+  appendClarificationPanel(asstGroup, metadata, {});
 }
 
 function applyPersistedMessageIds(persistedIds, assistantEntry) {
@@ -3156,7 +3183,7 @@ function normalizeToolSummary(summary) {
 
   const cached = /\(cached\)$/i.test(raw);
   const withoutCached = raw.replace(/\s*\(cached\)$/i, "").trim();
-  const isError = /^error:/i.test(withoutCached);
+  const isError = /^error:/i.test(withoutCached) || /^failed:/i.test(withoutCached) || /^[^:]{0,120}\bfailed:\s*/i.test(withoutCached);
   const text = isError ? withoutCached.replace(/^error:\s*/i, "").trim() : withoutCached;
   return { text, cached, isError };
 }
@@ -4028,7 +4055,7 @@ function updateAssistantToolTrace(group, metadata) {
       toolName: entry.tool_name,
       preview: entry.preview,
       summary: normalizedSummary.text,
-      state: entry.state || (normalizedSummary.isError ? "error" : "done"),
+      state: normalizedSummary.isError ? "error" : entry.state || "done",
       cached: entry.cached || normalizedSummary.cached,
     });
     sectionItems.appendChild(item);
@@ -4941,6 +4968,7 @@ async function sendMessage(options = {}) {
       history.push(...assistantToolHistory, assistantEntry);
       applyPersistedMessageIds(persistedMessageIds, assistantEntry);
     }
+    finalizeAssistantStreamingGroup(asstGroup, stepLog, assistantEntry.metadata);
     clearEditTarget();
     renderSummaryInspector();
 
@@ -4978,6 +5006,7 @@ async function sendMessage(options = {}) {
         history.push(...assistantToolHistory, assistantEntry);
         applyPersistedMessageIds(persistedMessageIds, assistantEntry);
       }
+      finalizeAssistantStreamingGroup(asstGroup, stepLog, assistantEntry.metadata);
       clearEditTarget();
       renderSummaryInspector();
       loadSidebar();

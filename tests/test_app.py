@@ -78,6 +78,7 @@ from routes.chat import (
     OMITTED_TOOL_OUTPUT_TEXT,
     _count_prunable_message_tokens,
     _estimate_prompt_tokens,
+    _is_failed_tool_summary,
     _select_recent_prompt_window,
     _select_summary_source_messages_by_token_budget,
     build_summary_prompt_messages,
@@ -163,8 +164,8 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(payload["pruning_batch_size"], 10)
         self.assertEqual(payload["fetch_url_token_threshold"], 3500)
         self.assertEqual(payload["fetch_url_clip_aggressiveness"], 50)
-        self.assertEqual(payload["rag_sensitivity"], "normal")
-        self.assertEqual(payload["rag_context_size"], "medium")
+        self.assertEqual(payload["rag_sensitivity"], "strict")
+        self.assertEqual(payload["rag_context_size"], "small")
         self.assertTrue(payload["tool_memory_auto_inject"])
         self.assertIn("features", payload)
         self.assertTrue(payload["features"]["rag_enabled"])
@@ -2380,6 +2381,11 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(assistant_message["usage"]["estimated_input_tokens"], 14)
         self.assertEqual(assistant_message["usage"]["input_breakdown"]["system_prompt"], 4)
         self.assertEqual(assistant_message["metadata"]["tool_trace"][0]["tool_name"], "search_web")
+
+    def test_failed_tool_summary_detection_marks_fetch_failures(self):
+        self.assertTrue(_is_failed_tool_summary("Fetch failed: HTTP 403"))
+        self.assertTrue(_is_failed_tool_summary("failed: timeout while reading response"))
+        self.assertFalse(_is_failed_tool_summary("Page content extracted: Example"))
 
     def test_chat_stream_persists_pending_clarification(self):
         conversation_id = self._create_conversation()

@@ -88,7 +88,7 @@ from messages import (
 )
 from project_workspace_service import create_workspace_runtime_state, find_latest_project_workflow, get_workspace_root
 from rag import preload_embedder
-from rag_service import build_rag_auto_context, build_tool_memory_auto_context
+from rag_service import build_rag_auto_context, build_tool_memory_auto_context, conversation_rag_source_key
 from rag_service import sync_conversations_to_rag_safe
 from routes.request_utils import is_valid_model_id, normalize_model_id, parse_messages_payload, parse_optional_int
 from token_utils import estimate_text_tokens
@@ -1455,6 +1455,15 @@ def parse_chat_request_payload():
     }
 
 
+def _is_failed_tool_summary(summary: str) -> bool:
+    text = re.sub(r"\s+", " ", str(summary or "").strip()).lower()
+    if not text:
+        return False
+    if text.startswith("error:") or text.startswith("failed:"):
+        return True
+    return bool(re.match(r"^[^:]{0,120}\bfailed:\s*", text))
+
+
 def register_chat_routes(app) -> None:
     def upsert_tool_trace_entry(entries: list[dict], call_map: dict[str, int], event: dict) -> None:
         tool_name = str(event.get("tool") or "").strip()
@@ -1486,10 +1495,10 @@ def register_chat_routes(app) -> None:
             if summary:
                 entry["summary"] = summary
         elif event_type == "tool_result":
-            entry["state"] = "done"
             summary = str(event.get("summary") or "").strip()
             if summary:
                 entry["summary"] = summary
+            entry["state"] = "error" if _is_failed_tool_summary(summary) else "done"
             if "(cached)" in summary.lower():
                 entry["cached"] = True
         else:
@@ -1812,11 +1821,15 @@ def register_chat_routes(app) -> None:
             if preflight_summary_outcome and preflight_summary_outcome.get("applied"):
                 canonical_messages = preflight_summary_outcome.get("messages") or get_conversation_messages(conv_id)
 
+        rag_exclude_source_keys = (
+            {conversation_rag_source_key("conversation", conv_id)} if conv_id else None
+        )
         retrieved_context = build_rag_auto_context(
             rag_query_text,
             get_rag_auto_inject_enabled(settings),
             threshold=RAG_SENSITIVITY_PRESETS[get_rag_sensitivity(settings)],
             top_k=get_rag_auto_inject_top_k(settings),
+            exclude_source_keys=rag_exclude_source_keys,
         )
         tool_memory_context = (
             build_tool_memory_auto_context(

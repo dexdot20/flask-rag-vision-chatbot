@@ -497,19 +497,23 @@ def fetch_url_tool(url: str) -> dict:
                         result,
                         "SSL certificate verification failed; retried without certificate verification",
                     )
-                if resp.status_code >= 400:
-                    _append_fetch_warning(result, f"HTTP {resp.status_code} returned by origin")
-                    if resp.status_code in _FETCH_RETRYABLE_STATUS_CODES and not _has_useful_fetch_content(result):
+                status_code = int(getattr(resp, "status_code", 0) or 0)
+                if status_code >= 400:
+                    _append_fetch_warning(result, f"HTTP {status_code} returned by origin")
+                    if status_code in _FETCH_RETRYABLE_STATUS_CODES and not _has_useful_fetch_content(result):
                         best_result = best_result or result
-                        last_error = f"HTTP {resp.status_code}"
+                        last_error = f"HTTP {status_code}"
                         if index + 1 < len(header_variants):
                             continue
                         break
 
                 if not result.get("content"):
                     best_result = best_result or result
-                    last_error = last_error or "Fetched page returned no extractable content"
-                    if index + 1 < len(header_variants):
+                    if status_code >= 400:
+                        last_error = last_error or f"HTTP {status_code}"
+                    else:
+                        last_error = last_error or "Fetched page returned no extractable content"
+                    if status_code in _FETCH_RETRYABLE_STATUS_CODES and index + 1 < len(header_variants):
                         continue
                     break
 

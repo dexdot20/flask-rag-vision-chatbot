@@ -590,7 +590,13 @@ def build_tool_memory_auto_context(query: str, top_k: int) -> str | None:
     return "\n\n".join(sections)
 
 
-def build_rag_auto_context(query: str, enabled: bool, threshold: float, top_k: int) -> dict | None:
+def build_rag_auto_context(
+    query: str,
+    enabled: bool,
+    threshold: float,
+    top_k: int,
+    exclude_source_keys: set[str] | None = None,
+) -> dict | None:
     query = str(query or "").strip()
     if not RAG_ENABLED or not enabled or not query:
         return None
@@ -601,6 +607,8 @@ def build_rag_auto_context(query: str, enabled: bool, threshold: float, top_k: i
         return None
 
     matches = _normalize_rag_hits(query, hits, max(0.0, min(1.0, float(threshold))))
+    if exclude_source_keys:
+        matches = [m for m in matches if m.get("source_key") not in exclude_source_keys]
     if not matches:
         return None
 
