@@ -22,6 +22,9 @@ const summaryModeEl = document.getElementById("summary-mode-select");
 const summaryTriggerEl = document.getElementById("summary-trigger-input");
 const summarySkipFirstEl = document.getElementById("summary-skip-first-input");
 const summarySkipLastEl = document.getElementById("summary-skip-last-input");
+const pruningEnabledEl = document.getElementById("pruning-enabled-toggle");
+const pruningTokenThresholdEl = document.getElementById("pruning-token-threshold-input");
+const pruningBatchSizeEl = document.getElementById("pruning-batch-size-input");
 const fetchThresholdEl = document.getElementById("fetch-threshold-input");
 const fetchAggressivenessEl = document.getElementById("fetch-aggressiveness-input");
 const ragAutoInjectEl = document.getElementById("rag-auto-inject-toggle");
@@ -261,6 +264,9 @@ function applySettingsToForm() {
   if (summaryTriggerEl) summaryTriggerEl.value = String(appSettings.chat_summary_trigger_token_count || 80000);
   if (summarySkipFirstEl) summarySkipFirstEl.value = String(appSettings.summary_skip_first ?? 2);
   if (summarySkipLastEl) summarySkipLastEl.value = String(appSettings.summary_skip_last ?? 1);
+  if (pruningEnabledEl) pruningEnabledEl.checked = Boolean(appSettings.pruning_enabled);
+  if (pruningTokenThresholdEl) pruningTokenThresholdEl.value = String(appSettings.pruning_token_threshold || 80000);
+  if (pruningBatchSizeEl) pruningBatchSizeEl.value = String(appSettings.pruning_batch_size || 10);
   if (fetchThresholdEl) fetchThresholdEl.value = String(appSettings.fetch_url_token_threshold || 3500);
   if (fetchAggressivenessEl) fetchAggressivenessEl.value = String(appSettings.fetch_url_clip_aggressiveness || 50);
   applySelectedTools(appSettings.active_tools || []);
@@ -319,6 +325,9 @@ async function refreshSettings() {
     appSettings.chat_summary_trigger_token_count = data.chat_summary_trigger_token_count || 80000;
     appSettings.summary_skip_first = data.summary_skip_first ?? 2;
     appSettings.summary_skip_last = data.summary_skip_last ?? 1;
+    appSettings.pruning_enabled = Boolean(data.pruning_enabled);
+    appSettings.pruning_token_threshold = data.pruning_token_threshold || 80000;
+    appSettings.pruning_batch_size = data.pruning_batch_size || 10;
     appSettings.fetch_url_token_threshold = data.fetch_url_token_threshold || 3500;
     appSettings.fetch_url_clip_aggressiveness = data.fetch_url_clip_aggressiveness ?? 50;
     appSettings.active_tools = Array.isArray(data.active_tools) ? data.active_tools : [];
@@ -348,6 +357,9 @@ async function saveSettings() {
     chat_summary_trigger_token_count: parseInt(summaryTriggerEl?.value || "", 10) || 80000,
     summary_skip_first: parseInt(summarySkipFirstEl?.value || "", 10) || 0,
     summary_skip_last: parseInt(summarySkipLastEl?.value || "", 10) || 1,
+    pruning_enabled: Boolean(pruningEnabledEl?.checked),
+    pruning_token_threshold: parseInt(pruningTokenThresholdEl?.value || "", 10) || 80000,
+    pruning_batch_size: parseInt(pruningBatchSizeEl?.value || "", 10) || 10,
     fetch_url_token_threshold: parseInt(fetchThresholdEl?.value || "", 10) || 3500,
     fetch_url_clip_aggressiveness: parseInt(fetchAggressivenessEl?.value || "", 10) || 50,
     active_tools: getSelectedTools(),
@@ -382,6 +394,9 @@ async function saveSettings() {
     appSettings.chat_summary_trigger_token_count = data.chat_summary_trigger_token_count || 80000;
     appSettings.summary_skip_first = data.summary_skip_first ?? 2;
     appSettings.summary_skip_last = data.summary_skip_last ?? 1;
+    appSettings.pruning_enabled = Boolean(data.pruning_enabled);
+    appSettings.pruning_token_threshold = data.pruning_token_threshold || 80000;
+    appSettings.pruning_batch_size = data.pruning_batch_size || 10;
     appSettings.fetch_url_token_threshold = data.fetch_url_token_threshold || 3500;
     appSettings.fetch_url_clip_aggressiveness = data.fetch_url_clip_aggressiveness ?? 50;
     appSettings.active_tools = Array.isArray(data.active_tools) ? data.active_tools : [];
@@ -567,6 +582,9 @@ function registerDirtyListeners() {
   summaryTriggerEl?.addEventListener("input", markDirty);
   summarySkipFirstEl?.addEventListener("input", markDirty);
   summarySkipLastEl?.addEventListener("input", markDirty);
+  pruningEnabledEl?.addEventListener("change", markDirty);
+  pruningTokenThresholdEl?.addEventListener("input", markDirty);
+  pruningBatchSizeEl?.addEventListener("input", markDirty);
   fetchThresholdEl?.addEventListener("input", markDirty);
   fetchAggressivenessEl?.addEventListener("input", markDirty);
   ragAutoInjectEl?.addEventListener("change", markDirty);

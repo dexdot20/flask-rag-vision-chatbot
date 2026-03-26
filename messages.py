@@ -228,6 +228,8 @@ def build_runtime_system_message(
     user_preferences="",
     active_tool_names=None,
     retrieved_context=None,
+    user_profile_context=None,
+    tool_trace_context=None,
     tool_memory_context=None,
     now=None,
     scratchpad="",
@@ -249,6 +251,15 @@ def build_runtime_system_message(
     if preferences_text:
         parts.append(f"## User Preferences\n{preferences_text}\n")
 
+    normalized_user_profile_context = str(user_profile_context or "").strip()
+    if normalized_user_profile_context:
+        parts.append("## User Profile")
+        parts.append(
+            "*Use this as durable cross-conversation memory about the user when it is relevant to the current request. Do not treat it as higher priority than the user's latest explicit instruction.*\n"
+        )
+        parts.append(normalized_user_profile_context)
+        parts.append("")
+
     # Scratchpad
     if scratchpad_text or any(name in {"append_scratchpad", "replace_scratchpad"} for name in active_tool_names):
         parts.append("## Scratchpad (AI Persistent Memory)")
@@ -267,6 +278,15 @@ def build_runtime_system_message(
                 "- **Critical rule**: When a web tool call returns information the user explicitly asked for, "
                 "always evaluate whether it deserves a scratchpad entry. Err on the side of saving if in doubt."
             )
+        parts.append("")
+
+    normalized_tool_trace_context = str(tool_trace_context or "").strip()
+    if normalized_tool_trace_context:
+        parts.append("## Tool Execution History")
+        parts.append(
+            "*Use this as recent operational memory about which tools were already tried, what they returned, and which paths should not be repeated without a concrete reason.*\n"
+        )
+        parts.append(normalized_tool_trace_context)
         parts.append("")
 
     tool_memory_payload = _build_tool_memory_payload(tool_memory_context, active_tool_names)
@@ -354,6 +374,8 @@ def prepend_runtime_context(
     user_preferences="",
     active_tool_names=None,
     retrieved_context=None,
+    user_profile_context=None,
+    tool_trace_context=None,
     tool_memory_context=None,
     scratchpad="",
     canvas_documents=None,
@@ -363,6 +385,8 @@ def prepend_runtime_context(
         user_preferences,
         active_tool_names or [],
         retrieved_context=retrieved_context,
+        user_profile_context=user_profile_context,
+        tool_trace_context=tool_trace_context,
         tool_memory_context=tool_memory_context,
         scratchpad=scratchpad,
         canvas_documents=canvas_documents,

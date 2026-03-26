@@ -215,6 +215,28 @@
                   </div>
                 </div>
               </div>
+
+              <div class="settings-page-section-card">
+                <div class="settings-page-section-card__header">
+                  <div>
+                    <span class="settings-section-kicker">Message refinement</span>
+                    <h3>Pruning mode</h3>
+                  </div>
+                  <p>Trim earlier chat messages without changing their meaning when long conversations start to drift.</p>
+                </div>
+                <label class="tool-toggle"><input type="checkbox" id="pruning-enabled-toggle" /> <span>Enable automatic pruning after the visible token threshold is exceeded</span></label>
+                <div class="settings-page-grid settings-page-grid--two">
+                  <div>
+                    <label class="settings-label" for="pruning-token-threshold-input">Pruning trigger in visible tokens (1000-200000)</label>
+                    <input type="number" class="settings-number" id="pruning-token-threshold-input" min="1000" max="200000" value="80000" />
+                  </div>
+                  <div>
+                    <label class="settings-label" for="pruning-batch-size-input">Prune first N eligible messages (1-50)</label>
+                    <input type="number" class="settings-number" id="pruning-batch-size-input" min="1" max="50" value="10" />
+                  </div>
+                </div>
+                <p class="settings-copy">Manual pruning stays available from message actions even if automatic pruning is turned off.</p>
+              </div>
             </div>
           </div>
         </section>

@@ -3,11 +3,16 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import re
+import time
+from datetime import datetime, timezone
 
 from config import (
     RAG_DISABLED_FEATURE_ERROR,
     RAG_ENABLED,
+    RAG_QUERY_EXPANSION_ENABLED,
+    RAG_QUERY_EXPANSION_MAX_VARIANTS,
     RAG_SEARCH_DEFAULT_TOP_K,
     RAG_SEARCH_MIN_SIMILARITY,
     RAG_SOURCE_CONVERSATION,
@@ -15,8 +20,13 @@ from config import (
     RAG_SOURCE_TOOL_RESULT,
     RAG_SUPPORTED_CATEGORIES,
     RAG_SUPPORTED_SOURCE_TYPES,
+    RAG_TEMPORAL_DECAY_ALPHA,
+    RAG_TEMPORAL_DECAY_LAMBDA,
+    TOOL_MEMORY_TTL_DEFAULT_SECONDS,
+    TOOL_MEMORY_TTL_NEWS_SECONDS,
+    TOOL_MEMORY_TTL_WEB_SECONDS,
 )
-from db import extract_message_tool_results, get_db, parse_message_metadata
+from db import delete_rag_document_records, extract_message_tool_results, get_db, get_expired_rag_document_source_keys, parse_message_metadata
 from messages import build_user_message_for_model
 from rag import (
     chunks_from_records,
@@ -24,6 +34,9 @@ from rag import (
 )
 from rag import (
     delete_source as rag_delete_source,
+)
+from rag import (
+    get_source_chunks as rag_get_source_chunks,
 )
 from rag import (
     query_chunks as rag_query_chunks,
@@ -34,6 +47,7 @@ from rag import (
 
 _rag_sources_verified = False
 CATEGORY_TOOL_MEMORY = RAG_SOURCE_TOOL_MEMORY
+DYNAMIC_RAG_CATEGORIES = {RAG_SOURCE_CONVERSATION, RAG_SOURCE_TOOL_MEMORY, RAG_SOURCE_TOOL_RESULT}
 logger = logging.getLogger(__name__)
 
 
@@ -132,31 +146,71 @@ def parse_rag_metadata(raw_metadata) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _format_utc_timestamp(timestamp: int | None) -> str | None:
+    if not isinstance(timestamp, int) or timestamp <= 0:
+        return None
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _tool_memory_ttl_seconds(tool_name: str) -> int:
+    normalized_name = normalize_category(tool_name)
+    if normalized_name in {"search_news_ddgs", "search_news_google"}:
+        return TOOL_MEMORY_TTL_NEWS_SECONDS
+    if normalized_name in {"search_web", "fetch_url"}:
+        return TOOL_MEMORY_TTL_WEB_SECONDS
+    return TOOL_MEMORY_TTL_DEFAULT_SECONDS
+
+
+def _tool_memory_args_hash(args_preview: str) -> str:
+    cleaned_args_preview = _clean_rag_text_block(args_preview, limit=300)
+    args_basis = cleaned_args_preview or ""
+    return hashlib.sha1(json.dumps(args_basis, ensure_ascii=False).encode("utf-8")).hexdigest()[:12]
+
+
+def purge_expired_rag_documents() -> int:
+    expired_source_keys = get_expired_rag_document_source_keys()
+    if not expired_source_keys:
+        return 0
+
+    removed = 0
+    for source_key in expired_source_keys:
+        removed += rag_delete_source(source_key)
+    delete_rag_document_records(expired_source_keys)
+    return removed
+
+
 def upsert_rag_document_record(
-    source_key: str, source_name: str, source_type: str, category: str, chunk_count: int, metadata: dict | None = None
+    source_key: str,
+    source_name: str,
+    source_type: str,
+    category: str,
+    chunk_count: int,
+    metadata: dict | None = None,
+    expires_at: str | None = None,
 ):
     category = normalize_rag_category(category, default=RAG_SOURCE_CONVERSATION) or RAG_SOURCE_CONVERSATION
     source_type = normalize_category(source_type)
     with get_db() as conn:
         conn.execute(
             """INSERT INTO rag_documents
-               (source_key, source_name, source_type, category, chunk_count, metadata, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+               (source_key, source_name, source_type, category, chunk_count, metadata, expires_at, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
                ON CONFLICT(source_key) DO UPDATE SET
                    source_name = excluded.source_name,
                    source_type = excluded.source_type,
                    category = excluded.category,
                    chunk_count = excluded.chunk_count,
                    metadata = excluded.metadata,
+                   expires_at = excluded.expires_at,
                    updated_at = datetime('now')""",
-            (source_key, source_name, source_type, category, int(chunk_count), serialize_rag_metadata(metadata)),
+            (source_key, source_name, source_type, category, int(chunk_count), serialize_rag_metadata(metadata), expires_at),
         )
 
 
 def _fetch_rag_documents_db() -> list[dict]:
     with get_db() as conn:
         rows = conn.execute(
-            """SELECT source_key, source_name, source_type, category, chunk_count, metadata, created_at, updated_at
+            """SELECT source_key, source_name, source_type, category, chunk_count, metadata, expires_at, created_at, updated_at
                FROM rag_documents
                ORDER BY updated_at DESC, source_name ASC"""
         ).fetchall()
@@ -168,6 +222,7 @@ def _fetch_rag_documents_db() -> list[dict]:
             "category": row["category"],
             "chunk_count": row["chunk_count"],
             "metadata": parse_rag_metadata(row["metadata"]),
+            "expires_at": row["expires_at"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
@@ -178,22 +233,23 @@ def _fetch_rag_documents_db() -> list[dict]:
 def ensure_supported_rag_sources(force: bool = False) -> int:
     _require_rag_enabled()
     global _rag_sources_verified
+    removed = purge_expired_rag_documents()
     if _rag_sources_verified and not force:
-        return 0
+        return removed
 
     with get_db() as conn:
         rows = conn.execute("SELECT source_key, source_type FROM rag_documents ORDER BY updated_at DESC").fetchall()
 
-    removed = 0
+    removed_invalid = 0
     for row in rows:
         if _is_supported_rag_source_type(row["source_type"]):
             continue
         rag_delete_source(row["source_key"])
         delete_rag_document_record(row["source_key"])
-        removed += 1
+        removed_invalid += 1
 
     _rag_sources_verified = True
-    return removed
+    return removed + removed_invalid
 
 
 def list_rag_documents_db() -> list[dict]:
@@ -205,7 +261,7 @@ def list_rag_documents_db() -> list[dict]:
 def get_rag_document_record(source_key: str):
     with get_db() as conn:
         return conn.execute(
-            "SELECT source_key, source_name, source_type, metadata, updated_at FROM rag_documents WHERE source_key = ?",
+            "SELECT source_key, source_name, source_type, metadata, expires_at, updated_at FROM rag_documents WHERE source_key = ?",
             (source_key,),
         ).fetchone()
 
@@ -255,13 +311,122 @@ def _clip_rag_excerpt(text: str, limit: int = 1200) -> str:
     return text[:limit].rstrip() + "…"
 
 
+def _normalize_query_tokens(query: str) -> list[str]:
+    return [token for token in re.findall(r"[^\W_]+", str(query or "").lower(), flags=re.UNICODE) if token]
+
+
+def _expand_query_variants(query: str) -> list[str]:
+    normalized_query = re.sub(r"\s+", " ", str(query or "").strip())
+    if not normalized_query:
+        return []
+
+    if not RAG_QUERY_EXPANSION_ENABLED:
+        return [normalized_query]
+
+    variants: list[str] = []
+
+    def add_variant(value: str) -> None:
+        candidate = re.sub(r"\s+", " ", str(value or "").strip())
+        if not candidate:
+            return
+        key = candidate.casefold()
+        if any(existing.casefold() == key for existing in variants):
+            return
+        variants.append(candidate)
+
+    add_variant(normalized_query)
+    cleaned_query = re.sub(r"[^\w\s]+", " ", normalized_query, flags=re.UNICODE)
+    add_variant(cleaned_query)
+
+    tokens = _normalize_query_tokens(normalized_query)
+    if len(tokens) >= 2:
+        add_variant(" ".join(tokens))
+    informative_tokens = [token for token in tokens if len(token) > 2]
+    if len(informative_tokens) >= 2:
+        add_variant(" ".join(informative_tokens))
+    if len(informative_tokens) >= 3:
+        add_variant(" ".join(informative_tokens[: max(2, len(informative_tokens) // 2 + 1)]))
+
+    return variants[:RAG_QUERY_EXPANSION_MAX_VARIANTS]
+
+
+def _coerce_hit_timestamp(metadata: dict | None) -> int | None:
+    source = metadata if isinstance(metadata, dict) else {}
+    for key in ("indexed_at_ts", "created_at_ts"):
+        value = source.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            normalized = int(value)
+            if normalized > 0:
+                return normalized
+            continue
+        text = str(value or "").strip()
+        if not text:
+            continue
+        try:
+            normalized = int(float(text))
+        except (TypeError, ValueError):
+            continue
+        if normalized > 0:
+            return normalized
+    return None
+
+
+def _apply_temporal_decay(similarity: float | None, metadata: dict | None) -> float | None:
+    if similarity is None:
+        return None
+
+    source = metadata if isinstance(metadata, dict) else {}
+    category = normalize_rag_category(source.get("category"), default=source.get("source_type"))
+    if category not in DYNAMIC_RAG_CATEGORIES:
+        return round(float(similarity), 4)
+
+    timestamp = _coerce_hit_timestamp(source)
+    if timestamp is None:
+        return round(float(similarity), 4)
+
+    days_old = max(0.0, (time.time() - timestamp) / 86_400)
+    boost = 1.0 + (RAG_TEMPORAL_DECAY_ALPHA * math.exp(-RAG_TEMPORAL_DECAY_LAMBDA * days_old))
+    return round(min(1.0, float(similarity) * boost), 4)
+
+
+def _dedupe_rag_hits(hits: list[dict]) -> list[dict]:
+    deduped: dict[str, dict] = {}
+    ordered_keys: list[str] = []
+    for hit in hits:
+        metadata = hit.get("metadata") if isinstance(hit.get("metadata"), dict) else {}
+        dedupe_key = str(hit.get("id") or metadata.get("source_key") or hit.get("text") or "").strip()
+        if not dedupe_key:
+            continue
+        current = deduped.get(dedupe_key)
+        if current is None:
+            deduped[dedupe_key] = hit
+            ordered_keys.append(dedupe_key)
+            continue
+        current_similarity = current.get("similarity")
+        incoming_similarity = hit.get("similarity")
+        if isinstance(incoming_similarity, (int, float)) and (
+            not isinstance(current_similarity, (int, float)) or incoming_similarity > current_similarity
+        ):
+            deduped[dedupe_key] = hit
+    return [deduped[key] for key in ordered_keys]
+
+
+def _query_rag_hits(query: str, top_k: int, category: str | None = None) -> list[dict]:
+    collected_hits: list[dict] = []
+    for variant in _expand_query_variants(query):
+        collected_hits.extend(rag_query_chunks(variant, top_k=top_k, category=category))
+    return _dedupe_rag_hits(collected_hits)
+
+
 def _normalize_rag_hits(query: str, hits: list[dict], threshold: float) -> list[dict]:
     matches = []
     for hit in hits:
-        similarity = hit.get("similarity")
+        metadata = hit.get("metadata") or {}
+        similarity = _apply_temporal_decay(hit.get("similarity"), metadata)
         if similarity is not None and similarity < threshold:
             continue
-        metadata = hit.get("metadata") or {}
         source_type = normalize_category(metadata.get("source_type"))
         if source_type not in RAG_SUPPORTED_SOURCE_TYPES:
             continue
@@ -277,6 +442,7 @@ def _normalize_rag_hits(query: str, hits: list[dict], threshold: float) -> list[
                 "text": _clip_rag_excerpt(hit.get("text", "")),
             }
         )
+    matches.sort(key=lambda item: float(item.get("similarity") or 0.0), reverse=True)
     return matches
 
 
@@ -288,13 +454,13 @@ def search_knowledge_base_tool(query: str, category: str | None = None, top_k: i
 
     ensure_supported_rag_sources()
     normalized_category = normalize_rag_category(category, default=None) if category else None
-    hits = rag_query_chunks(query, top_k=top_k, category=normalized_category)
+    hits = _query_rag_hits(query, top_k=top_k, category=normalized_category)
     matches = _normalize_rag_hits(query, hits, RAG_SEARCH_MIN_SIMILARITY)
     return {
         "query": query,
         "category": normalized_category,
-        "count": len(matches),
-        "matches": matches,
+        "count": len(matches[: max(1, int(top_k))]),
+        "matches": matches[: max(1, int(top_k))],
     }
 
 
@@ -307,10 +473,11 @@ def upsert_tool_memory_result(tool_name: str, args_preview: str, result_content:
     cleaned_tool_name = normalize_category(tool_name) or "tool"
     cleaned_args_preview = _clean_rag_text_block(args_preview, limit=300)
     cleaned_summary = _clean_rag_text_block(summary, limit=300)
-    args_basis = cleaned_args_preview or cleaned_tool_name
-    args_hash = hashlib.sha1(json.dumps(args_basis, ensure_ascii=False).encode("utf-8")).hexdigest()[:12]
+    args_hash = _tool_memory_args_hash(cleaned_args_preview)
     source_key = build_tool_memory_source_key(cleaned_tool_name, args_hash)
     source_name = cleaned_tool_name if not cleaned_args_preview else f"{cleaned_tool_name}: {cleaned_args_preview[:80]}"
+    expires_at_ts = int(time.time()) + _tool_memory_ttl_seconds(cleaned_tool_name)
+    expires_at = _format_utc_timestamp(expires_at_ts)
 
     record_parts = [f"tool:{cleaned_tool_name}"]
     if cleaned_args_preview:
@@ -325,6 +492,7 @@ def upsert_tool_memory_result(tool_name: str, args_preview: str, result_content:
         "args_preview": cleaned_args_preview,
         "summary": cleaned_summary,
         "source_type": RAG_SOURCE_TOOL_MEMORY,
+        "expires_at_ts": expires_at_ts,
     }
     chunks = chunks_from_records(
         records,
@@ -342,6 +510,7 @@ def upsert_tool_memory_result(tool_name: str, args_preview: str, result_content:
         category=CATEGORY_TOOL_MEMORY,
         chunks=chunks,
         metadata=metadata,
+        expires_at=expires_at,
     )
 
 
@@ -352,13 +521,46 @@ def search_tool_memory(query: str, top_k: int = RAG_SEARCH_DEFAULT_TOP_K) -> dic
         return {"query": "", "count": 0, "matches": []}
 
     ensure_supported_rag_sources()
-    hits = rag_query_chunks(query, top_k=top_k, category=CATEGORY_TOOL_MEMORY)
+    hits = _query_rag_hits(query, top_k=top_k, category=CATEGORY_TOOL_MEMORY)
     matches = _normalize_rag_hits(query, hits, RAG_SEARCH_MIN_SIMILARITY)
     return {
         "query": query,
         "category": CATEGORY_TOOL_MEMORY,
-        "count": len(matches),
-        "matches": matches,
+        "count": len(matches[: max(1, int(top_k))]),
+        "matches": matches[: max(1, int(top_k))],
+    }
+
+
+def get_exact_tool_memory_match(tool_name: str, args_preview: str) -> dict | None:
+    _require_rag_enabled()
+    cleaned_tool_name = normalize_category(tool_name)
+    cleaned_args_preview = _clean_rag_text_block(args_preview, limit=300)
+    if not cleaned_tool_name or not cleaned_args_preview:
+        return None
+
+    ensure_supported_rag_sources()
+    source_key = build_tool_memory_source_key(cleaned_tool_name, _tool_memory_args_hash(cleaned_args_preview))
+    record = get_rag_document_record(source_key)
+    if not record:
+        return None
+
+    rows = rag_get_source_chunks(source_key, category=CATEGORY_TOOL_MEMORY)
+    if not rows:
+        return None
+
+    content = "\n\n".join(_clean_rag_text_block(row.get("text") or "") for row in rows if _clean_rag_text_block(row.get("text") or ""))
+    if not content:
+        return None
+
+    metadata = parse_rag_metadata(record["metadata"])
+    return {
+        "source_key": str(record["source_key"] or "").strip(),
+        "source_name": str(record["source_name"] or "").strip(),
+        "tool_name": cleaned_tool_name,
+        "args_preview": cleaned_args_preview,
+        "summary": str(metadata.get("summary") or "").strip(),
+        "content": content,
+        "expires_at": str(record["expires_at"] or "").strip(),
     }
 
 
@@ -394,7 +596,7 @@ def build_rag_auto_context(query: str, enabled: bool, threshold: float, top_k: i
         return None
     try:
         ensure_supported_rag_sources()
-        hits = rag_query_chunks(query, top_k=max(1, int(top_k)))
+        hits = _query_rag_hits(query, top_k=max(1, int(top_k)))
     except Exception:
         return None
 
@@ -404,29 +606,51 @@ def build_rag_auto_context(query: str, enabled: bool, threshold: float, top_k: i
 
     return {
         "query": query,
-        "count": len(matches),
-        "matches": matches,
+        "count": len(matches[: max(1, int(top_k))]),
+        "matches": matches[: max(1, int(top_k))],
     }
 
 
 def ingest_rag_chunks(
-    source_key: str, source_name: str, source_type: str, category: str, chunks: list, metadata: dict | None = None
+    source_key: str,
+    source_name: str,
+    source_type: str,
+    category: str,
+    chunks: list,
+    metadata: dict | None = None,
+    expires_at: str | None = None,
 ) -> dict:
     _require_rag_enabled()
     category = normalize_rag_category(category, default=source_type)
     source_type = normalize_category(source_type)
     if source_type not in RAG_SUPPORTED_SOURCE_TYPES or category not in RAG_SUPPORTED_CATEGORIES:
         raise ValueError("Unsupported RAG source type or category.")
+    normalized_metadata = dict(metadata or {})
+    normalized_metadata["indexed_at_ts"] = int(time.time())
+    for chunk in chunks:
+        if hasattr(chunk, "metadata"):
+            merged_metadata = dict(getattr(chunk, "metadata", {}) or {})
+            merged_metadata.update(normalized_metadata)
+            chunk.metadata = merged_metadata
     rag_delete_source(source_key)
     inserted = rag_upsert_chunks(chunks)
-    upsert_rag_document_record(source_key, source_name, source_type, category, inserted, metadata=metadata)
+    upsert_rag_document_record(
+        source_key,
+        source_name,
+        source_type,
+        category,
+        inserted,
+        metadata=normalized_metadata,
+        expires_at=expires_at,
+    )
     return {
         "source_key": source_key,
         "source_name": source_name,
         "source_type": source_type,
         "category": category,
         "chunk_count": inserted,
-        "metadata": metadata or {},
+        "metadata": normalized_metadata,
+        "expires_at": expires_at,
     }
 
 

@@ -1188,6 +1188,20 @@ function getHistoryMessage(messageId) {
   return index >= 0 ? history[index] : null;
 }
 
+function isPrunableHistoryMessage(message) {
+  if (!message || (message.role !== "user" && message.role !== "assistant")) {
+    return false;
+  }
+  if (message.role === "assistant" && Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+    return false;
+  }
+  const metadata = message.metadata && typeof message.metadata === "object" ? message.metadata : null;
+  if (metadata?.is_summary === true || metadata?.is_pruned === true) {
+    return false;
+  }
+  return String(message.content || "").trim().length > 0;
+}
+
 function clearEditTarget() {
   editingMessageId = null;
   editBanner.hidden = true;
@@ -1225,42 +1239,93 @@ function beginEditingMessage(messageId) {
   inputEl.setSelectionRange(inputEl.value.length, inputEl.value.length);
 }
 
-function createMessageActions(messageId) {
-  const actions = document.createElement("div");
-  actions.className = "msg-actions";
-
-  const editBtn = document.createElement("button");
-  editBtn.type = "button";
-  editBtn.className = "msg-action-btn";
-  editBtn.textContent = "Edit";
-  editBtn.disabled = !Number.isInteger(Number(messageId));
-  editBtn.addEventListener("click", () => beginEditingMessage(messageId));
-
-  actions.appendChild(editBtn);
-  return actions;
-}
-
-function createAssistantCanvasActions(metadata) {
-  const documents = getCanvasDocuments(metadata);
-  if (!documents.length) {
+function createMessageActions(message, options = {}) {
+  if (!message) {
     return null;
   }
 
   const actions = document.createElement("div");
   actions.className = "msg-actions";
 
-  const openBtn = document.createElement("button");
-  openBtn.type = "button";
-  openBtn.className = "msg-action-btn";
-  openBtn.textContent = "Open canvas";
-  openBtn.addEventListener("click", () => {
-    activeCanvasDocumentId = documents[documents.length - 1].id;
-    openCanvas();
-    setCanvasStatus("Canvas ready.", "muted");
-  });
+  const messageId = message.id;
 
-  actions.appendChild(openBtn);
+  if (message.role === "user" && options.editable) {
+    const editBtn = document.createElement("button");
+    editBtn.type = "button";
+    editBtn.className = "msg-action-btn";
+    editBtn.textContent = "Edit";
+    editBtn.disabled = !Number.isInteger(Number(messageId));
+    editBtn.addEventListener("click", () => beginEditingMessage(messageId));
+    actions.appendChild(editBtn);
+  }
+
+  const documents = getCanvasDocuments(message.metadata);
+  if (message.role === "assistant" && documents.length) {
+    const openBtn = document.createElement("button");
+    openBtn.type = "button";
+    openBtn.className = "msg-action-btn";
+    openBtn.textContent = "Open canvas";
+    openBtn.addEventListener("click", () => {
+      activeCanvasDocumentId = documents[documents.length - 1].id;
+      openCanvas();
+      setCanvasStatus("Canvas ready.", "muted");
+    });
+    actions.appendChild(openBtn);
+  }
+
+  if (isPrunableHistoryMessage(message)) {
+    const pruneBtn = document.createElement("button");
+    pruneBtn.type = "button";
+    pruneBtn.className = "msg-action-btn";
+    pruneBtn.textContent = "Buda";
+    pruneBtn.disabled = !Number.isInteger(Number(messageId)) || isStreaming || isFixing;
+    pruneBtn.addEventListener("click", () => {
+      void pruneMessage(messageId);
+    });
+    actions.appendChild(pruneBtn);
+  }
+
+  if (!actions.childElementCount) {
+    return null;
+  }
   return actions;
+}
+
+async function pruneMessage(messageId) {
+  if (isStreaming || isFixing) {
+    return;
+  }
+
+  const message = getHistoryMessage(messageId);
+  if (!isPrunableHistoryMessage(message)) {
+    return;
+  }
+
+  try {
+    const response = await fetch(`/api/messages/${messageId}/prune`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ conversation_id: currentConvId }),
+    });
+    const data = await response.json().catch(() => null);
+    if (!response.ok) {
+      throw new Error(data?.error || "Message could not be pruned.");
+    }
+    if (!data?.message) {
+      throw new Error("Pruned message payload is missing.");
+    }
+
+    const index = getHistoryMessageIndex(messageId);
+    if (index >= 0) {
+      history[index] = normalizeHistoryEntry(data.message);
+      renderConversationHistory();
+    } else {
+      await refreshConversationFromServer();
+    }
+    showToast("Message pruned.", "success");
+  } catch (error) {
+    showError(error.message || "Message could not be pruned.");
+  }
 }
 
 function renderConversationHistory() {
@@ -1286,6 +1351,7 @@ function renderConversationHistory() {
       editable: message.role === "user",
       isEditingTarget: Number(message.id) === Number(editingMessageId),
       isLatestVisible: index === visibleEntries.length - 1,
+      toolCalls: message.tool_calls,
     }));
   });
   messagesEl.replaceChildren(fragment);
@@ -3280,18 +3346,35 @@ function createMessageGroup(role, text, metadata = null, options = {}) {
   const metaRow = document.createElement("div");
   metaRow.className = "msg-meta-row";
 
+  const normalizedMetadata = metadata && typeof metadata === "object" ? metadata : null;
+  const labelGroup = document.createElement("div");
+  labelGroup.className = "msg-meta-label-group";
+
   const label = document.createElement("div");
   label.className = "msg-label";
   label.textContent = role === "user" ? "You" : role === "summary" ? "Summary" : "Assistant";
 
-  metaRow.appendChild(label);
-  if (role === "user" && options.editable) {
-    metaRow.appendChild(createMessageActions(options.messageId));
-  } else if (role === "assistant") {
-    const canvasActions = createAssistantCanvasActions(metadata);
-    if (canvasActions) {
-      metaRow.appendChild(canvasActions);
-    }
+  labelGroup.appendChild(label);
+  if (normalizedMetadata?.is_pruned === true) {
+    const prunedBadge = document.createElement("span");
+    prunedBadge.className = "pruned-badge";
+    prunedBadge.textContent = "Budandi";
+    labelGroup.appendChild(prunedBadge);
+  }
+
+  metaRow.appendChild(labelGroup);
+  const actions = createMessageActions(
+    {
+      id: options.messageId,
+      role,
+      content: text,
+      metadata: normalizedMetadata,
+      tool_calls: Array.isArray(options.toolCalls) ? options.toolCalls : [],
+    },
+    options,
+  );
+  if (actions) {
+    metaRow.appendChild(actions);
   }
 
   const bubble = document.createElement("div");

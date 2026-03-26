@@ -13,15 +13,22 @@ import requests as http_requests
 
 import web_tools
 from agent import (
+    CONTEXT_OVERFLOW_RECOVERY_ERROR_TEXT,
     FINAL_ANSWER_ERROR_TEXT,
     FINAL_ANSWER_MISSING_TEXT,
+    _build_compact_tool_message_content,
     _execute_tool,
+    _is_context_overflow_error,
+    _iter_agent_exchange_blocks,
+    _prepare_tool_result_for_transcript,
+    _try_compact_messages,
     collect_agent_response,
     run_agent_stream,
 )
 from app import create_app
 from canvas_service import create_canvas_runtime_state, find_latest_canvas_documents, normalize_canvas_document, replace_canvas_lines
 from db import (
+    build_user_profile_system_context,
     append_to_scratchpad,
     count_visible_message_tokens,
     create_image_asset,
@@ -29,11 +36,13 @@ from db import (
     get_app_settings,
     get_db,
     get_image_asset,
+    get_user_profile_entries,
     insert_message,
     normalize_active_tool_names,
     parse_message_metadata,
     save_app_settings,
     serialize_message_metadata,
+    upsert_user_profile_entry,
 )
 from messages import (
     SUMMARY_LABEL,
@@ -43,12 +52,15 @@ from messages import (
     normalize_chat_messages,
     prepend_runtime_context,
 )
-from rag_service import get_conversation_records_for_rag
+from rag import Chunk
+from rag.store import query_chunks, upsert_chunks
+from rag_service import build_rag_auto_context, get_conversation_records_for_rag, get_exact_tool_memory_match, search_knowledge_base_tool, upsert_tool_memory_result
 from routes.chat import (
     _estimate_prompt_tokens,
     _select_recent_prompt_window,
     _select_summary_source_messages_by_token_budget,
     build_summary_prompt_messages,
+    maybe_create_conversation_summary,
 )
 from tool_registry import TOOL_SPEC_BY_NAME, get_openai_tool_specs
 from web_tools import (
@@ -122,6 +134,9 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertTrue(payload["rag_auto_inject"])
         self.assertEqual(payload["chat_summary_mode"], "auto")
         self.assertEqual(payload["chat_summary_trigger_token_count"], 80000)
+        self.assertFalse(payload["pruning_enabled"])
+        self.assertEqual(payload["pruning_token_threshold"], 80000)
+        self.assertEqual(payload["pruning_batch_size"], 10)
         self.assertEqual(payload["fetch_url_token_threshold"], 3500)
         self.assertEqual(payload["fetch_url_clip_aggressiveness"], 50)
         self.assertEqual(payload["rag_sensitivity"], "normal")
@@ -138,6 +153,9 @@ class AppRoutesTestCase(unittest.TestCase):
                 "max_steps": 3,
                 "chat_summary_mode": "aggressive",
                 "chat_summary_trigger_token_count": 9000,
+                "pruning_enabled": True,
+                "pruning_token_threshold": 12000,
+                "pruning_batch_size": 4,
                 "fetch_url_token_threshold": 4200,
                 "fetch_url_clip_aggressiveness": 70,
                 "active_tools": ["fetch_url", "search_web"],
@@ -154,6 +172,9 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(payload["max_steps"], 3)
         self.assertEqual(payload["chat_summary_mode"], "aggressive")
         self.assertEqual(payload["chat_summary_trigger_token_count"], 9000)
+        self.assertTrue(payload["pruning_enabled"])
+        self.assertEqual(payload["pruning_token_threshold"], 12000)
+        self.assertEqual(payload["pruning_batch_size"], 4)
         self.assertEqual(payload["fetch_url_token_threshold"], 4200)
         self.assertEqual(payload["fetch_url_clip_aggressiveness"], 70)
         self.assertEqual(payload["active_tools"], ["fetch_url", "search_web"])
@@ -179,6 +200,23 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("rag_context_size", response.get_json()["error"])
 
+    def test_settings_patch_rejects_invalid_pruning_values(self):
+        response = self.client.patch(
+            "/api/settings",
+            json={"pruning_token_threshold": 999},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("pruning_token_threshold", response.get_json()["error"])
+
+        response = self.client.patch(
+            "/api/settings",
+            json={"pruning_batch_size": 0},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("pruning_batch_size", response.get_json()["error"])
+
     def test_create_conversation_rejects_invalid_model(self):
         response = self.client.post(
             "/api/conversations",
@@ -193,6 +231,12 @@ class AppRoutesTestCase(unittest.TestCase):
             create_app(database_path=f"{self.temp_dir.name}/bootstrap.db")
 
         mocked_sync.assert_called_once_with()
+
+    def test_database_initialization_adds_rag_document_expiration_column(self):
+        with get_db() as conn:
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(rag_documents)").fetchall()}
+
+        self.assertIn("expires_at", columns)
 
     def test_create_conversation_triggers_auto_rag_sync(self):
         with patch("routes.conversations.sync_conversations_to_rag_safe") as mocked_sync:
@@ -384,6 +428,75 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(response.get_json()["title"], "Better Title")
         chat_sync.assert_called_once_with(conversation_id=conversation_id)
 
+    def test_manual_prune_endpoint_updates_message_and_preserves_original(self):
+        conversation_id = self._create_conversation()
+        with get_db() as conn:
+            message_id = insert_message(conn, conversation_id, "assistant", "Bu mesaj gereksiz ayrıntılar içeriyor ve budanmalı.")
+
+        mock_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="Bu mesaj budanmış halidir."))]
+        )
+        with patch("prune_service.client.chat.completions.create", return_value=mock_response), patch(
+            "routes.conversations.sync_conversations_to_rag_safe"
+        ) as mocked_sync:
+            response = self.client.post(
+                f"/api/messages/{message_id}/prune",
+                json={"conversation_id": conversation_id},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload["pruned"])
+        self.assertEqual(payload["message"]["content"], "Bu mesaj budanmış halidir.")
+        self.assertTrue(payload["message"]["metadata"]["is_pruned"])
+        self.assertEqual(
+            payload["message"]["metadata"]["pruned_original"],
+            "Bu mesaj gereksiz ayrıntılar içeriyor ve budanmalı.",
+        )
+        mocked_sync.assert_called_once_with(conversation_id=conversation_id)
+
+    def test_background_post_response_pruning_runs_when_threshold_exceeded(self):
+        fake_events = iter(
+            [
+                {"type": "answer_start"},
+                {"type": "answer_delta", "text": "Kısa cevap."},
+                {"type": "tool_capture", "tool_results": [], "canvas_documents": []},
+                {"type": "done"},
+            ]
+        )
+
+        conversation_id = self._create_conversation()
+
+        with patch("routes.chat.run_agent_stream", return_value=fake_events), patch(
+            "routes.chat.maybe_create_conversation_summary",
+            return_value={"applied": False},
+        ), patch("routes.chat.count_visible_message_tokens", return_value=90_000), patch(
+            "routes.chat.prune_conversation_batch"
+        ) as mocked_prune, patch("routes.chat.sync_conversations_to_rag_safe"):
+            response = self.client.patch(
+                "/api/settings",
+                json={
+                    "pruning_enabled": True,
+                    "pruning_token_threshold": 80000,
+                    "pruning_batch_size": 3,
+                },
+            )
+            self.assertEqual(response.status_code, 200)
+
+            response = self.client.post(
+                "/chat",
+                json={
+                    "conversation_id": conversation_id,
+                    "model": "deepseek-chat",
+                    "user_content": "Merhaba",
+                    "messages": [{"role": "user", "content": "Merhaba"}],
+                },
+            )
+            response.get_data(as_text=True)
+
+        self.assertEqual(response.status_code, 200)
+        mocked_prune.assert_called_once_with(conversation_id, 3)
+
     def test_active_tools_include_replace_scratchpad_for_existing_scratchpad_mode(self):
         settings = {"active_tools": json.dumps(["append_scratchpad", "search_web"]) }
         self.assertIn("replace_scratchpad", get_active_tool_names(settings))
@@ -464,6 +577,216 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn("Remembered web result", content)
         self.assertIn("Knowledge Base", content)
         self.assertIn("Context block", content)
+
+    def test_runtime_system_message_includes_user_profile_context(self):
+        upsert_user_profile_entry("pref:concise", "The user prefers concise answers.", confidence=0.95, source="manual")
+
+        message = build_runtime_system_message(
+            user_profile_context=build_user_profile_system_context(),
+            active_tool_names=[],
+        )
+
+        content = message["content"]
+        self.assertIn("## User Profile", content)
+        self.assertIn("The user prefers concise answers.", content)
+
+    def test_structured_summary_persists_user_profile_facts(self):
+        conversation_id = self._create_conversation()
+        with get_db() as conn:
+            insert_message(conn, conversation_id, "user", "Please keep answers short and concise in future replies.")
+            insert_message(conn, conversation_id, "assistant", "Understood. I will keep future answers concise.")
+
+        summary_payload = {
+            "content": json.dumps(
+                {
+                    "facts": [
+                        "The user prefers concise answers in future replies.",
+                        "The user is working on an os-chatbot codebase and wants continuity.",
+                    ],
+                    "decisions": ["Future replies should stay concise."],
+                    "open_issues": [],
+                    "entities": ["os-chatbot"],
+                    "tool_outcomes": [],
+                },
+                ensure_ascii=False,
+            ),
+            "errors": [],
+        }
+
+        settings = {**get_app_settings(), "summary_skip_first": "0", "summary_skip_last": "0"}
+        with patch("routes.chat.collect_agent_response", return_value=summary_payload):
+            outcome = maybe_create_conversation_summary(
+                conversation_id,
+                "deepseek-chat",
+                settings,
+                3500,
+                50,
+                force=True,
+            )
+
+        self.assertTrue(outcome["applied"])
+        entries = get_user_profile_entries()
+        self.assertIn("The user prefers concise answers in future replies.", [entry["value"] for entry in entries])
+        self.assertGreaterEqual(outcome.get("stored_profile_fact_count", 0), 1)
+
+    def test_query_chunks_skips_expired_metadata(self):
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        future_ts = now_ts + 3600
+        past_ts = now_ts - 3600
+
+        fake_collection = Mock()
+        fake_collection.query.return_value = {
+            "documents": [["expired result", "fresh result"]],
+            "metadatas": [[
+                {"source_key": "expired", "source_type": "tool_memory", "category": "tool_memory", "expires_at_ts": past_ts},
+                {"source_key": "fresh", "source_type": "tool_memory", "category": "tool_memory", "expires_at_ts": future_ts},
+            ]],
+            "distances": [[0.1, 0.05]],
+            "ids": [["old-id", "fresh-id"]],
+        }
+
+        with patch("rag.store._iter_query_collections", return_value=[(fake_collection, {"category": "tool_memory"})]), patch("rag.store.embed_texts", return_value=[[0.1, 0.2]]):
+            rows = query_chunks("latest result", top_k=5, category="tool_memory")
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["id"], "fresh-id")
+        self.assertEqual(rows[0]["metadata"]["source_key"], "fresh")
+
+    def test_upsert_chunks_writes_to_category_collections(self):
+        collection_conversation = Mock()
+        collection_tool_memory = Mock()
+
+        chunks = [
+            Chunk(
+                id="chunk-1",
+                text="conversation text",
+                source_name="conversation-doc",
+                source_type="conversation",
+                category="conversation",
+                chunk_index=0,
+                metadata={"source_key": "src-1"},
+            ),
+            Chunk(
+                id="chunk-2",
+                text="tool memory text",
+                source_name="tool-memory-doc",
+                source_type="tool_memory",
+                category="tool_memory",
+                chunk_index=0,
+                metadata={"source_key": "src-2"},
+            ),
+        ]
+
+        def fake_get_collection(name="knowledge_base"):
+            if name == "knowledge_base__conversation":
+                return collection_conversation
+            if name == "knowledge_base__tool_memory":
+                return collection_tool_memory
+            return Mock()
+
+        with patch("rag.store.get_collection", side_effect=fake_get_collection), patch("rag.store.embed_texts", return_value=[[0.1, 0.2], [0.3, 0.4]]):
+            inserted = upsert_chunks(chunks)
+
+        self.assertEqual(inserted, 2)
+        collection_conversation.upsert.assert_called_once()
+        collection_tool_memory.upsert.assert_called_once()
+
+    def test_get_exact_tool_memory_match_returns_joined_chunk_content(self):
+        with patch("rag_service.ensure_supported_rag_sources"), patch(
+            "rag_service.get_rag_document_record",
+            return_value={
+                "source_key": "src-1",
+                "source_name": "fetch_url: https://example.com/page",
+                "metadata": json.dumps({"summary": "Page content extracted: Example"}),
+                "expires_at": None,
+            },
+        ), patch(
+            "rag_service.rag_get_source_chunks",
+            return_value=[
+                {"id": "chunk-1", "text": "Title: Example", "metadata": {"chunk_index": 0}},
+                {"id": "chunk-2", "text": "Body: Retrieved content", "metadata": {"chunk_index": 1}},
+            ],
+        ):
+            match = get_exact_tool_memory_match("fetch_url", "https://example.com/page")
+
+        self.assertIsNotNone(match)
+        self.assertEqual(match["summary"], "Page content extracted: Example")
+        self.assertIn("Title: Example", match["content"])
+        self.assertIn("Body: Retrieved content", match["content"])
+
+    def test_upsert_tool_memory_result_assigns_ttl_metadata(self):
+        with patch("rag_service.time.time", return_value=1_000), patch("rag_service.ingest_rag_chunks") as mocked_ingest:
+            mocked_ingest.return_value = {"ok": True}
+            upsert_tool_memory_result(
+                "search_news_ddgs",
+                "economy headlines",
+                "headline body",
+                "brief summary",
+            )
+
+        _, kwargs = mocked_ingest.call_args
+        self.assertEqual(kwargs["expires_at"], "1970-01-01 02:16:40")
+        self.assertEqual(kwargs["metadata"]["expires_at_ts"], 8_200)
+
+    def test_search_knowledge_base_tool_uses_query_expansion_and_dedupes_hits(self):
+        original_query = "python liste sıralama nasıl yapılır"
+
+        def fake_query(query, top_k=5, category=None):
+            if query == original_query:
+                return [
+                    {
+                        "id": "chunk-1",
+                        "text": "sort docs",
+                        "metadata": {"source_key": "src-1", "source_name": "doc-1", "source_type": "conversation", "category": "conversation", "chunk_index": 0, "indexed_at_ts": 2_000},
+                        "similarity": 0.40,
+                    }
+                ]
+            return [
+                {
+                    "id": "chunk-1",
+                    "text": "sort docs",
+                    "metadata": {"source_key": "src-1", "source_name": "doc-1", "source_type": "conversation", "category": "conversation", "chunk_index": 0, "indexed_at_ts": 2_000},
+                    "similarity": 0.52,
+                },
+                {
+                    "id": "chunk-2",
+                    "text": "list order",
+                    "metadata": {"source_key": "src-2", "source_name": "doc-2", "source_type": "conversation", "category": "conversation", "chunk_index": 1, "indexed_at_ts": 2_000},
+                    "similarity": 0.45,
+                },
+            ]
+
+        with patch("rag_service.ensure_supported_rag_sources"), patch("rag_service.rag_query_chunks", side_effect=fake_query) as mocked_query, patch("rag_service.time.time", return_value=2_000):
+            result = search_knowledge_base_tool(original_query, top_k=5)
+
+        self.assertGreaterEqual(mocked_query.call_count, 2)
+        self.assertEqual(result["count"], 2)
+        self.assertEqual([match["id"] for match in result["matches"]], ["chunk-1", "chunk-2"])
+
+    def test_build_rag_auto_context_prefers_recent_hits_with_temporal_decay(self):
+        old_timestamp = int((datetime.now(timezone.utc) - timedelta(days=60)).timestamp())
+        new_timestamp = int(datetime.now(timezone.utc).timestamp())
+        fake_hits = [
+            {
+                "id": "old-hit",
+                "text": "older memory",
+                "metadata": {"source_key": "old", "source_name": "Old", "source_type": "tool_memory", "category": "tool_memory", "chunk_index": 0, "indexed_at_ts": old_timestamp},
+                "similarity": 0.50,
+            },
+            {
+                "id": "new-hit",
+                "text": "newer memory",
+                "metadata": {"source_key": "new", "source_name": "New", "source_type": "tool_memory", "category": "tool_memory", "chunk_index": 0, "indexed_at_ts": new_timestamp},
+                "similarity": 0.50,
+            },
+        ]
+
+        with patch("rag_service.ensure_supported_rag_sources"), patch("rag_service.rag_query_chunks", return_value=fake_hits), patch("rag_service.time.time", return_value=new_timestamp):
+            result = build_rag_auto_context("recent memory", True, threshold=0.1, top_k=5)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["matches"][0]["id"], "new-hit")
+        self.assertGreater(result["matches"][0]["similarity"], result["matches"][1]["similarity"])
 
     def test_runtime_system_message_hides_canvas_edit_tools_without_canvas_document(self):
         message = build_runtime_system_message(
@@ -2044,6 +2367,240 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn("MISSING FINAL ANSWER", retry_content)
         self.assertIn("assistant content only", retry_content)
 
+    def test_context_overflow_error_detection(self):
+        self.assertTrue(_is_context_overflow_error("context_length_exceeded: requested 200000 tokens"))
+        self.assertTrue(_is_context_overflow_error("This model's maximum context length is 128000 tokens."))
+        self.assertFalse(_is_context_overflow_error("rate_limit_exceeded"))
+        self.assertFalse(_is_context_overflow_error("429 Too Many Requests"))
+
+    def test_iter_agent_exchange_blocks_keeps_assistant_and_tool_together(self):
+        blocks = _iter_agent_exchange_blocks(
+            [
+                {"role": "system", "content": "sys"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "search_web", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-1", "content": "tool result"},
+                {"role": "user", "content": "next"},
+            ]
+        )
+
+        self.assertEqual(blocks[1]["type"], "exchange")
+        self.assertEqual([message["role"] for message in blocks[1]["messages"]], ["assistant", "tool"])
+
+    def test_try_compact_messages_preserves_recent_exchanges(self):
+        messages = [
+            {"role": "system", "content": "sys"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "search_web", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": "A" * 1200},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-2", "type": "function", "function": {"name": "fetch_url", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "call-2", "content": "B" * 1200},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-3", "type": "function", "function": {"name": "search_news_ddgs", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "call-3", "content": "C" * 1200},
+        ]
+
+        compacted = _try_compact_messages(messages, budget=200, keep_recent=2)
+
+        self.assertIsNotNone(compacted)
+        self.assertEqual(compacted[0]["role"], "system")
+        self.assertEqual(compacted[1]["role"], "user")
+        self.assertIn("compacted tool step 1", compacted[1]["content"])
+        self.assertEqual(compacted[-2]["role"], "assistant")
+        self.assertEqual(compacted[-1]["role"], "tool")
+
+    def test_try_compact_messages_builds_semantic_summary(self):
+        messages = [
+            {"role": "system", "content": "sys"},
+            {
+                "role": "assistant",
+                "content": "I should search for current release notes before answering.",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "search_web", "arguments": '{"queries": ["python release notes"]}'},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "content": "Web results\n\n1. Python 3.13 notes\nURL: https://example.com\nSnippet: Latest changes overview",
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-2", "type": "function", "function": {"name": "fetch_url", "arguments": '{"url": "https://example.com"}'}}],
+            },
+            {"role": "tool", "tool_call_id": "call-2", "content": "Title: Python 3.13\n\nKey highlights and changes."},
+        ]
+
+        compacted = _try_compact_messages(messages, budget=120, keep_recent=1)
+
+        self.assertIsNotNone(compacted)
+        compacted_summary = compacted[1]["content"]
+        self.assertIn("Assistant intent:", compacted_summary)
+        self.assertIn("search_web: python release notes", compacted_summary)
+        self.assertIn("Outcomes:", compacted_summary)
+        self.assertIn("Web results", compacted_summary)
+
+    def test_prepare_tool_result_for_transcript_clips_large_non_fetch_payloads(self):
+        result = _prepare_tool_result_for_transcript("search_web", {"items": ["x" * 30000]})
+        rendered = _build_compact_tool_message_content("search_web", {}, {"ignored": True}, "summary", transcript_result=result)
+
+        self.assertIsInstance(result, str)
+        self.assertIn("[CLIPPED: original", result)
+        self.assertIn("[CLIPPED: original", rendered)
+
+    def test_run_agent_stream_deduplicates_missing_final_answer_instruction(self):
+        responses = [
+            iter([self._stream_chunk(reasoning="One."), self._stream_chunk(usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2))]),
+            iter([self._stream_chunk(reasoning="Two."), self._stream_chunk(usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2))]),
+            iter([self._stream_chunk(content="Final."), self._stream_chunk(usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2))]),
+        ]
+
+        with patch("agent.client.chat.completions.create", side_effect=responses) as mocked_create:
+            events = list(run_agent_stream([{"role": "user", "content": "Test"}], "deepseek-reasoner", 3, []))
+
+        self.assertIn({"type": "answer_delta", "text": "Final."}, events)
+        third_call_messages = mocked_create.call_args_list[2].kwargs["messages"]
+        retry_markers = [message for message in third_call_messages if "MISSING FINAL ANSWER" in str(message.get("content") or "")]
+        self.assertEqual(len(retry_markers), 1)
+
+    def test_run_agent_stream_recovers_from_context_overflow_before_model_turn(self):
+        api_messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "Need answer"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "search_web", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": "A" * 2500},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-2", "type": "function", "function": {"name": "fetch_url", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "call-2", "content": "B" * 2500},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-3", "type": "function", "function": {"name": "search_news_ddgs", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "call-3", "content": "C" * 2500},
+        ]
+        responses = [
+            Exception("context_length_exceeded"),
+            iter([self._stream_chunk(content="Recovered."), self._stream_chunk(usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2))]),
+        ]
+
+        with patch("agent.PROMPT_MAX_INPUT_TOKENS", 300), patch(
+            "agent.client.chat.completions.create",
+            side_effect=responses,
+        ) as mocked_create:
+            events = list(run_agent_stream(api_messages, "deepseek-chat", 2, []))
+
+        self.assertIn({"type": "answer_delta", "text": "Recovered."}, events)
+        self.assertEqual(mocked_create.call_count, 2)
+        retried_messages = mocked_create.call_args_list[1].kwargs["messages"]
+        self.assertTrue(any(message["role"] == "user" and "compacted tool step" in message["content"] for message in retried_messages))
+
+    def test_run_agent_stream_traces_overflow_recovery_telemetry(self):
+        api_messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "Need answer"},
+            {
+                "role": "assistant",
+                "content": "I should inspect older search results.",
+                "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "search_web", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": "A" * 2500},
+            {
+                "role": "assistant",
+                "content": "Now inspect fetched details.",
+                "tool_calls": [{"id": "call-2", "type": "function", "function": {"name": "fetch_url", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "call-2", "content": "B" * 2500},
+        ]
+        responses = [
+            Exception("context_length_exceeded"),
+            iter([self._stream_chunk(content="Recovered."), self._stream_chunk(usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2))]),
+        ]
+
+        with patch("agent.PROMPT_MAX_INPUT_TOKENS", 250), patch(
+            "agent.client.chat.completions.create",
+            side_effect=responses,
+        ), patch("agent._trace_agent_event") as mocked_trace:
+            events = list(run_agent_stream(api_messages, "deepseek-chat", 2, []))
+
+        self.assertIn({"type": "answer_delta", "text": "Recovered."}, events)
+        compacted_calls = [call for call in mocked_trace.call_args_list if call.args and call.args[0] == "context_compacted"]
+        self.assertTrue(compacted_calls)
+        self.assertTrue(any(call.kwargs.get("force") is True for call in compacted_calls))
+        self.assertTrue(any((call.kwargs.get("compacted_exchange_count") or 0) >= 1 for call in compacted_calls))
+        recovered_calls = [call for call in mocked_trace.call_args_list if call.args and call.args[0] == "context_overflow_recovered"]
+        self.assertTrue(recovered_calls)
+        self.assertEqual(recovered_calls[-1].kwargs.get("phase"), "main_loop")
+
+    def test_run_agent_stream_reports_unrecoverable_context_overflow(self):
+        with patch("agent.client.chat.completions.create", side_effect=Exception("maximum context length exceeded")):
+            events = list(run_agent_stream([{"role": "user", "content": "Test"}], "deepseek-chat", 1, []))
+
+        self.assertIn(
+            {
+                "type": "tool_error",
+                "step": 1,
+                "tool": "api",
+                "error": CONTEXT_OVERFLOW_RECOVERY_ERROR_TEXT,
+            },
+            events,
+        )
+        self.assertIn({"type": "answer_delta", "text": FINAL_ANSWER_ERROR_TEXT}, events)
+
+    def test_final_answer_phase_recovers_from_context_overflow(self):
+        responses = [
+            iter(
+                [
+                    self._tool_call_chunk("search_web", {"queries": ["x"]}),
+                    self._stream_chunk(usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2)),
+                ]
+            ),
+            Exception("context_length_exceeded"),
+            iter([self._stream_chunk(content="Final after compaction."), self._stream_chunk(usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2))]),
+        ]
+
+        with patch("agent.PROMPT_MAX_INPUT_TOKENS", 200), patch(
+            "agent.AGENT_CONTEXT_COMPACTION_KEEP_RECENT_ROUNDS",
+            0,
+        ), patch("agent.client.chat.completions.create", side_effect=responses), patch(
+            "agent.search_web_tool",
+            return_value=[{"title": "Test", "url": "https://example.com", "snippet": "Snippet" * 200}],
+        ):
+            events = list(run_agent_stream([{"role": "user", "content": "Test"}], "deepseek-chat", 1, ["search_web"]))
+
+        self.assertIn({"type": "answer_delta", "text": "Final after compaction."}, events)
+
     def test_run_agent_stream_separates_reasoning_turns_with_blank_line(self):
         responses = [
             iter(
@@ -2104,6 +2661,77 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn({"type": "answer_delta", "text": FINAL_ANSWER_MISSING_TEXT}, events)
         leaked_reasoning = [event for event in events if event["type"] == "answer_delta" and "reasoning pass" in event["text"]]
         self.assertEqual(leaked_reasoning, [])
+
+    def test_run_agent_stream_injects_blocker_memory_after_tool_failure(self):
+        responses = [
+            iter(
+                [
+                    self._tool_call_chunk("search_web", {"queries": ["bad query"]}),
+                    self._stream_chunk(usage=SimpleNamespace(prompt_tokens=2, completion_tokens=3, total_tokens=5)),
+                ]
+            ),
+            iter(
+                [
+                    self._stream_chunk(content="Fallback answer."),
+                    self._stream_chunk(usage=SimpleNamespace(prompt_tokens=2, completion_tokens=4, total_tokens=6)),
+                ]
+            ),
+        ]
+
+        with patch("agent.client.chat.completions.create", side_effect=responses) as mocked_create, patch(
+            "agent.search_web_tool",
+            side_effect=RuntimeError("search backend unavailable"),
+        ):
+            events = list(run_agent_stream([{"role": "user", "content": "Find current info"}], "deepseek-chat", 2, ["search_web"]))
+
+        self.assertIn({"type": "answer_delta", "text": "Fallback answer."}, events)
+        second_call_messages = mocked_create.call_args_list[1].kwargs["messages"]
+        blocker_message = next((message for message in second_call_messages if message["role"] == "system" and "AGENT WORKING MEMORY" in message["content"]), None)
+        self.assertIsNotNone(blocker_message)
+        self.assertIn("search backend unavailable", blocker_message["content"])
+        self.assertIn("Failed paths to avoid repeating", blocker_message["content"])
+
+    def test_run_agent_stream_enforces_per_tool_step_limit(self):
+        responses = [
+            iter(
+                [
+                    self._tool_call_chunk("fetch_url", {"url": "https://example.com/1"}),
+                    self._stream_chunk(usage=SimpleNamespace(prompt_tokens=2, completion_tokens=3, total_tokens=5)),
+                ]
+            ),
+            iter(
+                [
+                    self._tool_call_chunk("fetch_url", {"url": "https://example.com/2"}),
+                    self._stream_chunk(usage=SimpleNamespace(prompt_tokens=2, completion_tokens=3, total_tokens=5)),
+                ]
+            ),
+            iter(
+                [
+                    self._tool_call_chunk("fetch_url", {"url": "https://example.com/3"}),
+                    self._stream_chunk(usage=SimpleNamespace(prompt_tokens=2, completion_tokens=3, total_tokens=5)),
+                ]
+            ),
+            iter(
+                [
+                    self._stream_chunk(content="Final answer."),
+                    self._stream_chunk(usage=SimpleNamespace(prompt_tokens=2, completion_tokens=4, total_tokens=6)),
+                ]
+            ),
+        ]
+
+        with patch("agent.client.chat.completions.create", side_effect=responses), patch(
+            "agent.fetch_url_tool",
+            return_value={"url": "https://example.com", "title": "Example", "content": "Body"},
+        ) as mocked_fetch:
+            events = list(run_agent_stream([{"role": "user", "content": "Fetch several pages"}], "deepseek-chat", 4, ["fetch_url"]))
+
+        self.assertEqual(mocked_fetch.call_count, 2)
+        per_tool_errors = [
+            event for event in events
+            if event["type"] == "tool_error" and event["tool"] == "fetch_url" and "Per-tool step limit reached" in event["error"]
+        ]
+        self.assertEqual(len(per_tool_errors), 1)
+        self.assertIn({"type": "answer_delta", "text": "Final answer."}, events)
 
     def test_run_agent_stream_stops_after_api_error_without_duplicate_retry(self):
         responses = [RuntimeError("Error code: 400 - {'error': {'message': 'Invalid consecutive assistant message at message index 2', 'type': 'invalid_request_error'}}")]
@@ -3728,7 +4356,7 @@ class AppRoutesTestCase(unittest.TestCase):
 
         with patch("routes.chat.collect_agent_response", return_value=fake_summary), patch(
             "routes.chat.sync_conversations_to_rag_safe"
-        ):
+        ), patch("routes.chat.get_prompt_summary_max_tokens", return_value=300):
             response = self.client.post(
                 f"/api/conversations/{conversation_id}/summarize",
                 json={"force": True},
@@ -3753,6 +4381,114 @@ class AppRoutesTestCase(unittest.TestCase):
         visible_pairs = [(row["id"], row["role"]) for row in visible_rows]
         self.assertNotIn((assistant_tool_id, "assistant"), visible_pairs)
         self.assertNotIn((tool_id, "tool"), visible_pairs)
+
+    def test_manual_summarize_can_create_hierarchical_summary_from_existing_summaries(self):
+        conversation_id = self._create_conversation()
+        save_app_settings(
+            {
+                "user_preferences": "",
+                "max_steps": "1",
+                "active_tools": "[]",
+                "rag_auto_inject": "false",
+                "chat_summary_mode": "never",
+                "chat_summary_trigger_token_count": "1000",
+                "summary_skip_first": "0",
+                "summary_skip_last": "0",
+            }
+        )
+
+        long_summary = " ".join(["summary-detail"] * 250)
+        with get_db() as conn:
+            conn.execute(
+                "INSERT INTO messages (conversation_id, role, content, metadata, position) VALUES (?, 'summary', ?, ?, ?)",
+                (
+                    conversation_id,
+                    f"Conversation summary (generated from deleted messages):\n\n{long_summary}",
+                    serialize_message_metadata({"is_summary": True, "summary_source": "conversation_history", "summary_level": 1}),
+                    1,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO messages (conversation_id, role, content, metadata, position) VALUES (?, 'summary', ?, ?, ?)",
+                (
+                    conversation_id,
+                    f"Conversation summary (generated from deleted messages):\n\n{long_summary}",
+                    serialize_message_metadata({"is_summary": True, "summary_source": "conversation_history", "summary_level": 1}),
+                    2,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO messages (conversation_id, role, content, metadata, position) VALUES (?, 'summary', ?, ?, ?)",
+                (
+                    conversation_id,
+                    "Conversation summary (generated from deleted messages):\n\nRecent compact summary.",
+                    serialize_message_metadata({"is_summary": True, "summary_source": "conversation_history", "summary_level": 1}),
+                    3,
+                ),
+            )
+
+        fake_summary = {
+            "content": json.dumps(
+                {
+                    "facts": ["Older summary facts were merged."],
+                    "decisions": ["A hierarchical summary replaced older summaries."],
+                    "open_issues": [],
+                    "entities": [],
+                    "tool_outcomes": [],
+                },
+                ensure_ascii=False,
+            ),
+            "reasoning_content": "",
+            "usage": None,
+            "tool_results": [],
+            "errors": [],
+        }
+
+        with patch("routes.chat.collect_agent_response", return_value=fake_summary), patch(
+            "routes.chat.sync_conversations_to_rag_safe"
+        ), patch("routes.chat.get_prompt_summary_max_tokens", return_value=300):
+            response = self.client.post(
+                f"/api/conversations/{conversation_id}/summarize",
+                json={"force": True},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload["applied"])
+        summary_messages = [message for message in payload["messages"] if message["role"] == "summary"]
+        self.assertEqual(len(summary_messages), 2)
+        hierarchical_summary = next(message for message in summary_messages if message["metadata"]["summary_level"] == 2)
+        self.assertEqual(hierarchical_summary["metadata"]["summary_source"], "summary_history")
+
+    def test_run_agent_stream_reuses_cross_turn_fetch_url_memory(self):
+        responses = [
+            iter(
+                [
+                    self._tool_call_chunk("fetch_url", {"url": "https://example.com/page"}),
+                    self._stream_chunk(usage=SimpleNamespace(prompt_tokens=3, completion_tokens=5, total_tokens=8)),
+                ]
+            ),
+            iter(
+                [
+                    self._stream_chunk(content="Final answer from cached fetch."),
+                    self._stream_chunk(usage=SimpleNamespace(prompt_tokens=4, completion_tokens=6, total_tokens=10)),
+                ]
+            ),
+        ]
+
+        with patch("agent.client.chat.completions.create", side_effect=responses), patch(
+            "agent.get_exact_tool_memory_match",
+            return_value={
+                "content": "URL: https://example.com/page\n\nTitle: Example\n\nReused page content.",
+                "summary": "Page content extracted: Example",
+            },
+        ), patch("agent.fetch_url_tool") as mocked_fetch:
+            events = list(run_agent_stream([{"role": "user", "content": "Fetch it again"}], "deepseek-chat", 2, ["fetch_url"]))
+
+        mocked_fetch.assert_not_called()
+        tool_result_event = next(event for event in events if event["type"] == "tool_result")
+        self.assertTrue(tool_result_event["cached"])
+        self.assertIn("Page content extracted", tool_result_event["summary"])
 
     def test_chat_summary_mode_never_skips_summary_even_above_token_threshold(self):
         conversation_id = self._create_conversation()

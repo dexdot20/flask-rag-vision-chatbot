@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -114,6 +115,13 @@ def init_db() -> None:
                 value      TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
+            CREATE TABLE IF NOT EXISTS user_profile (
+                key        TEXT PRIMARY KEY,
+                value      TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 1.0,
+                source     TEXT,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
             CREATE TABLE IF NOT EXISTS image_assets (
                 image_id         TEXT PRIMARY KEY,
                 conversation_id  INTEGER NOT NULL,
@@ -138,6 +146,7 @@ def init_db() -> None:
                 category TEXT NOT NULL DEFAULT 'general',
                 chunk_count INTEGER NOT NULL DEFAULT 0,
                 metadata TEXT,
+                expires_at TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
@@ -225,12 +234,180 @@ def ensure_messages_deleted_at_column() -> None:
         )
 
 
+def ensure_rag_documents_expires_at_column() -> None:
+    with get_db() as conn:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(rag_documents)").fetchall()}
+        if "expires_at" not in columns:
+            conn.execute("ALTER TABLE rag_documents ADD COLUMN expires_at TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rag_documents_expires_at ON rag_documents(expires_at, category, updated_at)"
+        )
+
+
+def delete_rag_document_records(source_keys: Iterable[str]) -> None:
+    normalized_keys = [str(source_key or "").strip() for source_key in source_keys if str(source_key or "").strip()]
+    if not normalized_keys:
+        return
+
+    placeholders = ", ".join("?" for _ in normalized_keys)
+    with get_db() as conn:
+        conn.execute(f"DELETE FROM rag_documents WHERE source_key IN ({placeholders})", tuple(normalized_keys))
+
+
+def get_expired_rag_document_source_keys(now_iso: str | None = None) -> list[str]:
+    reference_time = str(now_iso or "").strip() or datetime_utc_now_iso()
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT source_key FROM rag_documents WHERE expires_at IS NOT NULL AND expires_at <= ? ORDER BY expires_at ASC",
+            (reference_time,),
+        ).fetchall()
+    return [str(row["source_key"] or "").strip() for row in rows if str(row["source_key"] or "").strip()]
+
+
+def datetime_utc_now_iso() -> str:
+    with get_db() as conn:
+        row = conn.execute("SELECT datetime('now') AS now_iso").fetchone()
+    return str(row["now_iso"] or "").strip()
+
+
 def initialize_database() -> None:
     init_db()
     ensure_messages_metadata_column()
     ensure_messages_tool_history_columns()
     ensure_messages_position_column()
     ensure_messages_deleted_at_column()
+    ensure_rag_documents_expires_at_column()
+
+
+def _normalize_user_profile_value(value, max_length: int = 500) -> str:
+    return " ".join(str(value or "").strip().split())[:max_length]
+
+
+def _build_user_profile_fact_key(value: str) -> str:
+    normalized_value = _normalize_user_profile_value(value)
+    digest = hashlib.sha1(normalized_value.encode("utf-8")).hexdigest()
+    return f"fact:{digest}"
+
+
+def _is_user_profile_fact_candidate(value: str) -> bool:
+    normalized_value = _normalize_user_profile_value(value).casefold()
+    if not normalized_value:
+        return False
+    keywords = (
+        "the user",
+        "user prefers",
+        "user wants",
+        "user is",
+        "user uses",
+        "user works",
+        "prefers",
+        "likes",
+        "kullanıcı",
+        "kullanici",
+        "tercih",
+        "istiyor",
+        "kullanıyor",
+        "çalışıyor",
+        "works on",
+        "working on",
+        "name is",
+        "adı",
+    )
+    return any(keyword in normalized_value for keyword in keywords)
+
+
+def upsert_user_profile_entry(key: str, value: str, confidence: float = 1.0, source: str = "manual") -> dict | None:
+    normalized_key = str(key or "").strip()[:120]
+    normalized_value = _normalize_user_profile_value(value)
+    normalized_source = str(source or "").strip()[:80] or "manual"
+    try:
+        normalized_confidence = float(confidence)
+    except (TypeError, ValueError):
+        normalized_confidence = 1.0
+    normalized_confidence = max(0.0, min(1.0, normalized_confidence))
+
+    if not normalized_key or not normalized_value:
+        return None
+
+    with get_db() as conn:
+        conn.execute(
+            """INSERT INTO user_profile (key, value, confidence, source, updated_at)
+               VALUES (?, ?, ?, ?, datetime('now'))
+               ON CONFLICT(key) DO UPDATE SET
+                   value = excluded.value,
+                   confidence = excluded.confidence,
+                   source = excluded.source,
+                   updated_at = datetime('now')""",
+            (normalized_key, normalized_value, normalized_confidence, normalized_source),
+        )
+    return {
+        "key": normalized_key,
+        "value": normalized_value,
+        "confidence": normalized_confidence,
+        "source": normalized_source,
+    }
+
+
+def upsert_user_profile_facts(facts: list[str], confidence: float = 0.8, source: str = "summary_extraction") -> list[dict]:
+    stored: list[dict] = []
+    for raw_fact in facts or []:
+        normalized_fact = _normalize_user_profile_value(raw_fact)
+        if not normalized_fact or not _is_user_profile_fact_candidate(normalized_fact):
+            continue
+        entry = upsert_user_profile_entry(
+            _build_user_profile_fact_key(normalized_fact),
+            normalized_fact,
+            confidence=confidence,
+            source=source,
+        )
+        if entry is not None:
+            stored.append(entry)
+    return stored
+
+
+def get_user_profile_entries(limit: int | None = None) -> list[dict]:
+    query = "SELECT key, value, confidence, source, updated_at FROM user_profile ORDER BY confidence DESC, updated_at DESC, key ASC"
+    params: tuple[object, ...] = ()
+    if isinstance(limit, int) and limit > 0:
+        query += " LIMIT ?"
+        params = (limit,)
+    with get_db() as conn:
+        rows = conn.execute(query, params).fetchall()
+    return [
+        {
+            "key": str(row["key"] or "").strip(),
+            "value": str(row["value"] or "").strip(),
+            "confidence": float(row["confidence"] or 0.0),
+            "source": str(row["source"] or "").strip(),
+            "updated_at": str(row["updated_at"] or "").strip(),
+        }
+        for row in rows
+        if str(row["key"] or "").strip() and str(row["value"] or "").strip()
+    ]
+
+
+def build_user_profile_system_context(max_tokens: int = 500, limit: int = 12) -> str | None:
+    if max_tokens <= 0:
+        return None
+
+    entries = get_user_profile_entries(limit=limit)
+    if not entries:
+        return None
+
+    lines: list[str] = []
+    total_tokens = 0
+    for entry in entries:
+        line = f"- {entry['value']}"
+        line_tokens = estimate_text_tokens(line)
+        if lines and total_tokens + line_tokens > max_tokens:
+            break
+        if not lines and line_tokens > max_tokens:
+            break
+        lines.append(line)
+        total_tokens += line_tokens
+    if not lines:
+        return None
+    return "\n".join(lines)
 
 
 def _guess_extension_for_mime_type(mime_type: str) -> str:
@@ -950,6 +1127,11 @@ def serialize_message_metadata(metadata: dict | None) -> str | None:
             cleaned["key_points"] = normalized_points[:8]
     if reasoning_content:
         cleaned["reasoning_content"] = reasoning_content[:CONTENT_MAX_CHARS]
+    if metadata.get("is_pruned") is True:
+        cleaned["is_pruned"] = True
+    pruned_original = str(metadata.get("pruned_original") or "").strip()
+    if pruned_original:
+        cleaned["pruned_original"] = pruned_original[:CONTENT_MAX_CHARS]
     if metadata.get("is_summary") is True:
         cleaned["is_summary"] = True
     if summary_source:
@@ -967,6 +1149,7 @@ def serialize_message_metadata(metadata: dict | None) -> str | None:
         "trigger_threshold",
         "trigger_token_count",
         "visible_token_count",
+        "summary_source_token_target",
     ):
         normalized = _coerce_non_negative_int(metadata.get(key))
         if normalized is not None:
@@ -979,6 +1162,29 @@ def serialize_message_metadata(metadata: dict | None) -> str | None:
     summary_model = str(metadata.get("summary_model") or "").strip()
     if summary_model:
         cleaned["summary_model"] = summary_model[:120]
+
+    summary_format = str(metadata.get("summary_format") or "").strip().lower()
+    if summary_format in {"plain_text", "structured_json"}:
+        cleaned["summary_format"] = summary_format
+
+    summary_level = _coerce_non_negative_int(metadata.get("summary_level"))
+    if summary_level is not None:
+        cleaned["summary_level"] = max(1, summary_level)
+
+    summary_data = metadata.get("summary_data") if isinstance(metadata.get("summary_data"), dict) else None
+    if summary_data:
+        normalized_summary_data = {}
+        for key in ("facts", "decisions", "open_issues", "entities", "tool_outcomes"):
+            raw_items = summary_data.get(key) if isinstance(summary_data.get(key), list) else []
+            cleaned_items = []
+            for raw_item in raw_items[:16]:
+                item_text = str(raw_item or "").strip()
+                if item_text and item_text not in cleaned_items:
+                    cleaned_items.append(item_text[:500])
+            if cleaned_items:
+                normalized_summary_data[key] = cleaned_items
+        if normalized_summary_data:
+            cleaned["summary_data"] = normalized_summary_data
 
     summary_insert_strategy = str(metadata.get("summary_insert_strategy") or "").strip()
     if summary_insert_strategy in {
@@ -1383,6 +1589,32 @@ def get_fetch_url_clip_aggressiveness(settings: dict | None = None) -> int:
     except (TypeError, ValueError):
         aggressiveness = 50
     return max(0, min(100, aggressiveness))
+
+
+def get_pruning_enabled(settings: dict | None = None) -> bool:
+    source = settings if settings is not None else get_app_settings()
+    raw_value = source.get("pruning_enabled", DEFAULT_SETTINGS["pruning_enabled"])
+    return str(raw_value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def get_pruning_token_threshold(settings: dict | None = None) -> int:
+    source = settings if settings is not None else get_app_settings()
+    raw_value = source.get("pruning_token_threshold", DEFAULT_SETTINGS["pruning_token_threshold"])
+    try:
+        threshold = int(raw_value)
+    except (TypeError, ValueError):
+        threshold = CHAT_SUMMARY_TRIGGER_TOKEN_COUNT
+    return max(1_000, min(200_000, threshold))
+
+
+def get_pruning_batch_size(settings: dict | None = None) -> int:
+    source = settings if settings is not None else get_app_settings()
+    raw_value = source.get("pruning_batch_size", DEFAULT_SETTINGS["pruning_batch_size"])
+    try:
+        batch_size = int(raw_value)
+    except (TypeError, ValueError):
+        batch_size = 10
+    return max(1, min(50, batch_size))
 
 
 def get_next_message_position(conn: sqlite3.Connection, conversation_id: int) -> int:

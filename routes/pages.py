@@ -21,6 +21,9 @@ from db import (
     get_chat_summary_trigger_token_count,
     get_fetch_url_clip_aggressiveness,
     get_fetch_url_token_threshold,
+    get_pruning_batch_size,
+    get_pruning_enabled,
+    get_pruning_token_threshold,
     get_rag_auto_inject_enabled,
     get_rag_context_size,
     get_rag_sensitivity,
@@ -48,6 +51,9 @@ def build_settings_payload() -> dict:
         "chat_summary_trigger_token_count": get_chat_summary_trigger_token_count(raw),
         "summary_skip_first": get_summary_skip_first(raw),
         "summary_skip_last": get_summary_skip_last(raw),
+        "pruning_enabled": get_pruning_enabled(raw),
+        "pruning_token_threshold": get_pruning_token_threshold(raw),
+        "pruning_batch_size": get_pruning_batch_size(raw),
         "fetch_url_token_threshold": get_fetch_url_token_threshold(raw),
         "fetch_url_clip_aggressiveness": get_fetch_url_clip_aggressiveness(raw),
         "features": get_feature_flags(),
@@ -87,6 +93,9 @@ def register_page_routes(app) -> None:
         chat_summary_trigger_raw = data.get("chat_summary_trigger_token_count")
         summary_skip_first_raw = data.get("summary_skip_first")
         summary_skip_last_raw = data.get("summary_skip_last")
+        pruning_enabled_raw = data.get("pruning_enabled")
+        pruning_token_threshold_raw = data.get("pruning_token_threshold")
+        pruning_batch_size_raw = data.get("pruning_batch_size")
         fetch_url_token_threshold_raw = data.get("fetch_url_token_threshold")
         fetch_url_clip_aggressiveness_raw = data.get("fetch_url_clip_aggressiveness")
         scratchpad = data.get("scratchpad")
@@ -104,6 +113,9 @@ def register_page_routes(app) -> None:
             and chat_summary_trigger_raw is None
             and summary_skip_first_raw is None
             and summary_skip_last_raw is None
+            and pruning_enabled_raw is None
+            and pruning_token_threshold_raw is None
+            and pruning_batch_size_raw is None
             and fetch_url_token_threshold_raw is None
             and fetch_url_clip_aggressiveness_raw is None
         ):
@@ -203,6 +215,32 @@ def register_page_routes(app) -> None:
                 return jsonify({"error": "summary_skip_last must be between 0 and 20."}), 400
             settings["summary_skip_last"] = str(summary_skip_last)
 
+        if pruning_enabled_raw is not None:
+            if isinstance(pruning_enabled_raw, bool):
+                settings["pruning_enabled"] = "true" if pruning_enabled_raw else "false"
+            else:
+                settings["pruning_enabled"] = (
+                    "true" if str(pruning_enabled_raw).strip().lower() in {"1", "true", "yes", "on"} else "false"
+                )
+
+        if pruning_token_threshold_raw is not None:
+            try:
+                pruning_token_threshold = int(pruning_token_threshold_raw)
+            except (TypeError, ValueError):
+                return jsonify({"error": "pruning_token_threshold must be an integer."}), 400
+            if not (1_000 <= pruning_token_threshold <= 200_000):
+                return jsonify({"error": "pruning_token_threshold must be between 1000 and 200000."}), 400
+            settings["pruning_token_threshold"] = str(pruning_token_threshold)
+
+        if pruning_batch_size_raw is not None:
+            try:
+                pruning_batch_size = int(pruning_batch_size_raw)
+            except (TypeError, ValueError):
+                return jsonify({"error": "pruning_batch_size must be an integer."}), 400
+            if not (1 <= pruning_batch_size <= 50):
+                return jsonify({"error": "pruning_batch_size must be between 1 and 50."}), 400
+            settings["pruning_batch_size"] = str(pruning_batch_size)
+
         if fetch_url_token_threshold_raw is not None:
             try:
                 fetch_url_token_threshold = int(fetch_url_token_threshold_raw)
@@ -236,6 +274,9 @@ def register_page_routes(app) -> None:
                 "chat_summary_trigger_token_count": get_chat_summary_trigger_token_count(settings),
                 "summary_skip_first": get_summary_skip_first(settings),
                 "summary_skip_last": get_summary_skip_last(settings),
+                "pruning_enabled": get_pruning_enabled(settings),
+                "pruning_token_threshold": get_pruning_token_threshold(settings),
+                "pruning_batch_size": get_pruning_batch_size(settings),
                 "fetch_url_token_threshold": get_fetch_url_token_threshold(settings),
                 "fetch_url_clip_aggressiveness": get_fetch_url_clip_aggressiveness(settings),
                 "features": get_feature_flags(),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from collections import defaultdict
 import hashlib
 import json
 import logging
@@ -22,17 +23,22 @@ from canvas_service import (
     rewrite_canvas_document,
 )
 from config import (
+    AGENT_CONTEXT_COMPACTION_KEEP_RECENT_ROUNDS,
+    AGENT_CONTEXT_COMPACTION_THRESHOLD,
+    AGENT_TOOL_RESULT_TRANSCRIPT_MAX_CHARS,
     AGENT_TRACE_LOG_PATH,
     FETCH_RAW_TOOL_RESULT_MAX_TEXT_CHARS,
     FETCH_SUMMARY_MAX_CHARS,
     FETCH_SUMMARY_TOKEN_THRESHOLD,
+    PROMPT_MAX_INPUT_TOKENS,
     RAG_SEARCH_DEFAULT_TOP_K,
     RAG_TOOL_RESULT_MAX_TEXT_CHARS,
     RAG_TOOL_RESULT_SUMMARY_MAX_CHARS,
+    TOOL_STEP_LIMITS,
     client,
 )
 from db import append_to_scratchpad, read_image_asset_bytes, replace_scratchpad
-from rag_service import search_knowledge_base_tool, search_tool_memory, upsert_tool_memory_result
+from rag_service import get_exact_tool_memory_match, search_knowledge_base_tool, search_tool_memory, upsert_tool_memory_result
 from tool_registry import TOOL_SPEC_BY_NAME, get_openai_tool_specs
 from token_utils import estimate_text_tokens
 from vision import answer_image_question
@@ -45,6 +51,12 @@ from web_tools import (
 
 FINAL_ANSWER_ERROR_TEXT = "The model returned an invalid tool instruction and no final answer could be produced."
 FINAL_ANSWER_MISSING_TEXT = "The model did not produce a final answer in assistant content."
+CONTEXT_OVERFLOW_RECOVERY_ERROR_TEXT = (
+    "Context window is full and cannot be compacted further. "
+    "Try starting a new conversation, disabling RAG or large canvas content, or reducing the request size."
+)
+MISSING_FINAL_ANSWER_MARKER = "[INSTRUCTION: MISSING FINAL ANSWER"
+TOOL_EXECUTION_RESULTS_MARKER = "[TOOL EXECUTION RESULTS]"
 CANVAS_TOOL_NAMES = {
     "create_canvas_document",
     "rewrite_canvas_document",
@@ -123,7 +135,7 @@ def _estimate_message_breakdown(message: dict) -> dict[str, int]:
         return {"system_prompt": total_tokens}
 
     # Classify system messages by their distinctive markers
-    if content.startswith("[TOOL EXECUTION RESULTS]"):
+    if content.startswith(TOOL_EXECUTION_RESULTS_MARKER):
         return {"tool_results": total_tokens}
     if content.startswith("[INSTRUCTION: FINAL ANSWER REQUIRED]"):
         return {"final_instruction": total_tokens}
@@ -160,6 +172,34 @@ def _estimate_input_breakdown(messages_to_send: list[dict]) -> tuple[dict[str, i
     return breakdown, sum(breakdown.values())
 
 
+def _estimate_messages_tokens(messages_to_send: list[dict]) -> int:
+    return _estimate_input_breakdown(messages_to_send)[1]
+
+
+def _is_context_overflow_error(error_str: str) -> bool:
+    normalized = str(error_str or "").strip().lower()
+    if not normalized:
+        return False
+    if "rate_limit" in normalized or re.search(r"\b429\b", normalized):
+        return False
+
+    known_phrases = (
+        "context_length_exceeded",
+        "maximum context length",
+        "reduce the length",
+        "request too large",
+        "prompt is too long",
+        "input is too long",
+        "too many tokens",
+        "context window",
+        "context is full",
+        "max_tokens",
+    )
+    if any(phrase in normalized for phrase in known_phrases):
+        return True
+    return "token" in normalized and ("exceed" in normalized or "too long" in normalized)
+
+
 def _normalize_tool_args_for_cache(value):
     if isinstance(value, dict):
         return {str(key): _normalize_tool_args_for_cache(value[key]) for key in sorted(value.keys())}
@@ -182,6 +222,202 @@ def _clean_tool_text(text: str, limit: int | None = None) -> str:
     if limit and len(cleaned) > limit:
         return cleaned[:limit].rstrip() + "…"
     return cleaned
+
+
+def _has_missing_final_answer_instruction(messages: list[dict]) -> bool:
+    return any(MISSING_FINAL_ANSWER_MARKER in str(message.get("content") or "") for message in messages)
+
+
+def _is_tool_execution_result_message(message: dict) -> bool:
+    return str(message.get("role") or "").strip() == "system" and str(message.get("content") or "").startswith(
+        TOOL_EXECUTION_RESULTS_MARKER
+    )
+
+
+def _iter_agent_exchange_blocks(messages: list[dict]) -> list[dict]:
+    blocks: list[dict] = []
+    index = 0
+    exchange_index = 0
+    while index < len(messages):
+        message = messages[index]
+        role = str(message.get("role") or "").strip()
+        tool_calls = message.get("tool_calls") if isinstance(message, dict) else None
+        if role == "assistant" and isinstance(tool_calls, list) and tool_calls:
+            exchange_index += 1
+            block_messages = [message]
+            index += 1
+            while index < len(messages):
+                candidate = messages[index]
+                candidate_role = str(candidate.get("role") or "").strip()
+                if candidate_role == "tool" or _is_tool_execution_result_message(candidate):
+                    block_messages.append(candidate)
+                    index += 1
+                    continue
+                break
+            blocks.append({"type": "exchange", "step_index": exchange_index, "messages": block_messages})
+            continue
+
+        block_type = "system_prefix" if role == "system" and not blocks else "passthrough"
+        blocks.append({"type": block_type, "messages": [message]})
+        index += 1
+    return blocks
+
+
+def _flatten_agent_exchange_blocks(blocks: list[dict]) -> list[dict]:
+    flattened: list[dict] = []
+    for block in blocks:
+        flattened.extend(block.get("messages") or [])
+    return flattened
+
+
+def _merge_adjacent_user_messages(messages: list[dict]) -> list[dict] | None:
+    merged_messages: list[dict] = []
+    buffered_user_contents: list[str] = []
+    merged_any = False
+
+    def flush_user_buffer():
+        nonlocal merged_any
+        if not buffered_user_contents:
+            return
+        merged_content = "\n\n".join(content for content in buffered_user_contents if content)
+        if len(buffered_user_contents) > 1:
+            merged_any = True
+        merged_messages.append({"role": "user", "content": merged_content})
+        buffered_user_contents.clear()
+
+    for message in messages:
+        if str(message.get("role") or "").strip() == "user":
+            buffered_user_contents.append(str(message.get("content") or "").strip())
+            continue
+        flush_user_buffer()
+        merged_messages.append(message)
+
+    flush_user_buffer()
+    return merged_messages if merged_any else None
+
+
+def _extract_compaction_assistant_intent(message: dict) -> str:
+    return _clean_tool_text(message.get("content") or "", limit=140)
+
+
+def _extract_compaction_tool_call_preview(tool_call: dict) -> str:
+    function = tool_call.get("function") or {}
+    tool_name = str(function.get("name") or "").strip() or "tool"
+    raw_arguments = function.get("arguments")
+    parsed_arguments = _parse_json_like_value(raw_arguments)
+    arguments = parsed_arguments if isinstance(parsed_arguments, dict) else {}
+
+    if tool_name in {"search_web", "search_news_ddgs", "search_news_google"}:
+        queries = arguments.get("queries")
+        if isinstance(queries, list):
+            preview = ", ".join(str(item).strip() for item in queries if str(item).strip())
+            if preview:
+                return f"{tool_name}: {_clean_tool_text(preview, limit=120)}"
+    if tool_name == "fetch_url":
+        url = str(arguments.get("url") or "").strip()
+        if url:
+            return f"{tool_name}: {_clean_tool_text(url, limit=140)}"
+    if tool_name in {"search_knowledge_base", "search_tool_memory"}:
+        query = str(arguments.get("query") or "").strip()
+        if query:
+            return f"{tool_name}: {_clean_tool_text(query, limit=120)}"
+
+    scalar_parts: list[str] = []
+    for key, value in list(arguments.items())[:3]:
+        if isinstance(value, (str, int, float)):
+            text = _clean_tool_text(value, limit=60)
+            if text:
+                scalar_parts.append(f"{key}={text}")
+    if scalar_parts:
+        return f"{tool_name}: " + ", ".join(scalar_parts)
+    return tool_name
+
+
+def _extract_compaction_tool_result_preview(message: dict) -> str:
+    content = str(message.get("content") or "").strip()
+    if not content:
+        return ""
+
+    parsed = _parse_json_like_value(content)
+    if isinstance(parsed, dict):
+        error = _clean_tool_text(parsed.get("error") or "", limit=120)
+        if error:
+            return f"error: {error}"
+        summary = _clean_tool_text(parsed.get("summary") or parsed.get("title") or "", limit=120)
+        if summary:
+            return summary
+        value = _clean_tool_text(parsed.get("content") or parsed.get("value") or "", limit=120)
+        if value:
+            return value
+
+    normalized = content.replace(TOOL_EXECUTION_RESULTS_MARKER, "").strip()
+    for line in normalized.splitlines():
+        cleaned = _clean_tool_text(line, limit=120)
+        if not cleaned:
+            continue
+        if cleaned.lower().startswith(("url:", "title:")):
+            continue
+        return cleaned
+    return _clean_tool_text(normalized, limit=120)
+
+
+def _count_exchange_blocks(messages: list[dict]) -> int:
+    return sum(1 for block in _iter_agent_exchange_blocks(messages) if block.get("type") == "exchange")
+
+
+def _compact_exchange_to_message(block: dict) -> dict:
+    tool_previews: list[str] = []
+    result_parts: list[str] = []
+    assistant_intent = ""
+    for message in block.get("messages") or []:
+        role = str(message.get("role") or "").strip()
+        if role == "assistant":
+            assistant_intent = assistant_intent or _extract_compaction_assistant_intent(message)
+            for tool_call in message.get("tool_calls") or []:
+                preview = _extract_compaction_tool_call_preview(tool_call)
+                if preview and preview not in tool_previews:
+                    tool_previews.append(preview)
+        elif role == "tool" or _is_tool_execution_result_message(message):
+            content = _extract_compaction_tool_result_preview(message)
+            if content:
+                result_parts.append(content)
+
+    parts = [f"[Context: compacted tool step {block.get('step_index') or '?'}]"]
+    if assistant_intent:
+        parts.append(f"Assistant intent: {assistant_intent}")
+    if tool_previews:
+        parts.append("Actions:\n- " + "\n- ".join(tool_previews[:4]))
+    if result_parts:
+        parts.append("Outcomes:\n- " + "\n- ".join(result_parts[:3]))
+    return {"role": "user", "content": "\n".join(parts)}
+
+
+def _try_compact_messages(messages: list[dict], budget: int, keep_recent: int = 2) -> list[dict] | None:
+    if not isinstance(messages, list):
+        return None
+
+    blocks = _iter_agent_exchange_blocks(messages)
+    exchange_positions = [index for index, block in enumerate(blocks) if block.get("type") == "exchange"]
+    if not exchange_positions:
+        return _merge_adjacent_user_messages(messages)
+
+    keep_recent = max(0, int(keep_recent))
+    compactable_positions = exchange_positions[:-keep_recent] if keep_recent else exchange_positions[:]
+    if not compactable_positions:
+        return None
+
+    working_blocks = [{**block, "messages": list(block.get("messages") or [])} for block in blocks]
+    best_messages: list[dict] | None = None
+    for position in compactable_positions:
+        block = working_blocks[position]
+        block["messages"] = [_compact_exchange_to_message(block)]
+        best_messages = _flatten_agent_exchange_blocks(working_blocks)
+        merged_user_messages = _merge_adjacent_user_messages(best_messages)
+        if merged_user_messages is not None:
+            best_messages = merged_user_messages
+        if _estimate_messages_tokens(best_messages) <= max(1, int(budget)):
+            return best_messages
+    return best_messages
 
 
 def _serialize_for_log(value, depth: int = 0):
@@ -383,6 +619,10 @@ def _prepare_tool_result_for_transcript(
             fetch_url_token_threshold=fetch_url_token_threshold,
             fetch_url_clip_aggressiveness=fetch_url_clip_aggressiveness,
         )
+    serialized = _serialize_tool_message_content(result)
+    if len(serialized) > AGENT_TOOL_RESULT_TRANSCRIPT_MAX_CHARS:
+        clipped = serialized[:AGENT_TOOL_RESULT_TRANSCRIPT_MAX_CHARS].rstrip() + "…"
+        return f"{clipped} [CLIPPED: original {len(serialized)} chars]"
     return result
 
 
@@ -703,6 +943,13 @@ def _build_final_answer_instruction() -> dict:
     }
 
 
+def _build_minimal_final_answer_instruction() -> dict:
+    return {
+        "role": "system",
+        "content": "[FINAL ANSWER ONLY]\nNo tools. Answer in assistant content only.",
+    }
+
+
 def _build_missing_final_answer_instruction() -> dict:
     return {
         "role": "system",
@@ -725,7 +972,7 @@ def _build_tool_execution_result_message(transcript_results: list[dict]) -> dict
         return None
 
     parts = [
-        "[TOOL EXECUTION RESULTS]\n",
+        f"{TOOL_EXECUTION_RESULTS_MARKER}\n",
         "**Fetch Guidance**: Use the retrieved page content as the source of truth. "
         "Do not repeat the same fetch_url call unless the user explicitly asks to refresh.\n",
     ]
@@ -1150,6 +1397,39 @@ def _build_compact_tool_message_content(
     storage_entry: dict | None = None,
 ) -> str:
     del result
+    if tool_name == "fetch_url" and isinstance(transcript_result, dict):
+        parts = []
+        title = _clean_tool_text(transcript_result.get("title") or "", limit=160)
+        url = _clean_tool_text(transcript_result.get("url") or tool_args.get("url") or "", limit=200)
+        notice = _clean_tool_text(transcript_result.get("summary_notice") or "", limit=240)
+        diagnostic = _clean_tool_text(transcript_result.get("fetch_diagnostic") or "", limit=280)
+        body = _clean_tool_text(transcript_result.get("content") or "", limit=4_000)
+        if title:
+            parts.append(f"Title: {title}")
+        if url:
+            parts.append(f"URL: {url}")
+        if summary:
+            parts.append(f"Summary: {_clean_tool_text(summary, limit=300)}")
+        if notice:
+            parts.append(f"Note: {notice}")
+        if diagnostic:
+            parts.append(f"Fetch status: {diagnostic}")
+        if body:
+            parts.append(body)
+        return "\n\n".join(parts).strip()
+
+    if isinstance(transcript_result, str):
+        if len(transcript_result) <= RAG_TOOL_RESULT_MAX_TEXT_CHARS:
+            return transcript_result
+        clip_marker = " [CLIPPED: original "
+        marker_index = transcript_result.find(clip_marker)
+        if marker_index > 0:
+            marker = transcript_result[marker_index:]
+            prefix_limit = max(0, RAG_TOOL_RESULT_MAX_TEXT_CHARS - len(marker) - 1)
+            prefix = transcript_result[:prefix_limit].rstrip()
+            return f"{prefix}…{marker}"
+        return _clean_tool_text(transcript_result, limit=RAG_TOOL_RESULT_MAX_TEXT_CHARS)
+
     preferred_entry = storage_entry if isinstance(storage_entry, dict) else None
     if preferred_entry:
         content = _clean_tool_text(preferred_entry.get("content") or "", limit=RAG_TOOL_RESULT_MAX_TEXT_CHARS)
@@ -1284,6 +1564,53 @@ def _build_tool_result_storage_entry(tool_name: str, tool_args: dict, result, su
     return entry
 
 
+def _lookup_cross_turn_tool_memory(tool_name: str, tool_args: dict) -> tuple[object, str] | None:
+    if tool_name == "fetch_url":
+        url = _tool_input_preview(tool_name, tool_args)
+        if not url:
+            return None
+        try:
+            exact_match = get_exact_tool_memory_match(tool_name, url)
+        except Exception:
+            return None
+        if not exact_match:
+            return None
+        excerpt = _clean_tool_text(exact_match.get("content") or "", limit=RAG_TOOL_RESULT_MAX_TEXT_CHARS)
+        if not excerpt:
+            return None
+        summary = _clean_tool_text(exact_match.get("summary") or "", limit=RAG_TOOL_RESULT_SUMMARY_MAX_CHARS)
+        if not summary:
+            summary = f"Reused cached fetch_url result for {url}"
+        return excerpt, summary
+
+    if tool_name not in {"search_web", "search_news_ddgs", "search_news_google"}:
+        return None
+
+    query = _tool_input_preview(tool_name, tool_args)
+    if not query:
+        return None
+
+    try:
+        matches = (search_tool_memory(query, top_k=1).get("matches") or [])[:1]
+    except Exception:
+        return None
+    if not matches:
+        return None
+
+    best_match = matches[0]
+    similarity = best_match.get("similarity")
+    if not isinstance(similarity, (int, float)) or similarity < 0.85:
+        return None
+
+    excerpt = _clean_tool_text(best_match.get("text") or "", limit=RAG_TOOL_RESULT_MAX_TEXT_CHARS)
+    if not excerpt:
+        return None
+
+    source_name = _clean_tool_text(best_match.get("source_name") or "Tool memory", limit=120)
+    summary = f"Reused tool memory from {source_name}"
+    return excerpt, summary
+
+
 def _extract_clarification_event(result: dict) -> dict | None:
     if not isinstance(result, dict):
         return None
@@ -1298,6 +1625,91 @@ def _extract_clarification_event(result: dict) -> dict | None:
         "clarification": payload,
         "text": text,
     }
+
+
+def _extract_initial_goal(messages: list[dict]) -> str:
+    for message in messages:
+        if str(message.get("role") or "").strip() != "user":
+            continue
+        content = _clean_tool_text(message.get("content") or "", limit=180)
+        if content:
+            return content
+    return ""
+
+
+def _append_working_state_attempt(working_state: dict, tool_name: str, preview: str) -> None:
+    attempts = working_state.setdefault("steps_tried", [])
+    entry = {
+        "tool_name": str(tool_name or "").strip() or "tool",
+        "preview": _clean_tool_text(preview or "", limit=140),
+    }
+    if attempts and attempts[-1] == entry:
+        return
+    attempts.append(entry)
+    if len(attempts) > 8:
+        del attempts[:-8]
+
+
+def _append_working_state_blocker(working_state: dict, tool_name: str, error: str) -> None:
+    blockers = working_state.setdefault("blockers", [])
+    entry = {
+        "tool_name": str(tool_name or "").strip() or "tool",
+        "error": _clean_tool_text(error or "", limit=220),
+    }
+    if blockers and blockers[-1] == entry:
+        return
+    blockers.append(entry)
+    if len(blockers) > 6:
+        del blockers[:-6]
+
+
+def _build_working_state_instruction(working_state: dict) -> dict | None:
+    if not isinstance(working_state, dict):
+        return None
+
+    current_goal = _clean_tool_text(working_state.get("current_goal") or "", limit=180)
+    attempts = working_state.get("steps_tried") if isinstance(working_state.get("steps_tried"), list) else []
+    blockers = working_state.get("blockers") if isinstance(working_state.get("blockers"), list) else []
+    if not blockers:
+        return None
+
+    parts = ["[AGENT WORKING MEMORY]"]
+    if current_goal:
+        parts.append(f"Current goal: {current_goal}")
+    if attempts:
+        lines = []
+        for entry in attempts[-5:]:
+            tool_name = _clean_tool_text(entry.get("tool_name") or "tool", limit=80)
+            preview = _clean_tool_text(entry.get("preview") or "", limit=120)
+            line = f"- {tool_name}"
+            if preview:
+                line += f": {preview}"
+            lines.append(line)
+        if lines:
+            parts.append("Tried in this run:\n" + "\n".join(lines))
+    if blockers:
+        lines = []
+        for entry in blockers[-4:]:
+            tool_name = _clean_tool_text(entry.get("tool_name") or "tool", limit=80)
+            error = _clean_tool_text(entry.get("error") or "", limit=180)
+            line = f"- {tool_name}"
+            if error:
+                line += f": {error}"
+            lines.append(line)
+        if lines:
+            parts.append("Failed paths to avoid repeating without a concrete reason:\n" + "\n".join(lines))
+    parts.append("Prefer a different tool or produce the best available answer if these blockers make repetition low-value.")
+    return {"role": "system", "content": "\n\n".join(parts)}
+
+
+def _get_tool_step_limit(tool_name: str) -> int:
+    normalized_name = str(tool_name or "").strip()
+    value = TOOL_STEP_LIMITS.get(normalized_name, TOOL_STEP_LIMITS.get("default", 5))
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        limit = int(TOOL_STEP_LIMITS.get("default", 5))
+    return max(1, limit)
 
 
 def run_agent_stream(
@@ -1321,6 +1733,7 @@ def run_agent_stream(
     trace_id = uuid4().hex[:12]
     total_clean_content = ""
     fetch_attempt_counts: dict[str, int] = {}
+    tool_call_counts: dict[str, int] = defaultdict(int)
     canvas_modified = False
     usage_totals = {
         "prompt_tokens": 0,
@@ -1331,6 +1744,11 @@ def run_agent_stream(
     }
     runtime_state = {
         "canvas": create_canvas_runtime_state(initial_canvas_documents),
+    }
+    working_state = {
+        "current_goal": _extract_initial_goal(messages),
+        "steps_tried": [],
+        "blockers": [],
     }
 
     def build_tool_capture_event() -> dict:
@@ -1364,6 +1782,47 @@ def run_agent_stream(
         input_cost = (prompt_tokens / 1_000_000) * pricing["input"]
         output_cost = (completion_tokens / 1_000_000) * pricing["output"]
         return round(input_cost + output_cost, 6)
+
+    def apply_context_compaction(extra_messages: list[dict] | None = None, reason: str = "", force: bool = False):
+        nonlocal messages
+        extra_messages = list(extra_messages or [])
+        turn_messages = [*messages, *extra_messages]
+        threshold = max(1, int(PROMPT_MAX_INPUT_TOKENS * AGENT_CONTEXT_COMPACTION_THRESHOLD))
+        before_tokens = _estimate_messages_tokens(turn_messages)
+        before_message_count = len(turn_messages)
+        before_exchange_count = _count_exchange_blocks(messages)
+        if not force and before_tokens <= threshold:
+            return turn_messages, False
+
+        compacted_messages = _try_compact_messages(
+            messages,
+            max(1, int(PROMPT_MAX_INPUT_TOKENS * 0.75)),
+            keep_recent=0 if force else AGENT_CONTEXT_COMPACTION_KEEP_RECENT_ROUNDS,
+        )
+        if compacted_messages is None:
+            return turn_messages, False
+
+        messages = compacted_messages
+        compacted_turn_messages = [*messages, *extra_messages]
+        after_tokens = _estimate_messages_tokens(compacted_turn_messages)
+        after_message_count = len(compacted_turn_messages)
+        after_exchange_count = _count_exchange_blocks(messages)
+        _trace_agent_event(
+            "context_compacted",
+            trace_id=trace_id,
+            step=step,
+            reason=reason,
+            before_tokens=before_tokens,
+            after_tokens=after_tokens,
+            threshold=threshold,
+            force=force,
+            before_message_count=before_message_count,
+            after_message_count=after_message_count,
+            compacted_exchange_count=max(0, before_exchange_count - after_exchange_count),
+            merged_message_delta=max(0, before_message_count - after_message_count),
+            keep_recent=0 if force else AGENT_CONTEXT_COMPACTION_KEEP_RECENT_ROUNDS,
+        )
+        return compacted_turn_messages, True
 
     def usage_event():
         total_cost = calculate_cost(usage_totals["prompt_tokens"], usage_totals["completion_tokens"])
@@ -1548,12 +2007,39 @@ def run_agent_stream(
         step += 1
         yield {"type": "step_started", "step": step, "max_steps": max_steps}
         _trace_agent_event("agent_step_started", trace_id=trace_id, step=step, max_steps=max_steps)
+        context_compacted_this_step = False
+        needs_separator_for_sync = pending_answer_separator
+        working_memory_instruction = _build_working_state_instruction(working_state)
+        extra_messages = [working_memory_instruction] if working_memory_instruction else []
+        turn_messages, _ = apply_context_compaction(extra_messages, reason="pre_model_turn")
 
         try:
-            needs_separator_for_sync = pending_answer_separator
-            turn_result = yield from stream_model_turn(messages)
+            turn_result = yield from stream_model_turn(turn_messages)
         except Exception as exc:
             fatal_api_error = str(exc)
+            if _is_context_overflow_error(fatal_api_error) and not context_compacted_this_step:
+                _, compacted = apply_context_compaction(extra_messages, reason="reactive_model_turn", force=True)
+                if compacted:
+                    context_compacted_this_step = True
+                    _trace_agent_event(
+                        "context_overflow_recovered",
+                        trace_id=trace_id,
+                        step=step,
+                        phase="main_loop",
+                        source="model_turn_exception",
+                    )
+                    step -= 1
+                    continue
+                _trace_agent_event(
+                    "context_overflow_unrecoverable",
+                    trace_id=trace_id,
+                    step=step,
+                    phase="main_loop",
+                    source="model_turn_exception",
+                    error=fatal_api_error,
+                    message_count=len(turn_messages),
+                )
+                fatal_api_error = CONTEXT_OVERFLOW_RECOVERY_ERROR_TEXT
             _trace_agent_event("agent_api_error", trace_id=trace_id, step=step, error=fatal_api_error)
             yield {"type": "tool_error", "step": step, "tool": "api", "error": fatal_api_error}
             break
@@ -1611,7 +2097,31 @@ def run_agent_stream(
                 return
 
             if stream_error:
-                fatal_api_error = stream_error
+                if _is_context_overflow_error(stream_error) and not context_compacted_this_step:
+                    _, compacted = apply_context_compaction(extra_messages, reason="reactive_stream_error", force=True)
+                    if compacted:
+                        context_compacted_this_step = True
+                        _trace_agent_event(
+                            "context_overflow_recovered",
+                            trace_id=trace_id,
+                            step=step,
+                            phase="main_loop",
+                            source="stream_error",
+                        )
+                        step -= 1
+                        continue
+                    _trace_agent_event(
+                        "context_overflow_unrecoverable",
+                        trace_id=trace_id,
+                        step=step,
+                        phase="main_loop",
+                        source="stream_error",
+                        error=stream_error,
+                        message_count=len(turn_messages),
+                    )
+                    fatal_api_error = CONTEXT_OVERFLOW_RECOVERY_ERROR_TEXT
+                else:
+                    fatal_api_error = stream_error
                 _trace_agent_event("agent_api_error", trace_id=trace_id, step=step, error=fatal_api_error)
                 yield {"type": "tool_error", "step": step, "tool": "api", "error": fatal_api_error}
                 break
@@ -1623,7 +2133,8 @@ def run_agent_stream(
                 "tool": "agent",
                 "error": "The model returned no final answer content. Retrying and waiting for a final answer.",
             }
-            messages.append(_build_missing_final_answer_instruction())
+            if not _has_missing_final_answer_instruction(messages):
+                messages.append(_build_missing_final_answer_instruction())
             continue
 
         assistant_tool_call_message = _build_assistant_tool_call_message(content_text, tool_calls)
@@ -1713,7 +2224,26 @@ def run_agent_stream(
                 cache_key=cache_key,
             )
 
+            _append_working_state_attempt(working_state, tool_name, preview)
             yield {"type": "step_update", "step": step, "tool": tool_name, "preview": preview, "call_id": call_id}
+
+            tool_limit = _get_tool_step_limit(tool_name)
+            if tool_call_counts[tool_name] >= tool_limit:
+                error = f"Per-tool step limit reached for {tool_name}. Try a different tool or produce the best available answer."
+                _append_working_state_blocker(working_state, tool_name, error)
+                yield {"type": "tool_error", "step": step, "tool": tool_name, "error": error, "call_id": call_id}
+                tool_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": _serialize_tool_message_content({"ok": False, "error": error}),
+                    }
+                )
+                transcript_results.append(
+                    {"tool_name": tool_name, "arguments": tool_args, "ok": False, "error": error}
+                )
+                continue
+            tool_call_counts[tool_name] += 1
 
             if tool_name not in CANVAS_TOOL_NAMES and cache_key in tool_result_cache:
                 cached_result, cached_summary = tool_result_cache[cache_key]
@@ -1747,6 +2277,7 @@ def run_agent_stream(
                     "tool": tool_name,
                     "summary": f"{cached_summary} (cached)",
                     "call_id": call_id,
+                    "cached": True,
                 }
                 cached_storage_entry = _build_tool_result_storage_entry(
                     tool_name,
@@ -1776,6 +2307,50 @@ def run_agent_stream(
                         "ok": not (tool_name == "fetch_url" and isinstance(cached_result, dict) and cached_result.get("error")),
                         "summary": f"{cached_summary} (cached)",
                         "result": transcript_result,
+                        "cached": True,
+                    }
+                )
+                continue
+
+            cross_turn_cache_hit = _lookup_cross_turn_tool_memory(tool_name, tool_args)
+            if cross_turn_cache_hit is not None:
+                cached_excerpt, cached_summary = cross_turn_cache_hit
+                _trace_agent_event(
+                    "tool_memory_cache_hit",
+                    trace_id=trace_id,
+                    step=step,
+                    tool_name=tool_name,
+                    tool_args=tool_args,
+                    summary=cached_summary,
+                )
+                yield {
+                    "type": "tool_result",
+                    "step": step,
+                    "tool": tool_name,
+                    "summary": f"{cached_summary} (cached)",
+                    "call_id": call_id,
+                    "cached": True,
+                }
+                tool_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": _build_compact_tool_message_content(
+                            tool_name,
+                            tool_args,
+                            cached_excerpt,
+                            f"{cached_summary} (cached)",
+                            transcript_result=cached_excerpt,
+                        ),
+                    }
+                )
+                transcript_results.append(
+                    {
+                        "tool_name": tool_name,
+                        "arguments": tool_args,
+                        "ok": True,
+                        "summary": f"{cached_summary} (cached)",
+                        "result": cached_excerpt,
                         "cached": True,
                     }
                 )
@@ -1830,7 +2405,14 @@ def run_agent_stream(
                     transcript_result=transcript_result,
                 )
 
-                yield {"type": "tool_result", "step": step, "tool": tool_name, "summary": summary, "call_id": call_id}
+                yield {
+                    "type": "tool_result",
+                    "step": step,
+                    "tool": tool_name,
+                    "summary": summary,
+                    "call_id": call_id,
+                    "cached": False,
+                }
                 tool_messages.append(
                     {
                         "role": "tool",
@@ -1878,6 +2460,7 @@ def run_agent_stream(
                     return
             except Exception as exc:
                 error = str(exc)
+                _append_working_state_blocker(working_state, tool_name, error)
                 _trace_agent_event(
                     "tool_call_failed",
                     trace_id=trace_id,
@@ -1929,38 +2512,115 @@ def run_agent_stream(
         yield {"type": "done"}
         return
 
-    try:
-        _trace_agent_event("final_answer_phase_started", trace_id=trace_id, step=step)
-        turn_result = yield from stream_model_turn([*messages, _build_final_answer_instruction()], allow_tools=False)
-        content_text = turn_result.get("content_text") or ""
-        tool_calls = turn_result.get("tool_calls")
-        stream_error = turn_result.get("stream_error")
-        if tool_calls:
-            yield {
-                "type": "tool_error",
-                "step": step,
-                "tool": "agent",
-                "error": "Tool limit reached before the model produced a final answer.",
-            }
-            final_text = FINAL_ANSWER_ERROR_TEXT
-        elif not content_text:
-            yield {
-                "type": "tool_error",
-                "step": step,
-                "tool": "agent",
-                "error": "The model still did not provide a final answer in assistant content.",
-            }
-            final_text = FINAL_ANSWER_MISSING_TEXT
-        else:
-            final_text = content_text
-        if stream_error:
-            yield {"type": "tool_error", "step": step, "tool": "final_answer", "error": stream_error}
-        for event in emit_answer(final_text):
-            yield event
-    except Exception as exc:
-        yield {"type": "tool_error", "step": step, "tool": "final_answer", "error": str(exc)}
-        for event in emit_answer(FINAL_ANSWER_ERROR_TEXT):
-            yield event
+    final_phase_compaction_used = False
+    final_instruction_builder = _build_final_answer_instruction
+    while True:
+        final_extra_messages = []
+        try:
+            _trace_agent_event("final_answer_phase_started", trace_id=trace_id, step=step)
+            working_memory_instruction = _build_working_state_instruction(working_state)
+            final_extra_messages = [working_memory_instruction] if working_memory_instruction is not None else []
+            final_messages, _ = apply_context_compaction(final_extra_messages, reason="pre_final_answer")
+            final_messages = [*final_messages, final_instruction_builder()]
+            turn_result = yield from stream_model_turn(final_messages, allow_tools=False)
+            content_text = turn_result.get("content_text") or ""
+            tool_calls = turn_result.get("tool_calls")
+            stream_error = turn_result.get("stream_error")
+            if stream_error and _is_context_overflow_error(stream_error) and not final_phase_compaction_used:
+                _, compacted = apply_context_compaction(final_extra_messages, reason="reactive_final_stream", force=True)
+                if compacted:
+                    final_phase_compaction_used = True
+                    _trace_agent_event(
+                        "context_overflow_recovered",
+                        trace_id=trace_id,
+                        step=step,
+                        phase="final_answer",
+                        source="stream_error",
+                    )
+                    continue
+                if final_instruction_builder is _build_final_answer_instruction:
+                    _trace_agent_event(
+                        "context_overflow_minimal_final_instruction",
+                        trace_id=trace_id,
+                        step=step,
+                        phase="final_answer",
+                        source="stream_error",
+                    )
+                    final_phase_compaction_used = True
+                    final_instruction_builder = _build_minimal_final_answer_instruction
+                    continue
+                _trace_agent_event(
+                    "context_overflow_unrecoverable",
+                    trace_id=trace_id,
+                    step=step,
+                    phase="final_answer",
+                    source="stream_error",
+                    error=stream_error,
+                    message_count=len(final_messages),
+                )
+                stream_error = CONTEXT_OVERFLOW_RECOVERY_ERROR_TEXT
+            if tool_calls:
+                yield {
+                    "type": "tool_error",
+                    "step": step,
+                    "tool": "agent",
+                    "error": "Tool limit reached before the model produced a final answer.",
+                }
+                final_text = FINAL_ANSWER_ERROR_TEXT
+            elif not content_text:
+                yield {
+                    "type": "tool_error",
+                    "step": step,
+                    "tool": "agent",
+                    "error": "The model still did not provide a final answer in assistant content.",
+                }
+                final_text = FINAL_ANSWER_MISSING_TEXT
+            else:
+                final_text = content_text
+            if stream_error:
+                yield {"type": "tool_error", "step": step, "tool": "final_answer", "error": stream_error}
+            for event in emit_answer(final_text):
+                yield event
+            break
+        except Exception as exc:
+            error = str(exc)
+            if _is_context_overflow_error(error) and not final_phase_compaction_used:
+                _, compacted = apply_context_compaction(final_extra_messages, reason="reactive_final_answer", force=True)
+                if compacted:
+                    final_phase_compaction_used = True
+                    _trace_agent_event(
+                        "context_overflow_recovered",
+                        trace_id=trace_id,
+                        step=step,
+                        phase="final_answer",
+                        source="exception",
+                    )
+                    continue
+                if final_instruction_builder is _build_final_answer_instruction:
+                    _trace_agent_event(
+                        "context_overflow_minimal_final_instruction",
+                        trace_id=trace_id,
+                        step=step,
+                        phase="final_answer",
+                        source="exception",
+                    )
+                    final_phase_compaction_used = True
+                    final_instruction_builder = _build_minimal_final_answer_instruction
+                    continue
+                _trace_agent_event(
+                    "context_overflow_unrecoverable",
+                    trace_id=trace_id,
+                    step=step,
+                    phase="final_answer",
+                    source="exception",
+                    error=error,
+                    message_count=len([*messages, *final_extra_messages]),
+                )
+                error = CONTEXT_OVERFLOW_RECOVERY_ERROR_TEXT
+            yield {"type": "tool_error", "step": step, "tool": "final_answer", "error": error}
+            for event in emit_answer(FINAL_ANSWER_ERROR_TEXT):
+                yield event
+            break
 
     if usage_totals["total_tokens"]:
         yield usage_event()

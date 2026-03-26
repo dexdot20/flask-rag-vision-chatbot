@@ -451,6 +451,13 @@ body.sidebar-collapsed .chat-area {
   width: 100%;
 }
 
+.msg-meta-label-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
 .msg-group.user .msg-meta-row {
   width: auto;
   max-width: 75%;
@@ -476,6 +483,20 @@ body.sidebar-collapsed .chat-area {
   display: flex;
   align-items: center;
   gap: 6px;
+}
+
+.pruned-badge {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  border: 1px solid rgba(79, 110, 247, 0.28);
+  background: rgba(79, 110, 247, 0.12);
+  color: #b7c5ff;
+  padding: 3px 8px;
+  font-size: 0.67rem;
+  line-height: 1;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
 }
 
 .assistant-context-badge {

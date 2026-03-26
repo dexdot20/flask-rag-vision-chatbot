@@ -110,6 +110,15 @@ PROMPT_SUMMARY_MAX_TOKENS = max(500, min(PROMPT_MAX_INPUT_TOKENS, _parse_int_env
 PROMPT_RAG_MAX_TOKENS = max(0, min(PROMPT_MAX_INPUT_TOKENS, _parse_int_env("PROMPT_RAG_MAX_TOKENS", 6_000)))
 PROMPT_TOOL_MEMORY_MAX_TOKENS = max(0, min(PROMPT_MAX_INPUT_TOKENS, _parse_int_env("PROMPT_TOOL_MEMORY_MAX_TOKENS", 4_000)))
 PROMPT_PREFLIGHT_SUMMARY_TOKEN_COUNT = max(2_000, min(200_000, _parse_int_env("PROMPT_PREFLIGHT_SUMMARY_TOKEN_COUNT", 90_000)))
+AGENT_CONTEXT_COMPACTION_THRESHOLD = max(0.5, min(0.98, _parse_float_env("AGENT_CONTEXT_COMPACTION_THRESHOLD", 0.85)))
+AGENT_CONTEXT_COMPACTION_KEEP_RECENT_ROUNDS = max(
+    0,
+    min(6, _parse_int_env("AGENT_CONTEXT_COMPACTION_KEEP_RECENT_ROUNDS", 2)),
+)
+AGENT_TOOL_RESULT_TRANSCRIPT_MAX_CHARS = max(
+    8_000,
+    min(CONTENT_MAX_CHARS, _parse_int_env("AGENT_TOOL_RESULT_TRANSCRIPT_MAX_CHARS", 16_000)),
+)
 SUMMARY_SOURCE_TARGET_TOKENS = max(1_000, min(40_000, _parse_int_env("SUMMARY_SOURCE_TARGET_TOKENS", 6_000)))
 SUMMARY_RETRY_MIN_SOURCE_TOKENS = max(500, min(SUMMARY_SOURCE_TARGET_TOKENS, _parse_int_env("SUMMARY_RETRY_MIN_SOURCE_TOKENS", 1_500)))
 
@@ -149,9 +158,13 @@ RAG_ENABLED = _parse_bool_env("RAG_ENABLED", True)
 RAG_AUTO_INJECT_TOP_K = max(1, min(8, _parse_int_env("RAG_AUTO_INJECT_TOP_K", 5)))
 RAG_SEARCH_DEFAULT_TOP_K = max(1, min(12, _parse_int_env("RAG_SEARCH_DEFAULT_TOP_K", 5)))
 RAG_AUTO_INJECT_THRESHOLD = max(0.0, min(1.0, _parse_float_env("RAG_AUTO_INJECT_THRESHOLD", 0.35)))
-RAG_SEARCH_MIN_SIMILARITY = max(0.0, min(1.0, _parse_float_env("RAG_SEARCH_MIN_SIMILARITY", 0.2)))
+RAG_SEARCH_MIN_SIMILARITY = max(0.0, min(1.0, _parse_float_env("RAG_SEARCH_MIN_SIMILARITY", 0.35)))
+RAG_QUERY_EXPANSION_ENABLED = _parse_bool_env("RAG_QUERY_EXPANSION_ENABLED", True)
+RAG_QUERY_EXPANSION_MAX_VARIANTS = max(1, min(4, _parse_int_env("RAG_QUERY_EXPANSION_MAX_VARIANTS", 3)))
+RAG_TEMPORAL_DECAY_ALPHA = max(0.0, min(1.0, _parse_float_env("RAG_TEMPORAL_DECAY_ALPHA", 0.15)))
+RAG_TEMPORAL_DECAY_LAMBDA = max(0.0, min(1.0, _parse_float_env("RAG_TEMPORAL_DECAY_LAMBDA", 0.05)))
 RAG_SENSITIVITY_PRESETS = {
-    "flexible": 0.20,
+    "flexible": 0.25,
     "normal": 0.35,
     "strict": 0.55,
 }
@@ -171,6 +184,16 @@ FETCH_RAW_TOOL_RESULT_MAX_TEXT_CHARS = max(
     RAG_TOOL_RESULT_MAX_TEXT_CHARS,
     min(CONTENT_MAX_CHARS, _parse_int_env("FETCH_RAW_TOOL_RESULT_MAX_TEXT_CHARS", 24_000)),
 )
+TOOL_MEMORY_TTL_DEFAULT_SECONDS = max(3_600, _parse_int_env("TOOL_MEMORY_TTL_DEFAULT_SECONDS", 604_800))
+TOOL_MEMORY_TTL_WEB_SECONDS = max(3_600, _parse_int_env("TOOL_MEMORY_TTL_WEB_SECONDS", 86_400))
+TOOL_MEMORY_TTL_NEWS_SECONDS = max(1_800, _parse_int_env("TOOL_MEMORY_TTL_NEWS_SECONDS", 7_200))
+TOOL_STEP_LIMITS = {
+    "search_web": max(1, _parse_int_env("TOOL_STEP_LIMIT_SEARCH_WEB", 3)),
+    "fetch_url": max(1, _parse_int_env("TOOL_STEP_LIMIT_FETCH_URL", 2)),
+    "search_news_ddgs": max(1, _parse_int_env("TOOL_STEP_LIMIT_SEARCH_NEWS_DDGS", 2)),
+    "search_news_google": max(1, _parse_int_env("TOOL_STEP_LIMIT_SEARCH_NEWS_GOOGLE", 2)),
+    "default": max(1, _parse_int_env("TOOL_STEP_LIMIT_DEFAULT", 5)),
+}
 RAG_DISABLED_INGEST_ERROR = (
     "Manual RAG ingestion is disabled. RAG now only indexes conversation history and successful text-like tool results."
 )
@@ -214,6 +237,9 @@ DEFAULT_SETTINGS = {
     "chat_summary_mode": CHAT_SUMMARY_MODE if CHAT_SUMMARY_MODE in CHAT_SUMMARY_ALLOWED_MODES else "auto",
     "summary_skip_first": "2",
     "summary_skip_last": "1",
+    "pruning_enabled": "false",
+    "pruning_token_threshold": str(CHAT_SUMMARY_TRIGGER_TOKEN_COUNT),
+    "pruning_batch_size": "10",
 }
 
 

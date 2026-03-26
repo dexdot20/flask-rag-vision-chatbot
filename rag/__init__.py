@@ -5,6 +5,7 @@ from .store import (
     DEFAULT_COLLECTION_NAME,
     delete_source,
     get_chroma_path,
+    get_source_chunks,
     query_chunks,
     upsert_chunks,
 )
@@ -18,6 +19,7 @@ __all__ = [
     "delete_source",
     "embed_texts",
     "get_chroma_path",
+    "get_source_chunks",
     "normalize_category",
     "preload_embedder",
     "query_chunks",
