@@ -86,7 +86,7 @@ from routes.request_utils import is_valid_model_id, normalize_model_id, parse_me
 from token_utils import estimate_text_tokens
 from tool_registry import resolve_runtime_tool_names
 from vision import preload_local_ocr_engine, read_uploaded_image, run_image_vision_analysis
-from prune_service import prune_conversation_batch
+from prune_service import is_prunable_message, prune_conversation_batch
 
 
 TITLE_MAX_WORDS = 5
@@ -105,6 +105,7 @@ SUMMARY_TOOL_MESSAGE_TEXT_LIMIT = 320
 SUMMARY_MAX_OUTPUT_CHARS = 2_200
 SUMMARY_MAX_BULLETS = 10
 SUMMARY_TOOL_TRACE_LIMIT = 8
+OMITTED_TOOL_OUTPUT_TEXT = "[Tool output omitted from older history to save context budget.]"
 
 
 def _select_title_source_messages(messages: list[dict]) -> list[dict]:
@@ -822,19 +823,59 @@ def _select_tail_messages_by_token_budget(messages: list[dict], max_tokens: int)
     return list(reversed(selected_reversed))
 
 
+def _count_prunable_message_tokens(messages: list[dict]) -> int:
+    total = 0
+    for message in messages:
+        if not is_prunable_message(message):
+            continue
+        total += estimate_text_tokens(str(message.get("content") or ""))
+    return total
+
+
+def _get_last_user_message_key(messages: list[dict]) -> tuple[int, int] | None:
+    user_messages = [
+        message
+        for message in messages
+        if isinstance(message, dict) and _get_message_role(message) == "user"
+    ]
+    if not user_messages:
+        return None
+    return max((_sort_message_key(message) for message in user_messages), default=None)
+
+
+def _redact_old_tool_messages(block_messages: list[dict], current_turn_start_key: tuple[int, int] | None) -> list[dict]:
+    if current_turn_start_key is None:
+        return block_messages
+
+    redacted_messages: list[dict] = []
+    for message in block_messages:
+        if not isinstance(message, dict):
+            redacted_messages.append(message)
+            continue
+
+        if _get_message_role(message) != "tool" or _sort_message_key(message) >= current_turn_start_key:
+            redacted_messages.append(message)
+            continue
+
+        redacted_messages.append({**message, "content": OMITTED_TOOL_OUTPUT_TEXT})
+    return redacted_messages
+
+
 def _select_recent_prompt_window(messages: list[dict], max_tokens: int, min_user_messages: int = 2) -> list[dict]:
     if max_tokens <= 0:
         return []
+    current_turn_start_key = _get_last_user_message_key(messages)
     selected_blocks_reversed: list[list[dict]] = []
     for block in reversed(_iter_message_blocks(messages)):
         block_messages = block.get("messages") or []
         if not block_messages or not block.get("valid_for_prompt"):
             continue
-        candidate_blocks = [block_messages, *reversed(selected_blocks_reversed)]
+        prompt_block_messages = _redact_old_tool_messages(block_messages, current_turn_start_key)
+        candidate_blocks = [prompt_block_messages, *reversed(selected_blocks_reversed)]
         candidate = [message for candidate_block in candidate_blocks for message in candidate_block]
         if _estimate_prompt_tokens(build_api_messages(candidate)) > max_tokens:
             break
-        selected_blocks_reversed.append(block_messages)
+        selected_blocks_reversed.append(prompt_block_messages)
 
     selected_messages: list[dict] = []
     for block_messages in reversed(selected_blocks_reversed):
@@ -1361,8 +1402,8 @@ def _maybe_run_conversation_pruning(conversation_id: int, settings: dict) -> Non
         return
 
     try:
-        visible_token_count = count_visible_message_tokens(get_conversation_messages(conversation_id))
-        if visible_token_count < get_pruning_token_threshold(settings):
+        prunable_token_count = _count_prunable_message_tokens(get_conversation_messages(conversation_id))
+        if prunable_token_count < get_pruning_token_threshold(settings):
             return
         prune_conversation_batch(conversation_id, get_pruning_batch_size(settings))
     except Exception:

@@ -56,6 +56,8 @@ from rag import Chunk
 from rag.store import query_chunks, upsert_chunks
 from rag_service import build_rag_auto_context, get_conversation_records_for_rag, get_exact_tool_memory_match, search_knowledge_base_tool, upsert_tool_memory_result
 from routes.chat import (
+    OMITTED_TOOL_OUTPUT_TEXT,
+    _count_prunable_message_tokens,
     _estimate_prompt_tokens,
     _select_recent_prompt_window,
     _select_summary_source_messages_by_token_budget,
@@ -470,7 +472,7 @@ class AppRoutesTestCase(unittest.TestCase):
         with patch("routes.chat.run_agent_stream", return_value=fake_events), patch(
             "routes.chat.maybe_create_conversation_summary",
             return_value={"applied": False},
-        ), patch("routes.chat.count_visible_message_tokens", return_value=90_000), patch(
+        ), patch("routes.chat._count_prunable_message_tokens", return_value=90_000), patch(
             "routes.chat.prune_conversation_batch"
         ) as mocked_prune, patch("routes.chat.sync_conversations_to_rag_safe"):
             response = self.client.patch(
@@ -496,6 +498,35 @@ class AppRoutesTestCase(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         mocked_prune.assert_called_once_with(conversation_id, 3)
+
+    def test_count_prunable_message_tokens_ignores_tool_and_summary_messages(self):
+        messages = [
+            {"role": "user", "content": "Visible user text"},
+            {"role": "assistant", "content": "Visible assistant text"},
+            {
+                "role": "assistant",
+                "content": "Tool call envelope",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "search_web", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "content": "Very large tool result" * 1000},
+            {"role": "summary", "content": "Conversation summary"},
+            {"role": "assistant", "content": "", "metadata": {"is_pruned": True}},
+        ]
+
+        expected = _count_prunable_message_tokens(
+            [
+                {"role": "user", "content": "Visible user text"},
+                {"role": "assistant", "content": "Visible assistant text"},
+            ]
+        )
+
+        self.assertEqual(_count_prunable_message_tokens(messages), expected)
 
     def test_active_tools_include_replace_scratchpad_for_existing_scratchpad_mode(self):
         settings = {"active_tools": json.dumps(["append_scratchpad", "search_web"]) }
@@ -4050,6 +4081,51 @@ class AppRoutesTestCase(unittest.TestCase):
         selected = _select_recent_prompt_window(messages, max_tokens=300)
 
         self.assertEqual([message["role"] for message in selected], ["user"])
+
+    def test_select_recent_prompt_window_redacts_old_tool_output_but_keeps_current_turn_tool_output(self):
+        messages = [
+            {"role": "user", "content": "Older question", "position": 1, "id": 1},
+            {
+                "role": "assistant",
+                "content": "Calling old tool.",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "search_web", "arguments": "{}"},
+                    }
+                ],
+                "position": 2,
+                "id": 2,
+            },
+            {"role": "tool", "content": "A" * 2500, "tool_call_id": "call-1", "position": 3, "id": 3},
+            {"role": "user", "content": "Latest question", "position": 4, "id": 4},
+            {
+                "role": "assistant",
+                "content": "Calling current tool.",
+                "tool_calls": [
+                    {
+                        "id": "call-2",
+                        "type": "function",
+                        "function": {"name": "fetch_url", "arguments": "{}"},
+                    }
+                ],
+                "position": 5,
+                "id": 5,
+            },
+            {"role": "tool", "content": "Current tool result", "tool_call_id": "call-2", "position": 6, "id": 6},
+        ]
+
+        selected = _select_recent_prompt_window(messages, max_tokens=500)
+
+        redacted_old_tool = next(message for message in selected if message.get("tool_call_id") == "call-1")
+        current_turn_tool = next(message for message in selected if message.get("tool_call_id") == "call-2")
+
+        self.assertEqual(redacted_old_tool["role"], "tool")
+        self.assertEqual(redacted_old_tool["content"], OMITTED_TOOL_OUTPUT_TEXT)
+        self.assertEqual(current_turn_tool["role"], "tool")
+        self.assertEqual(current_turn_tool["content"], "Current tool result")
+        self.assertLessEqual(_estimate_prompt_tokens(build_api_messages(selected)), 500)
 
     def test_summary_source_selection_uses_expanded_prompt_budget(self):
         canonical_messages = [

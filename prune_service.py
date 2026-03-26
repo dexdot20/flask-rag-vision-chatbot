@@ -44,7 +44,7 @@ def _build_pruning_messages(content: str) -> list[dict[str, str]]:
     ]
 
 
-def _is_prunable_message(message: dict) -> bool:
+def is_prunable_message(message: dict) -> bool:
     role = str(message.get("role") or "").strip()
     if role not in PRUNABLE_ROLES:
         return False
@@ -90,7 +90,7 @@ def prune_message(message_id: int) -> dict:
         raise ValueError("Message not found.")
 
     message = message_row_to_dict(row)
-    if not _is_prunable_message(message):
+    if not is_prunable_message(message):
         raise ValueError("Only visible user or assistant messages can be pruned.")
 
     original_content = str(message.get("content") or "")
@@ -120,7 +120,7 @@ def prune_conversation_batch(conversation_id: int, batch_size: int) -> int:
     with get_db() as conn:
         rows = get_conversation_message_rows(conn, normalized_conversation_id)
         messages = [message_row_to_dict(row) for row in rows]
-        candidate_ids = [message["id"] for message in messages if _is_prunable_message(message)][:normalized_batch_size]
+        candidate_ids = [message["id"] for message in messages if is_prunable_message(message)][:normalized_batch_size]
 
     pruned_count = 0
     for message_id in candidate_ids:
