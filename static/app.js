@@ -2047,7 +2047,7 @@ async function loadSidebar() {
     });
     item.querySelector(".sidebar-del").addEventListener("click", (event) => {
       event.stopPropagation();
-      if (!window.confirm("Bu sohbeti silmek istediğinizden emin misiniz?")) {
+      if (!window.confirm("Are you sure you want to delete this conversation?")) {
         return;
       }
       deleteConversation(conversation.id);

@@ -155,6 +155,14 @@ It is not a minimal prompt/response demo. The app keeps conversation history in 
 
 ## Installation
 
+Quick start:
+
+```bash
+bash install.sh
+```
+
+The installer asks for a system profile and accelerator, writes `.env`, and installs runtime dependencies. If you prefer a manual setup, follow the steps below.
+
 ### 1) Create a virtual environment
 
 ```bash

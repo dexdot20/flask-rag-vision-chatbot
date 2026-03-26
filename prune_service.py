@@ -8,8 +8,10 @@ from db import get_conversation_message_rows, get_db, message_row_to_dict, parse
 PRUNABLE_ROLES = {"user", "assistant"}
 PRUNING_MODEL = "deepseek-chat"
 PRUNING_SYSTEM_PROMPT = (
-    "You rewrite a single chat message. Preserve the original language, core meaning, intent, and tone. "
-    "Remove repetition, filler, indirect phrasing, and unnecessary detail. Return only the refined message text."
+    "You rewrite a single chat message. Preserve the original language, core meaning, intent, tone, and all critical facts. "
+    "Do not delete or paraphrase code blocks, identifiers, numbers, URLs, API names, configuration values, or other precise data. "
+    "If the message contains code, logs, JSON, tables, or other dense technical content, keep those sections verbatim and only trim truly redundant surrounding prose. "
+    "Return only the refined message text."
 )
 
 
@@ -36,8 +38,9 @@ def _build_pruning_messages(content: str) -> list[dict[str, str]]:
         {
             "role": "user",
             "content": (
-                "Mesajin ana fikrini ve butunlugunu koruyarak; gereksiz detaylari, tekrarleri ve dolayli anlatimlari "
-                "sadeleştir. Sonucta mesajin daha net, rafine ve duzenlenmis bir versiyonunu olustur.\n\n"
+                "Preserve the message's core idea, critical details, and technical accuracy; only reduce unnecessary repetition, "
+                "indirect phrasing, and filler. Code blocks, logs, JSON, tables, numbers, commands, URLs, and other sensitive "
+                "technical data must be kept verbatim; do not rewrite, summarize, or delete those sections.\n\n"
                 f"Mesaj:\n{content}"
             ),
         },

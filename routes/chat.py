@@ -2146,9 +2146,9 @@ def register_chat_routes(app) -> None:
                     "- If the topic is unclear, return: New Chat\n\n"
                     "Examples:\n"
                     "User: 'How do I sort a list in Python?' → Python List Sorting\n"
-                    "User: 'Selamlar nasılsın' → Selaşma\n"
+                    "User: 'Hello, how are you?' → Greeting\n"
                     "User: 'What is the capital of France?' → Capital of France\n"
-                    "User: 'Bugün hava durumu nasıl?' → Hava Durumu"
+                    "User: 'What's the weather like today?' → Weather Forecast"
                 ),
             },
             {

@@ -44,6 +44,7 @@ from db import (
     serialize_message_metadata,
     upsert_user_profile_entry,
 )
+from prune_service import _build_pruning_messages
 from messages import (
     SUMMARY_LABEL,
     build_api_messages,
@@ -456,6 +457,23 @@ class AppRoutesTestCase(unittest.TestCase):
             "Bu mesaj gereksiz ayrıntılar içeriyor ve budanmalı.",
         )
         mocked_sync.assert_called_once_with(conversation_id=conversation_id)
+
+    def test_pruning_prompt_requires_preserving_critical_and_code_content(self):
+        prompt_messages = _build_pruning_messages(
+            """Bunu kısalt ama şu kodu bozma:\n\n```python\ndef add(a, b):\n    return a + b\n```\n\nAPI key: sk-test-12345\nURL: https://example.com/docs\nSayi: 4096"""
+        )
+
+        system_prompt = prompt_messages[0]["content"]
+        user_prompt = prompt_messages[1]["content"]
+
+        self.assertIn("all critical facts", system_prompt)
+        self.assertIn("code blocks", system_prompt)
+        self.assertIn("keep those sections verbatim", system_prompt)
+        self.assertIn("Preserve the message's core idea", user_prompt)
+        self.assertIn("Code blocks", user_prompt)
+        self.assertIn("JSON", user_prompt)
+        self.assertIn("URLs", user_prompt)
+        self.assertIn("must be kept verbatim", user_prompt)
 
     def test_background_post_response_pruning_runs_when_threshold_exceeded(self):
         fake_events = iter(
