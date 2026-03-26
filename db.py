@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from flask import current_app, has_app_context
 
-from canvas_service import extract_canvas_documents
+from canvas_service import extract_canvas_active_document_id, extract_canvas_documents
 from config import (
     CACHE_TTL_HOURS,
     CHAT_SUMMARY_ALLOWED_MODES,
@@ -1243,8 +1243,63 @@ def serialize_message_metadata(metadata: dict | None) -> str | None:
     canvas_documents = extract_canvas_documents(metadata)
     if canvas_documents or metadata.get("canvas_cleared") is True:
         cleaned["canvas_documents"] = canvas_documents
+    active_document_id = extract_canvas_active_document_id(metadata, canvas_documents)
+    if active_document_id:
+        cleaned["active_document_id"] = active_document_id
     if metadata.get("canvas_cleared") is True:
         cleaned["canvas_cleared"] = True
+
+    project_workflow = metadata.get("project_workflow") if isinstance(metadata.get("project_workflow"), dict) else None
+    if project_workflow:
+        cleaned_workflow = {}
+        for key, max_length in (("project_name", 120), ("goal", 300), ("target_type", 40), ("stage", 40)):
+            value = str(project_workflow.get(key) or "").strip()
+            if value:
+                cleaned_workflow[key] = value[:max_length]
+        files = project_workflow.get("files") if isinstance(project_workflow.get("files"), list) else []
+        cleaned_files = []
+        for entry in files[:64]:
+            if not isinstance(entry, dict):
+                continue
+            path = str(entry.get("path") or "").strip()[:240]
+            if not path:
+                continue
+            cleaned_entry = {"path": path}
+            for key, max_length in (("role", 24), ("purpose", 180), ("status", 40)):
+                value = str(entry.get(key) or "").strip()
+                if value:
+                    cleaned_entry[key] = value[:max_length]
+            cleaned_files.append(cleaned_entry)
+        if cleaned_files:
+            cleaned_workflow["files"] = cleaned_files
+        for list_key in ("dependencies", "open_issues"):
+            values = project_workflow.get(list_key) if isinstance(project_workflow.get(list_key), list) else []
+            normalized_values = []
+            for value in values[:24]:
+                item = str(value or "").strip()
+                if item and item not in normalized_values:
+                    normalized_values.append(item[:200])
+            if normalized_values:
+                cleaned_workflow[list_key] = normalized_values
+        validation = project_workflow.get("validation") if isinstance(project_workflow.get("validation"), dict) else None
+        if validation:
+            cleaned_validation = {}
+            status = str(validation.get("status") or "").strip()[:40]
+            if status:
+                cleaned_validation["status"] = status
+            for list_key in ("issues", "warnings"):
+                values = validation.get(list_key) if isinstance(validation.get(list_key), list) else []
+                normalized_values = []
+                for value in values[:24]:
+                    item = str(value or "").strip()
+                    if item and item not in normalized_values:
+                        normalized_values.append(item[:200])
+                if normalized_values:
+                    cleaned_validation[list_key] = normalized_values
+            if cleaned_validation:
+                cleaned_workflow["validation"] = cleaned_validation
+        if cleaned_workflow:
+            cleaned["project_workflow"] = cleaned_workflow
 
     file_id = (metadata.get("file_id") or "").strip()
     file_name = (metadata.get("file_name") or "").strip()

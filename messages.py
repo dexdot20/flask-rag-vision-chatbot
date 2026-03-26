@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 
-from canvas_service import extract_canvas_documents
+from canvas_service import build_canvas_project_manifest, extract_canvas_documents
 from config import (
     MAX_SCRATCHPAD_LENGTH,
     MAX_USER_PREFERENCES_LENGTH,
@@ -178,12 +178,20 @@ def build_api_messages(messages: list[dict]) -> list[dict]:
     return api_messages
 
 
-def _build_canvas_prompt_payload(canvas_documents) -> dict | None:
+def _build_canvas_prompt_payload(canvas_documents, active_document_id: str | None = None) -> dict | None:
     documents = extract_canvas_documents({"canvas_documents": canvas_documents or []})
     if not documents:
         return None
 
+    manifest = build_canvas_project_manifest(documents, active_document_id=active_document_id)
+    resolved_active_document_id = str((manifest or {}).get("active_document_id") or "").strip()
     active_document = documents[-1]
+    if resolved_active_document_id:
+        for document in documents:
+            if str(document.get("id") or "") == resolved_active_document_id:
+                active_document = document
+                break
+
     content = str(active_document.get("content") or "")
     all_lines = content.split("\n") if content else []
     visible_lines = []
@@ -202,8 +210,16 @@ def _build_canvas_prompt_payload(canvas_documents) -> dict | None:
         visible_char_count += extra_chars
 
     return {
+        "mode": (manifest or {}).get("mode") or "document",
+        "manifest": manifest,
+        "relationship_map": (manifest or {}).get("relationship_map"),
         "document_count": len(documents),
         "active_document": active_document,
+        "other_documents": [
+            entry
+            for entry in ((manifest or {}).get("file_list") or [])
+            if entry.get("id") != active_document.get("id")
+        ],
         "visible_lines": visible_lines,
         "is_truncated": len(visible_lines) < len(all_lines),
         "visible_line_end": len(visible_lines),
@@ -234,6 +250,9 @@ def build_runtime_system_message(
     now=None,
     scratchpad="",
     canvas_documents=None,
+    canvas_active_document_id: str | None = None,
+    workspace_root: str | None = None,
+    project_workflow: dict | None = None,
 ):
     now = (now or datetime.now().astimezone()).astimezone()
     preferences_text = (user_preferences or "").strip()[:MAX_USER_PREFERENCES_LENGTH]
@@ -326,16 +345,43 @@ def build_runtime_system_message(
     if policies:
         parts.append("## Important Policies\n" + "\n".join(f"- {p}" for p in policies) + "\n")
 
-    canvas_payload = _build_canvas_prompt_payload(canvas_documents)
+    normalized_workspace_root = str(workspace_root or "").strip()
+    if normalized_workspace_root:
+        parts.append("## Workspace Sandbox")
+        parts.append(f"- Root: {normalized_workspace_root}")
+        parts.append("- Scope: All workspace file tools must stay inside this root.")
+        parts.append("- Safety: If a batch write tool returns needs_confirmation, wait for explicit user approval before re-running with confirm=true.\n")
+        parts.append("- Review: Prefer returned unified diffs or preview_workspace_changes before high-impact rewrites, and use workspace undo/redo tools for recovery.\n")
+
+    if isinstance(project_workflow, dict) and project_workflow:
+        parts.append("## Project Workflow")
+        parts.append("```json\n" + json.dumps(project_workflow, ensure_ascii=False, indent=2) + "\n```\n")
+
+    canvas_payload = _build_canvas_prompt_payload(canvas_documents, active_document_id=canvas_active_document_id)
     if canvas_payload:
+        manifest = canvas_payload.get("manifest")
+        if manifest and canvas_payload.get("mode") == "project":
+            parts.append("## Canvas Project Manifest")
+            parts.append("```json\n" + json.dumps(manifest, ensure_ascii=False, indent=2) + "\n```\n")
+        relationship_map = canvas_payload.get("relationship_map")
+        if relationship_map and canvas_payload.get("mode") == "project":
+            parts.append("## Canvas Relationship Map")
+            parts.append("```json\n" + json.dumps(relationship_map, ensure_ascii=False, indent=2) + "\n```\n")
         active_document = canvas_payload["active_document"]
         parts.append("## Active Canvas Document")
+        parts.append(f"- Working mode: {canvas_payload['mode']}")
         parts.append(f"- Document count: {canvas_payload['document_count']}")
         parts.append(f"- Active document id: {active_document['id']}")
         parts.append(f"- Title: {active_document['title']}")
+        if active_document.get("path"):
+            parts.append(f"- Path: {active_document['path']}")
+        if active_document.get("role"):
+            parts.append(f"- Role: {active_document['role']}")
         parts.append(f"- Format: {active_document['format']}")
         if active_document.get("language"):
             parts.append(f"- Language: {active_document['language']}")
+        if active_document.get("summary"):
+            parts.append(f"- Summary: {active_document['summary']}")
         parts.append(f"- Total lines: {canvas_payload['total_lines']}")
         parts.append(
             f"- Visible lines in prompt: 1-{canvas_payload['visible_line_end']}"
@@ -349,6 +395,10 @@ def build_runtime_system_message(
             parts.append("```json\n" + json.dumps(canvas_payload["visible_lines"], ensure_ascii=False, indent=2) + "\n```\n")
         else:
             parts.append("(The active canvas document is empty.)\n")
+        other_documents = canvas_payload.get("other_documents") or []
+        if other_documents:
+            parts.append("## Other Canvas Documents")
+            parts.append("```json\n" + json.dumps(other_documents, ensure_ascii=False, indent=2) + "\n```\n")
 
     # Tool capabilities
     tools = get_prompt_tool_context(active_tool_names, canvas_documents=canvas_documents) if active_tool_names else None
@@ -379,6 +429,9 @@ def prepend_runtime_context(
     tool_memory_context=None,
     scratchpad="",
     canvas_documents=None,
+    canvas_active_document_id: str | None = None,
+    workspace_root: str | None = None,
+    project_workflow: dict | None = None,
 ):
     summary_count = sum(1 for message in messages if message.get("role") == "summary")
     runtime_message = build_runtime_system_message(
@@ -390,6 +443,9 @@ def prepend_runtime_context(
         tool_memory_context=tool_memory_context,
         scratchpad=scratchpad,
         canvas_documents=canvas_documents,
+        canvas_active_document_id=canvas_active_document_id,
+        workspace_root=workspace_root,
+        project_workflow=project_workflow,
     )
     
     system_content = runtime_message["content"]

@@ -14,7 +14,9 @@ from canvas_service import (
     create_canvas_document,
     create_canvas_runtime_state,
     extract_canvas_documents,
+    get_canvas_runtime_active_document_id,
     find_latest_canvas_documents,
+    find_latest_canvas_state,
     get_canvas_runtime_documents,
 )
 from config import CHAT_SUMMARY_MODEL, RAG_ENABLED, RAG_SENSITIVITY_PRESETS, VISION_DISABLED_FEATURE_ERROR, VISION_ENABLED
@@ -70,6 +72,8 @@ from doc_service import (
     build_canvas_markdown,
     build_document_context_block,
     extract_document_text,
+    infer_canvas_format,
+    infer_canvas_language,
     read_uploaded_document,
 )
 from messages import (
@@ -79,6 +83,7 @@ from messages import (
     normalize_chat_messages,
     prepend_runtime_context,
 )
+from project_workspace_service import create_workspace_runtime_state, find_latest_project_workflow, get_workspace_root
 from rag import preload_embedder
 from rag_service import build_rag_auto_context, build_tool_memory_auto_context
 from rag_service import sync_conversations_to_rag_safe
@@ -890,6 +895,9 @@ def _build_budgeted_prompt_messages(
     retrieved_context: dict | None,
     tool_memory_context: str | None,
     canvas_documents: list[dict] | None = None,
+    canvas_active_document_id: str | None = None,
+    workspace_root: str | None = None,
+    project_workflow: dict | None = None,
 ) -> tuple[list[dict], dict]:
     ordered_messages = [message for message in canonical_messages if isinstance(message, dict)]
     tool_trace_context = _build_tool_trace_context(ordered_messages)
@@ -906,6 +914,9 @@ def _build_budgeted_prompt_messages(
         tool_memory_context=None,
         scratchpad=settings.get("scratchpad", ""),
         canvas_documents=canvas_documents,
+        canvas_active_document_id=canvas_active_document_id,
+        workspace_root=workspace_root,
+        project_workflow=project_workflow,
     )[0]
     base_system_tokens = estimate_text_tokens(str(base_runtime_message.get("content") or ""))
     history_budget = max(1_000, prompt_budget - base_system_tokens)
@@ -957,6 +968,9 @@ def _build_budgeted_prompt_messages(
         tool_memory_context=trimmed_tool_memory,
         scratchpad=settings.get("scratchpad", ""),
         canvas_documents=canvas_documents,
+        canvas_active_document_id=canvas_active_document_id,
+        workspace_root=workspace_root,
+        project_workflow=project_workflow,
     )
 
     stats = {
@@ -1654,8 +1668,16 @@ def register_chat_routes(app) -> None:
                 created_file_asset = create_file_asset(conv_id, doc_name, doc_mime_type, doc_bytes, extracted_text)
                 context_block, text_truncated = build_document_context_block(doc_name, extracted_text)
                 canvas_md = build_canvas_markdown(doc_name, extracted_text)
+                canvas_format = infer_canvas_format(doc_name)
+                canvas_language = infer_canvas_language(doc_name)
                 pre_created_canvas_state = create_canvas_runtime_state()
-                canvas_doc = create_canvas_document(pre_created_canvas_state, doc_name, canvas_md)
+                canvas_doc = create_canvas_document(
+                    pre_created_canvas_state,
+                    doc_name,
+                    canvas_md,
+                    format_name=canvas_format,
+                    language_name=canvas_language,
+                )
                 latest_user_message["metadata"] = {
                     **latest_user_message.get("metadata", {}),
                     "file_id": created_file_asset["file_id"],
@@ -1671,6 +1693,7 @@ def register_chat_routes(app) -> None:
                     "file_mime_type": doc_mime_type,
                     "text_truncated": text_truncated,
                     "canvas_document": canvas_doc,
+                    "open_canvas": False,
                 }
             except ValueError as exc:
                 if created_file_asset is not None:
@@ -1797,11 +1820,17 @@ def register_chat_routes(app) -> None:
             if get_tool_memory_auto_inject_enabled(settings)
             else None
         )
-        initial_canvas_documents = find_latest_canvas_documents(canonical_messages)
+        latest_canvas_state = find_latest_canvas_state(canonical_messages)
+        initial_canvas_documents = latest_canvas_state.get("documents") or []
+        initial_canvas_active_document_id = latest_canvas_state.get("active_document_id")
+        workspace_runtime_state = create_workspace_runtime_state(conv_id)
+        workspace_root = get_workspace_root(workspace_runtime_state)
+        initial_project_workflow = find_latest_project_workflow(canonical_messages)
         if pre_created_canvas_state is not None:
             pre_docs = get_canvas_runtime_documents(pre_created_canvas_state)
             if pre_docs:
                 initial_canvas_documents = pre_docs
+                initial_canvas_active_document_id = get_canvas_runtime_active_document_id(pre_created_canvas_state)
         runtime_tool_names = resolve_runtime_tool_names(active_tool_names, canvas_documents=initial_canvas_documents)
         api_messages, prompt_budget_stats = _build_budgeted_prompt_messages(
             canonical_messages,
@@ -1810,6 +1839,9 @@ def register_chat_routes(app) -> None:
             retrieved_context,
             tool_memory_context,
             canvas_documents=initial_canvas_documents,
+            canvas_active_document_id=initial_canvas_active_document_id,
+            workspace_root=workspace_root,
+            project_workflow=initial_project_workflow,
         )
 
         defer_post_response_tasks = not current_app.testing
@@ -1820,7 +1852,9 @@ def register_chat_routes(app) -> None:
             usage_data = None
             stored_tool_results = []
             canvas_documents = []
+            active_document_id = initial_canvas_active_document_id
             canvas_cleared = False
+            project_workflow = initial_project_workflow
             pending_clarification = None
             persisted_tool_history = []
             tool_trace_entries = []
@@ -1872,7 +1906,7 @@ def register_chat_routes(app) -> None:
                         {
                             "type": "canvas_sync",
                             "documents": [document_event["canvas_document"]],
-                            "auto_open": True,
+                                "auto_open": False,
                         },
                         ensure_ascii=False,
                     ) + "\n"
@@ -1885,6 +1919,9 @@ def register_chat_routes(app) -> None:
                 fetch_url_token_threshold=fetch_url_token_threshold,
                 fetch_url_clip_aggressiveness=fetch_url_clip_aggressiveness,
                 initial_canvas_documents=initial_canvas_documents,
+                initial_canvas_active_document_id=initial_canvas_active_document_id,
+                workspace_runtime_state=workspace_runtime_state,
+                initial_project_workflow=initial_project_workflow,
             ):
                 if event["type"] == "answer_delta":
                     full_response += event["text"]
@@ -1913,10 +1950,33 @@ def register_chat_routes(app) -> None:
                             ensure_ascii=False,
                         ) + "\n"
                     continue
+                elif event["type"] == "canvas_tool_starting":
+                    yield json.dumps(
+                        {
+                            "type": "canvas_loading",
+                            "tool": str(event.get("tool") or "").strip(),
+                            "snapshot": event.get("snapshot") if isinstance(event.get("snapshot"), dict) else {},
+                        },
+                        ensure_ascii=False,
+                    ) + "\n"
+                    continue
+                elif event["type"] == "canvas_content_delta":
+                    yield json.dumps(
+                        {
+                            "type": "canvas_content_delta",
+                            "tool": str(event.get("tool") or "").strip(),
+                            "delta": str(event.get("delta") or ""),
+                            "snapshot": event.get("snapshot") if isinstance(event.get("snapshot"), dict) else {},
+                        },
+                        ensure_ascii=False,
+                    ) + "\n"
+                    continue
                 elif event["type"] == "tool_capture":
                     stored_tool_results = extract_message_tool_results({"tool_results": event.get("tool_results")})
                     canvas_documents = extract_canvas_documents({"canvas_documents": event.get("canvas_documents")})
+                    active_document_id = str(event.get("active_document_id") or "").strip() or None
                     canvas_cleared = event.get("canvas_cleared") is True
+                    project_workflow = event.get("project_workflow") if isinstance(event.get("project_workflow"), dict) else project_workflow
                     ui_tool_results = build_tool_results_ui_payload(stored_tool_results)
                     if ui_tool_results:
                         yield json.dumps(
@@ -1931,6 +1991,7 @@ def register_chat_routes(app) -> None:
                             {
                                 "type": "canvas_sync",
                                 "documents": canvas_documents,
+                                "active_document_id": active_document_id,
                                 "auto_open": True,
                                 "cleared": canvas_cleared,
                             },
@@ -1942,7 +2003,7 @@ def register_chat_routes(app) -> None:
             if conv_id and persisted_tool_history:
                 persist_tool_history_rows(conv_id, persisted_tool_history)
 
-            if conv_id and (full_response or full_reasoning or pending_clarification or canvas_documents or canvas_cleared):
+            if conv_id and (full_response or full_reasoning or pending_clarification or canvas_documents or canvas_cleared or project_workflow):
                 prompt_tokens = usage_data.get("prompt_tokens") if usage_data else None
                 completion_tokens = usage_data.get("completion_tokens") if usage_data else None
                 total_tokens = usage_data.get("total_tokens") if usage_data else None
@@ -1950,7 +2011,9 @@ def register_chat_routes(app) -> None:
                     {
                         "tool_results": stored_tool_results,
                         "canvas_documents": canvas_documents,
+                        "active_document_id": active_document_id,
                         "canvas_cleared": canvas_cleared,
+                        "project_workflow": project_workflow,
                         "tool_trace": tool_trace_entries,
                         "reasoning_content": full_reasoning,
                         "pending_clarification": pending_clarification,
@@ -2173,13 +2236,8 @@ def register_chat_routes(app) -> None:
             result = {"content": "", "errors": [str(exc)]}
 
         title = _normalize_generated_title(result.get("content") or "")
-        if not title:
-            if result.get("errors"):
-                title = _build_fallback_title_from_source(source_text)
-            if not title:
-                title = TITLE_FALLBACK
-        elif not _looks_related_to_source(title, source_text):
-            title = TITLE_FALLBACK
+        if not title or not _looks_related_to_source(title, source_text):
+            title = _build_fallback_title_from_source(source_text) or TITLE_FALLBACK
 
         with get_db() as conn:
             conn.execute(

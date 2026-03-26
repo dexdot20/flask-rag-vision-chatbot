@@ -25,6 +25,35 @@ _EXTENSION_TO_MIME: dict[str, str] = {
     ".txt": MIME_PLAIN,
     ".csv": MIME_CSV,
     ".md": MIME_MARKDOWN,
+    ".py": MIME_PLAIN,
+    ".js": MIME_PLAIN,
+    ".ts": MIME_PLAIN,
+    ".tsx": MIME_PLAIN,
+    ".jsx": MIME_PLAIN,
+    ".json": MIME_PLAIN,
+    ".html": MIME_PLAIN,
+    ".css": MIME_PLAIN,
+    ".scss": MIME_PLAIN,
+    ".sh": MIME_PLAIN,
+    ".sql": MIME_PLAIN,
+    ".yaml": MIME_PLAIN,
+    ".yml": MIME_PLAIN,
+}
+
+_CODE_LANGUAGE_BY_EXTENSION: dict[str, str] = {
+    ".py": "python",
+    ".js": "javascript",
+    ".ts": "typescript",
+    ".tsx": "tsx",
+    ".jsx": "jsx",
+    ".json": "json",
+    ".html": "html",
+    ".css": "css",
+    ".scss": "scss",
+    ".sh": "bash",
+    ".sql": "sql",
+    ".yaml": "yaml",
+    ".yml": "yaml",
 }
 
 
@@ -103,8 +132,21 @@ def extract_document_text(doc_bytes: bytes, mime_type: str) -> str:
     raise ValueError(f"No text extractor for MIME type: {mime}")
 
 
+def infer_canvas_language(filename: str) -> str | None:
+    ext = os.path.splitext(filename or "")[-1].lower()
+    return _CODE_LANGUAGE_BY_EXTENSION.get(ext)
+
+
+def infer_canvas_format(filename: str) -> str:
+    return "code" if infer_canvas_language(filename) else "markdown"
+
+
 def build_canvas_markdown(filename: str, text: str) -> str:
     name = os.path.basename(filename or "document")
+    if infer_canvas_format(name) == "code":
+        return text.rstrip("\n")
+    if os.path.splitext(name)[-1].lower() == ".md":
+        return text
     return f"# {name}\n\n{text}"
 
 

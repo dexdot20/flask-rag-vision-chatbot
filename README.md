@@ -54,7 +54,7 @@ It is not a minimal prompt/response demo. The app keeps conversation history in 
   - tool results
   - RAG context
   - final instruction
-- Estimates per-turn and session cost with current DeepSeek V3.2 pricing logic
+- Estimates per-turn and session cost with the app's configured DeepSeek pricing logic
 - Writes rotating agent trace logs to `logs/agent-trace.log` by default
 
 ### Attachments
@@ -71,6 +71,7 @@ It is not a minimal prompt/response demo. The app keeps conversation history in 
   - TXT
   - CSV
   - Markdown
+  - Common code and config files such as Python, JavaScript, TypeScript, JSON, HTML, CSS, YAML, SQL, and shell scripts
 
 ### Memory and retrieval
 
@@ -85,9 +86,13 @@ It is not a minimal prompt/response demo. The app keeps conversation history in 
 ### Canvas documents
 
 - The model can create and edit Markdown canvas documents attached to the current conversation
-- The UI can display multiple canvas documents, search within them, and export them
+- The model can also create code-format canvas documents with language metadata
+- The UI can display multiple canvas documents, search within them, filter them, and export them
 - Canvas documents can be edited line-by-line by the model
+- Project-mode canvas sessions include a file tree with active-file highlighting
 - Canvas documents can be downloaded as Markdown, HTML, or PDF
+
+Manual smoke test checklist for the Canvas UI is available in [docs/canvas-ui-smoke-test.md](docs/canvas-ui-smoke-test.md)
 
 ### Observability
 
@@ -379,7 +384,7 @@ The Settings page persists these values in `app_settings`:
 - Use Generate Title to refresh a conversation title manually.
 - Use Summarize to force a summary pass for the current conversation.
 - Use Undo on a summary message to restore the summarized messages.
-- Use Prune on a message to replace verbose visible content with a compact version while preserving the original in metadata.
+- Use Prune history to prune the first N eligible unpruned messages in the current conversation.
 
 ### Settings page
 
@@ -414,7 +419,7 @@ Important interpretation details:
 - The panel is rebuilt from stored assistant-message metadata when conversation history is reloaded
 - Zero-value breakdown categories are hidden
 - Local input-source totals are explanatory only and can differ from billed prompt tokens
-- Cost uses DeepSeek V3.2 cache-miss input pricing because the usage payload does not expose cache-hit prompt-token counts
+- Cost uses the app's configured DeepSeek cache-miss input pricing because the usage payload does not expose cache-hit prompt-token counts
 
 ### Editing a previous user message
 
@@ -471,12 +476,20 @@ If you attach a document (DOCX, PDF, TXT, CSV, or MD):
 ### Canvas documents workflow
 
 - The model can create a canvas document with `create_canvas_document`.
+- The model can expand a non-active canvas file with `expand_canvas_document` when project summaries are insufficient.
 - Existing documents can be rewritten with `rewrite_canvas_document`.
 - Line-level edits use `replace_canvas_lines`, `insert_canvas_lines`, and `delete_canvas_lines`.
 - Canvas documents can be deleted with `delete_canvas_document` or cleared with `clear_canvas`.
 - Canvas documents are stored in SQLite and attached to the current conversation.
-- The UI exposes a collapsible canvas panel with search, tabs, copy, delete, and download actions.
+- The UI exposes a collapsible canvas panel with search, role/path filters, a project tree, tabs, copy, delete, edit, and download actions.
 - Canvas exports are available as Markdown, HTML, and PDF.
+
+### Workspace project workflow
+
+- Project-mode turns can track a structured workflow state with plan, skeleton, content, validation, and fix stages.
+- Workspace tools operate in a conversation-scoped sandbox rooted under `PROJECT_WORKSPACE_ROOT`.
+- Batch file writes can preview diffs before confirmation.
+- Workspace file history supports undo and redo for recorded file changes.
 
 ### Exporting conversations
 

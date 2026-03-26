@@ -39,8 +39,9 @@
       <span id="canvas-btn-indicator" class="canvas-btn-indicator" hidden aria-hidden="true"></span>
     </button>
     <button class="btn-ghost" id="export-btn" type="button">Export</button>
+    <button class="btn-ghost" id="prune-history-btn" type="button">Prune history</button>
     <a class="btn-ghost" id="settings-btn" href="/settings">Settings</a>
-    <button class="btn-tokens" id="tokens-btn" title="Token usage and cost">
+    <button class="btn-tokens" id="tokens-btn" title="Usage & cost">
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>
       </svg>
@@ -73,6 +74,7 @@
   </div>
   <div class="mobile-tools-panel__section mobile-tools-panel__section--actions">
     <button class="mobile-tools-action" id="mobile-export-btn" type="button">Export chat</button>
+    <button class="mobile-tools-action" id="mobile-prune-btn" type="button">Prune history</button>
     <a class="mobile-tools-action" id="mobile-settings-btn" href="/settings">Settings</a>
     <button class="mobile-tools-action" id="mobile-tokens-btn" type="button">Usage &amp; cost</button>
   </div>
@@ -113,7 +115,7 @@
   <div class="stats-section stats-section-intro">
     <div class="stats-section-title">How to read this</div>
     <p class="stats-note">Provider totals come from the API usage payload for completed assistant turns. Input-source sections below are local estimates of how each prompt was assembled.</p>
-    <p class="stats-note">Cost is estimated with current DeepSeek V3.2 API pricing using cache-miss input tokens: $0.28 per 1M input tokens, $0.42 per 1M output tokens. If DeepSeek applies cache-hit pricing, actual billed cost can be lower.</p>
+    <p class="stats-note">Cost is estimated with the app's configured DeepSeek API pricing using cache-miss input tokens: $0.28 per 1M input tokens, $0.42 per 1M output tokens. If DeepSeek applies cache-hit pricing, actual billed cost can be lower.</p>
   </div>
 
   <div class="stats-section">
@@ -198,6 +200,7 @@
 <div id="stats-overlay" class="stats-overlay"></div>
 
 <div id="canvas-panel" class="canvas-panel" aria-hidden="true" aria-labelledby="canvas-subtitle">
+  <div id="canvas-resize-handle" class="canvas-resize-handle" aria-hidden="true"></div>
   <div class="canvas-panel-header">
     <div>
       <span>Canvas</span>
@@ -210,6 +213,9 @@
     </button>
   </div>
   <div class="canvas-panel-actions">
+    <button class="btn-ghost" id="canvas-edit-btn" type="button">Edit</button>
+    <button class="btn-primary" id="canvas-save-btn" type="button" hidden>Save</button>
+    <button class="btn-ghost" id="canvas-cancel-btn" type="button" hidden>Cancel</button>
     <button class="btn-ghost" id="canvas-copy-btn" type="button">Copy</button>
     <button class="btn-ghost btn-ghost--danger" id="canvas-delete-btn" type="button">Delete current</button>
     <button class="btn-ghost btn-ghost--danger" id="canvas-clear-btn" type="button">Clear all</button>
@@ -221,13 +227,41 @@
   <div class="canvas-search-row">
     <label class="sr-only" for="canvas-search-input">Search canvas</label>
     <input id="canvas-search-input" class="canvas-search-input" type="search" placeholder="Search in canvas" autocomplete="off" spellcheck="false" />
+    <label class="sr-only" for="canvas-format-select">Canvas format</label>
+    <select id="canvas-format-select" class="canvas-format-select" aria-label="Canvas format">
+      <option value="markdown">Markdown</option>
+      <option value="code">Code</option>
+    </select>
   </div>
   <div id="canvas-status" class="canvas-status">Canvas idle</div>
-  <div id="canvas-empty-state" class="canvas-empty-state">
-    <h3>No canvas document yet</h3>
-    <p>Ask the assistant to draft something substantial, then continue refining it with line-based edits.</p>
-  </div>
-  <article id="canvas-document" class="canvas-document" role="document" aria-label="Canvas document" hidden></article>
+    <div class="canvas-workspace-shell">
+      <aside id="canvas-tree-panel" class="canvas-tree-panel" hidden>
+        <div class="canvas-tree-panel__header">
+          <span>Project files</span>
+          <span id="canvas-tree-count" class="canvas-tree-count">0 shown</span>
+        </div>
+        <div class="canvas-filter-row">
+          <label class="sr-only" for="canvas-role-filter">Filter by role</label>
+          <select id="canvas-role-filter" class="canvas-filter-select" aria-label="Filter canvas by role">
+            <option value="">All roles</option>
+          </select>
+          <label class="sr-only" for="canvas-path-filter">Filter by path</label>
+          <select id="canvas-path-filter" class="canvas-filter-select" aria-label="Filter canvas by path">
+            <option value="">All paths</option>
+          </select>
+        </div>
+        <div id="canvas-tree" class="canvas-tree" aria-label="Canvas project tree"></div>
+      </aside>
+      <div class="canvas-workspace-main">
+        <section id="canvas-diff" class="canvas-diff" hidden></section>
+        <div id="canvas-empty-state" class="canvas-empty-state">
+          <h3>No canvas document yet</h3>
+          <p>Ask the assistant to draft something substantial, then continue refining it with line-based edits.</p>
+        </div>
+        <textarea id="canvas-editor" class="canvas-editor" hidden spellcheck="false" aria-label="Canvas editor"></textarea>
+        <article id="canvas-document" class="canvas-document" role="document" aria-label="Canvas document" hidden></article>
+      </div>
+    </div>
 </div>
 <div id="canvas-overlay" class="canvas-overlay"></div>
 
@@ -279,8 +313,8 @@
         <button id="edit-banner-cancel" class="edit-banner__cancel" type="button">Cancel</button>
       </div>
       <div class="input-wrapper">
-        <input id="image-input" type="file" accept="image/png,image/jpeg,image/webp,.docx,.pdf,.txt,.csv,.md,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/pdf,text/plain,text/csv,text/markdown" hidden />
-        <input id="doc-input" type="file" accept=".docx,.pdf,.txt,.csv,.md,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/pdf,text/plain,text/csv,text/markdown" hidden />
+        <input id="image-input" type="file" accept="image/png,image/jpeg,image/webp,.docx,.pdf,.txt,.csv,.md,.py,.js,.ts,.tsx,.jsx,.json,.html,.css,.scss,.sh,.sql,.yaml,.yml,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/pdf,text/plain,text/csv,text/markdown" hidden />
+        <input id="doc-input" type="file" accept=".docx,.pdf,.txt,.csv,.md,.py,.js,.ts,.tsx,.jsx,.json,.html,.css,.scss,.sh,.sql,.yaml,.yml,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/pdf,text/plain,text/csv,text/markdown" hidden />
         <button id="attach-btn" class="btn-attach" title="Add file" type="button">
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 1 1 5.66 5.66L9.41 17.41a2 2 0 1 1-2.83-2.83l8.49-8.48"/>

@@ -12,6 +12,7 @@ load_dotenv()
 BASE_DIR = os.path.dirname(__file__)
 DB_PATH = os.path.join(BASE_DIR, "chatbot.db")
 IMAGE_STORAGE_DIR = (os.getenv("IMAGE_STORAGE_DIR") or os.path.join(BASE_DIR, "data", "images")).strip()
+PROJECT_WORKSPACE_ROOT = (os.getenv("PROJECT_WORKSPACE_ROOT") or os.path.join(BASE_DIR, "data", "workspaces")).strip()
 PROXIES_PATH = os.path.join(BASE_DIR, "proxies.txt")
 AGENT_TRACE_LOG_PATH = (os.getenv("AGENT_TRACE_LOG_PATH") or os.path.join(BASE_DIR, "logs", "agent-trace.log")).strip()
 
@@ -134,10 +135,27 @@ DEFAULT_ACTIVE_TOOL_NAMES = [
     "search_news_ddgs",
     "search_news_google",
     "create_canvas_document",
+    "expand_canvas_document",
+    "plan_project_workspace",
+    "get_project_workflow_status",
     "rewrite_canvas_document",
     "replace_canvas_lines",
     "insert_canvas_lines",
     "delete_canvas_lines",
+    "create_directory",
+    "create_file",
+    "update_file",
+    "read_file",
+    "list_dir",
+    "search_files",
+    "preview_workspace_changes",
+    "get_workspace_file_history",
+    "undo_workspace_file_change",
+    "redo_workspace_file_change",
+    "create_project_scaffold",
+    "write_project_tree",
+    "bulk_update_workspace_files",
+    "validate_project_workspace",
 ]
 
 PRIVATE_NETWORKS = [

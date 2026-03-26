@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -17,7 +18,9 @@ from agent import (
     FINAL_ANSWER_ERROR_TEXT,
     FINAL_ANSWER_MISSING_TEXT,
     _build_compact_tool_message_content,
+    _build_streaming_canvas_tool_preview,
     _execute_tool,
+    _extract_partial_json_string_value,
     _is_context_overflow_error,
     _iter_agent_exchange_blocks,
     _prepare_tool_result_for_transcript,
@@ -26,7 +29,16 @@ from agent import (
     run_agent_stream,
 )
 from app import create_app
-from canvas_service import create_canvas_runtime_state, find_latest_canvas_documents, normalize_canvas_document, replace_canvas_lines
+from canvas_service import (
+    build_canvas_project_manifest,
+    create_canvas_runtime_state,
+    find_latest_canvas_documents,
+    find_latest_canvas_state,
+    get_canvas_runtime_active_document_id,
+    normalize_canvas_document,
+    replace_canvas_lines,
+)
+from doc_service import build_canvas_markdown, infer_canvas_format, infer_canvas_language
 from db import (
     build_user_profile_system_context,
     append_to_scratchpad,
@@ -45,6 +57,7 @@ from db import (
     upsert_user_profile_entry,
 )
 from prune_service import _build_pruning_messages
+from project_workspace_service import create_workspace_runtime_state
 from messages import (
     SUMMARY_LABEL,
     build_api_messages,
@@ -219,6 +232,31 @@ class AppRoutesTestCase(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertIn("pruning_batch_size", response.get_json()["error"])
+
+    def test_extract_partial_json_string_value_handles_partial_escapes(self):
+        arguments_text = "{\"title\":\"Plan\",\"content\":\"Line 1\\nLine 2\\u00e7 ve \\\"quote\\\""
+
+        extracted = _extract_partial_json_string_value(arguments_text, "content")
+
+        self.assertEqual(extracted, 'Line 1\nLine 2ç ve "quote"')
+
+    def test_build_streaming_canvas_tool_preview_reads_partial_canvas_args(self):
+        tool_call_parts = [
+            {
+                "name": "create_canvas_document",
+                "arguments_parts": [
+                    '{"title":"Spec","format":"code","language":"python","content":"print(1)\\nprint(2)"',
+                ],
+            }
+        ]
+
+        preview = _build_streaming_canvas_tool_preview(tool_call_parts)
+
+        self.assertEqual(preview["tool"], "create_canvas_document")
+        self.assertEqual(preview["snapshot"]["title"], "Spec")
+        self.assertEqual(preview["snapshot"]["format"], "code")
+        self.assertEqual(preview["snapshot"]["language"], "python")
+        self.assertEqual(preview["content"], "print(1)\nprint(2)")
 
     def test_create_conversation_rejects_invalid_model(self):
         response = self.client.post(
@@ -840,6 +878,7 @@ class AppRoutesTestCase(unittest.TestCase):
     def test_runtime_system_message_hides_canvas_edit_tools_without_canvas_document(self):
         message = build_runtime_system_message(
             active_tool_names=[
+                "expand_canvas_document",
                 "create_canvas_document",
                 "rewrite_canvas_document",
                 "replace_canvas_lines",
@@ -852,6 +891,7 @@ class AppRoutesTestCase(unittest.TestCase):
 
         content = message["content"]
         self.assertIn('"name": "create_canvas_document"', content)
+        self.assertNotIn('"name": "expand_canvas_document"', content)
         self.assertNotIn('"name": "rewrite_canvas_document"', content)
         self.assertNotIn('"name": "replace_canvas_lines"', content)
         self.assertNotIn('"name": "clear_canvas"', content)
@@ -880,6 +920,77 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn("1: print('hello')", content)
         self.assertIn("2: print('world')", content)
         self.assertIn('"name": "replace_canvas_lines"', content)
+
+    def test_runtime_system_message_includes_canvas_project_manifest(self):
+        message = build_runtime_system_message(
+            active_tool_names=[
+                "create_canvas_document",
+                "rewrite_canvas_document",
+                "replace_canvas_lines",
+            ],
+            canvas_documents=[
+                {
+                    "id": "canvas-1",
+                    "title": "app.py",
+                    "path": "src/app.py",
+                    "role": "source",
+                    "project_id": "demo-app",
+                    "workspace_id": "demo-workspace",
+                    "format": "code",
+                    "language": "python",
+                    "content": "from config import settings\n\nprint(settings)",
+                    "imports": ["config"],
+                    "symbols": ["main"],
+                },
+                {
+                    "id": "canvas-2",
+                    "title": "config.py",
+                    "path": "src/config.py",
+                    "role": "config",
+                    "project_id": "demo-app",
+                    "workspace_id": "demo-workspace",
+                    "format": "code",
+                    "language": "python",
+                    "content": "settings = {'debug': True}",
+                    "exports": ["settings"],
+                },
+            ],
+            canvas_active_document_id="canvas-1",
+        )
+
+        content = message["content"]
+        self.assertIn("## Canvas Project Manifest", content)
+        self.assertIn("## Canvas Relationship Map", content)
+        self.assertIn('"project_name": "demo-app"', content)
+        self.assertIn('"active_document_id": "canvas-1"', content)
+        self.assertIn('"last_validation_status": "ok"', content)
+        self.assertIn('"imports": [', content)
+        self.assertIn("- Working mode: project", content)
+        self.assertIn("- Path: src/app.py", content)
+        self.assertIn("- Role: source", content)
+        self.assertIn("## Other Canvas Documents", content)
+        self.assertIn('"path": "src/config.py"', content)
+
+    def test_openai_tool_specs_include_expand_canvas_document_with_canvas_documents(self):
+        tools = get_openai_tool_specs(
+            [
+                "expand_canvas_document",
+                "create_canvas_document",
+                "rewrite_canvas_document",
+            ],
+            canvas_documents=[
+                {
+                    "id": "canvas-1",
+                    "title": "app.py",
+                    "path": "src/app.py",
+                    "format": "code",
+                    "content": "print('hello')",
+                }
+            ],
+        )
+
+        tool_names = [entry["function"]["name"] for entry in tools]
+        self.assertEqual(tool_names, ["expand_canvas_document", "create_canvas_document", "rewrite_canvas_document"])
 
     def test_openai_tool_specs_hide_canvas_edit_tools_without_canvas_document(self):
         tools = get_openai_tool_specs(
@@ -911,6 +1022,34 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn("Date: ", content)
         self.assertIn("Time: ", content)
         self.assertEqual(messages[1]["role"], "user")
+
+    def test_runtime_system_message_includes_workspace_sandbox(self):
+        message = build_runtime_system_message(
+            active_tool_names=["create_file", "list_dir"],
+            workspace_root="/tmp/workspace-root",
+        )
+
+        content = message["content"]
+        self.assertIn("## Workspace Sandbox", content)
+        self.assertIn("- Root: /tmp/workspace-root", content)
+        self.assertIn("needs_confirmation", content)
+
+    def test_runtime_system_message_includes_project_workflow(self):
+        message = build_runtime_system_message(
+            active_tool_names=["plan_project_workspace", "get_project_workflow_status"],
+            project_workflow={
+                "stage": "content",
+                "project_name": "Demo App",
+                "goal": "Build a small Python service",
+                "target_type": "python-project",
+                "files": [{"path": "demo-app/app.py", "role": "source", "status": "written"}],
+            },
+        )
+
+        content = message["content"]
+        self.assertIn("## Project Workflow", content)
+        self.assertIn('"stage": "content"', content)
+        self.assertIn('"project_name": "Demo App"', content)
 
     def test_settings_patch_allows_manual_scratchpad_updates(self):
         response = self.client.patch(
@@ -1189,6 +1328,37 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(delete_summary, "Canvas lines deleted in Release Plan")
         self.assertNotIn("", deleted["content"].splitlines()[:1])
 
+    def test_canvas_tools_support_code_format(self):
+        runtime_state = {}
+
+        created, _ = _execute_tool(
+            "create_canvas_document",
+            {
+                "title": "main.py",
+                "content": "print('hello')",
+                "format": "code",
+                "language": "python",
+            },
+            runtime_state=runtime_state,
+        )
+
+        self.assertEqual(created["format"], "code")
+        self.assertEqual(created["language"], "python")
+
+        updated, _ = _execute_tool(
+            "rewrite_canvas_document",
+            {
+                "document_id": created["document_id"],
+                "content": "console.log('hello');",
+                "format": "code",
+                "language": "javascript",
+            },
+            runtime_state=runtime_state,
+        )
+
+        self.assertEqual(updated["format"], "code")
+        self.assertEqual(updated["language"], "javascript")
+
     def test_canvas_tools_delete_and_clear_documents_in_runtime_state(self):
         runtime_state = {}
 
@@ -1231,6 +1401,347 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(runtime_state["canvas"]["documents"], [])
         self.assertIsNone(runtime_state["canvas"]["active_document_id"])
         self.assertEqual(created_second["title"], "Draft Two")
+
+    def test_workspace_tools_create_read_list_search_update_and_validate(self):
+        workspace_root = os.path.join(self.temp_dir.name, "workspace-tools")
+        runtime_state = {"workspace": create_workspace_runtime_state(root_path=workspace_root)}
+
+        created_dir, _ = _execute_tool("create_directory", {"path": "demo/tests"}, runtime_state=runtime_state)
+        self.assertEqual(created_dir["path"], "demo/tests")
+
+        created_file, _ = _execute_tool(
+            "create_file",
+            {"path": "demo/app.py", "content": "def main():\n    return 'ok'\n"},
+            runtime_state=runtime_state,
+        )
+        self.assertEqual(created_file["action"], "file_created")
+
+        updated_file, _ = _execute_tool(
+            "update_file",
+            {"path": "demo/app.py", "content": "def main():\n    return 'updated'\n"},
+            runtime_state=runtime_state,
+        )
+        self.assertEqual(updated_file["action"], "file_updated")
+
+        read_result, _ = _execute_tool(
+            "read_file",
+            {"path": "demo/app.py", "start_line": 1, "end_line": 2},
+            runtime_state=runtime_state,
+        )
+        self.assertIn("1: def main():", read_result["content"])
+        self.assertIn("2:     return 'updated'", read_result["content"])
+
+        list_result, _ = _execute_tool("list_dir", {"path": "demo"}, runtime_state=runtime_state)
+        self.assertEqual([entry["path"] for entry in list_result["entries"]], ["demo/tests", "demo/app.py"])
+
+        search_result, _ = _execute_tool(
+            "search_files",
+            {"query": "updated", "path_prefix": "demo", "search_content": True},
+            runtime_state=runtime_state,
+        )
+        self.assertEqual(search_result["matches"][0]["path"], "demo/app.py")
+
+        history_result, _ = _execute_tool(
+            "get_workspace_file_history",
+            {"path": "demo/app.py"},
+            runtime_state=runtime_state,
+        )
+        self.assertEqual(history_result["undo_count"], 2)
+        self.assertEqual(history_result["redo_count"], 0)
+
+        validate_result, _ = _execute_tool(
+            "validate_project_workspace",
+            {"path": "demo"},
+            runtime_state=runtime_state,
+        )
+        self.assertEqual(validate_result["status"], "ok")
+
+    def test_project_workflow_tools_track_stage_transitions(self):
+        workspace_root = os.path.join(self.temp_dir.name, "workflow-tools")
+        runtime_state = {
+            "workspace": create_workspace_runtime_state(root_path=workspace_root),
+        }
+
+        planned, summary = _execute_tool(
+            "plan_project_workspace",
+            {
+                "goal": "Build a small Python demo",
+                "project_name": "Demo App",
+                "target_type": "python-project",
+            },
+            runtime_state=runtime_state,
+        )
+        self.assertEqual(summary, "Project planned: Demo App")
+        self.assertEqual(planned["project_workflow"]["stage"], "plan")
+        self.assertEqual(planned["project_workflow"]["target_type"], "python-project")
+
+        scaffolded, _ = _execute_tool(
+            "create_project_scaffold",
+            {"project_name": "Demo App", "target_type": "python-project"},
+            runtime_state=runtime_state,
+        )
+        self.assertEqual(scaffolded["status"], "ok")
+
+        status_after_scaffold, _ = _execute_tool(
+            "get_project_workflow_status",
+            {},
+            runtime_state=runtime_state,
+        )
+        self.assertEqual(status_after_scaffold["project_workflow"]["stage"], "skeleton")
+
+        updated, _ = _execute_tool(
+            "bulk_update_workspace_files",
+            {
+                "files": [
+                    {"path": "demo-app/app.py", "content": "def main():\n    return 'ok'\n"},
+                ],
+                "confirm": True,
+            },
+            runtime_state=runtime_state,
+        )
+        self.assertEqual(updated["status"], "ok")
+
+        status_after_write, _ = _execute_tool(
+            "get_project_workflow_status",
+            {},
+            runtime_state=runtime_state,
+        )
+        self.assertEqual(status_after_write["project_workflow"]["stage"], "content")
+
+        validated, _ = _execute_tool(
+            "validate_project_workspace",
+            {"path": "demo-app"},
+            runtime_state=runtime_state,
+        )
+        self.assertEqual(validated["status"], "ok")
+
+        final_status, _ = _execute_tool(
+            "get_project_workflow_status",
+            {},
+            runtime_state=runtime_state,
+        )
+        self.assertEqual(final_status["project_workflow"]["stage"], "validated")
+        self.assertEqual(final_status["project_workflow"]["validation"]["status"], "ok")
+
+    def test_validate_project_workspace_reports_python_project_rule_warnings(self):
+        workspace_root = os.path.join(self.temp_dir.name, "validation-rules")
+        runtime_state = {"workspace": create_workspace_runtime_state(root_path=workspace_root)}
+
+        written, _ = _execute_tool(
+            "write_project_tree",
+            {
+                "directories": ["demo/src/demo_pkg", "demo/tests"],
+                "files": [
+                    {"path": "demo/README.md", "content": "# Demo\n"},
+                    {"path": "demo/requirements.txt", "content": "requests\n"},
+                    {"path": "demo/pyproject.toml", "content": "[project]\nname = 'demo'\nversion = '0.1.0'\n"},
+                    {"path": "demo/config.py", "content": "\n"},
+                    {"path": "demo/src/demo_pkg/__init__.py", "content": ""},
+                    {"path": "demo/src/demo_pkg/main.py", "content": "from .missing import run\n"},
+                ],
+            },
+            runtime_state=runtime_state,
+        )
+        self.assertEqual(written["status"], "ok")
+
+        validation, _ = _execute_tool(
+            "validate_project_workspace",
+            {"path": "demo"},
+            runtime_state=runtime_state,
+        )
+        self.assertEqual(validation["status"], "ok")
+        self.assertTrue(validation["summary"]["looks_like_python_project"])
+        self.assertGreaterEqual(validation["summary"]["warning_count"], 4)
+        self.assertIn("Missing expected file: app.py", validation["warnings"])
+        self.assertIn("Missing tests directory or test files.", validation["warnings"])
+        self.assertIn("config.py is empty.", validation["warnings"])
+        self.assertIn("No obvious Python entry point found. Add app.py, main.py, __main__.py, or declare scripts in pyproject.toml.", validation["warnings"])
+        self.assertIn("Relative import target is missing in src/demo_pkg/main.py: .missing", validation["warnings"])
+
+    def test_project_scaffold_and_batch_tools_require_confirmation_for_overwrites(self):
+        workspace_root = os.path.join(self.temp_dir.name, "workspace-project")
+        runtime_state = {"workspace": create_workspace_runtime_state(root_path=workspace_root)}
+
+        preview, _ = _execute_tool(
+            "create_project_scaffold",
+            {"project_name": "Demo App"},
+            runtime_state=runtime_state,
+        )
+        self.assertEqual(preview["action"], "project_scaffold_created")
+        self.assertEqual(preview["project_root"], "demo-app")
+
+        overwrite_preview, _ = _execute_tool(
+            "write_project_tree",
+            {
+                "files": [
+                    {"path": "demo-app/app.py", "content": "print('rewrite')\n"},
+                    {"path": "demo-app/config.py", "content": "SETTINGS = {'debug': True}\n"},
+                ]
+            },
+            runtime_state=runtime_state,
+        )
+        self.assertEqual(overwrite_preview["status"], "needs_confirmation")
+        self.assertIn("demo-app/app.py", overwrite_preview["overwrites"])
+        self.assertIn("--- a/demo-app/app.py", overwrite_preview["diffs"][0]["diff"])
+
+        applied, _ = _execute_tool(
+            "write_project_tree",
+            {
+                "files": [
+                    {"path": "demo-app/app.py", "content": "print('rewrite')\n"},
+                    {"path": "demo-app/config.py", "content": "SETTINGS = {'debug': True}\n"},
+                ],
+                "confirm": True,
+            },
+            runtime_state=runtime_state,
+        )
+        self.assertEqual(applied["status"], "ok")
+        self.assertTrue(applied["revision_ids"])
+
+        bulk_preview, _ = _execute_tool(
+            "bulk_update_workspace_files",
+            {
+                "files": [
+                    {"path": "demo-app/README.md", "content": "# Demo App\n"},
+                    {"path": "demo-app/tests/test_app.py", "content": "def test_placeholder():\n    assert True\n"},
+                ]
+            },
+            runtime_state=runtime_state,
+        )
+        self.assertEqual(bulk_preview["status"], "needs_confirmation")
+        self.assertEqual(len(bulk_preview["diffs"]), 2)
+
+        bulk_applied, _ = _execute_tool(
+            "bulk_update_workspace_files",
+            {
+                "files": [
+                    {"path": "demo-app/README.md", "content": "# Demo App\n"},
+                    {"path": "demo-app/tests/test_app.py", "content": "def test_placeholder():\n    assert True\n"},
+                ],
+                "confirm": True,
+            },
+            runtime_state=runtime_state,
+        )
+        self.assertEqual(bulk_applied["status"], "ok")
+
+    def test_preview_and_undo_redo_workspace_file_changes(self):
+        workspace_root = os.path.join(self.temp_dir.name, "workspace-history")
+        runtime_state = {"workspace": create_workspace_runtime_state(root_path=workspace_root)}
+
+        created, _ = _execute_tool(
+            "create_file",
+            {"path": "demo/app.py", "content": "print('v1')\n"},
+            runtime_state=runtime_state,
+        )
+        self.assertEqual(created["action"], "file_created")
+
+        preview, summary = _execute_tool(
+            "preview_workspace_changes",
+            {"files": [{"path": "demo/app.py", "content": "print('v2')\n"}]},
+            runtime_state=runtime_state,
+        )
+        self.assertEqual(summary, "Workspace diff preview: 1 files")
+        self.assertEqual(preview["diffs"][0]["change_type"], "modified")
+        self.assertIn("-print('v1')", preview["diffs"][0]["diff"])
+        self.assertIn("+print('v2')", preview["diffs"][0]["diff"])
+
+        updated, _ = _execute_tool(
+            "update_file",
+            {"path": "demo/app.py", "content": "print('v2')\n"},
+            runtime_state=runtime_state,
+        )
+        self.assertEqual(updated["action"], "file_updated")
+
+        undo_result, undo_summary = _execute_tool(
+            "undo_workspace_file_change",
+            {"path": "demo/app.py"},
+            runtime_state=runtime_state,
+        )
+        self.assertEqual(undo_summary, "Workspace undo: demo/app.py")
+        self.assertEqual(undo_result["action"], "workspace_file_undone")
+        self.assertEqual(undo_result["content"], "print('v1')\n")
+        self.assertEqual(undo_result["redo_count"], 1)
+
+        redo_result, redo_summary = _execute_tool(
+            "redo_workspace_file_change",
+            {"path": "demo/app.py"},
+            runtime_state=runtime_state,
+        )
+        self.assertEqual(redo_summary, "Workspace redo: demo/app.py")
+        self.assertEqual(redo_result["action"], "workspace_file_redone")
+        self.assertEqual(redo_result["content"], "print('v2')\n")
+
+        history_result, _ = _execute_tool(
+            "get_workspace_file_history",
+            {"path": "demo/app.py"},
+            runtime_state=runtime_state,
+        )
+        self.assertEqual(history_result["undo_count"], 2)
+        self.assertEqual(history_result["redo_count"], 0)
+
+    def test_hidden_workspace_history_is_not_listed_or_searched(self):
+        workspace_root = os.path.join(self.temp_dir.name, "workspace-hidden-history")
+        runtime_state = {"workspace": create_workspace_runtime_state(root_path=workspace_root)}
+
+        _execute_tool(
+            "create_file",
+            {"path": "demo/app.py", "content": "print('v1')\n"},
+            runtime_state=runtime_state,
+        )
+        _execute_tool(
+            "update_file",
+            {"path": "demo/app.py", "content": "print('v2')\n"},
+            runtime_state=runtime_state,
+        )
+
+        listed, _ = _execute_tool("list_dir", {}, runtime_state=runtime_state)
+        self.assertEqual([entry["path"] for entry in listed["entries"]], ["demo"])
+
+        searched, _ = _execute_tool(
+            "search_files",
+            {"query": ".workspace-history", "search_content": True},
+            runtime_state=runtime_state,
+        )
+        self.assertEqual(searched["matches"], [])
+
+    def test_expand_canvas_document_tool_returns_line_numbered_context(self):
+        runtime_state = {"canvas": create_canvas_runtime_state([
+            {
+                "id": "canvas-1",
+                "title": "app.py",
+                "path": "src/app.py",
+                "role": "source",
+                "format": "code",
+                "language": "python",
+                "content": "import os\n\nprint('hello')",
+                "imports": ["os"],
+                "symbols": ["main"],
+            },
+            {
+                "id": "canvas-2",
+                "title": "config.py",
+                "path": "src/config.py",
+                "role": "config",
+                "format": "code",
+                "language": "python",
+                "content": "DEBUG = True",
+                "exports": ["DEBUG"],
+            },
+        ], active_document_id="canvas-2")}
+
+        expanded, summary = _execute_tool(
+            "expand_canvas_document",
+            {"document_path": "src/app.py"},
+            runtime_state=runtime_state,
+        )
+
+        self.assertEqual(summary, "Canvas expanded: src/app.py")
+        self.assertEqual(expanded["action"], "expanded")
+        self.assertEqual(expanded["document_path"], "src/app.py")
+        self.assertEqual(expanded["visible_lines"][0], "1: import os")
+        self.assertEqual(expanded["visible_lines"][2], "3: print('hello')")
+        self.assertEqual(expanded["manifest_excerpt"]["active_file"], "src/config.py")
+        self.assertIn("os", expanded["relationship_map"]["imports"])
 
     def test_chat_image_upload_persists_image_asset_and_metadata(self):
         conversation_id = self._create_conversation()
@@ -1377,9 +1888,29 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn('id="canvas-confirm-open"', html_text)
         self.assertIn('id="canvas-delete-btn"', html_text)
         self.assertIn('id="canvas-clear-btn"', html_text)
+        self.assertIn('id="canvas-edit-btn"', html_text)
+        self.assertIn('id="canvas-save-btn"', html_text)
+        self.assertIn('id="canvas-format-select"', html_text)
+        self.assertIn('id="canvas-diff"', html_text)
+        self.assertIn('id="canvas-role-filter"', html_text)
+        self.assertIn('id="canvas-path-filter"', html_text)
+        self.assertIn('id="canvas-tree"', html_text)
+        self.assertIn('id="canvas-resize-handle"', html_text)
         self.assertIn('const canvasDeleteBtn = document.getElementById("canvas-delete-btn")', script_text)
         self.assertIn('const canvasClearBtn = document.getElementById("canvas-clear-btn")', script_text)
+        self.assertIn('const canvasEditBtn = document.getElementById("canvas-edit-btn")', script_text)
+        self.assertIn('const canvasSaveBtn = document.getElementById("canvas-save-btn")', script_text)
+        self.assertIn('const canvasRoleFilter = document.getElementById("canvas-role-filter")', script_text)
+        self.assertIn('const canvasPathFilter = document.getElementById("canvas-path-filter")', script_text)
+        self.assertIn('function getCanvasVisibleDocuments(documents)', script_text)
+        self.assertIn('function buildCanvasTreeNodes(documents)', script_text)
+        self.assertIn('function renderCanvasTree(documents, activeDocument)', script_text)
+        self.assertIn('function renderHighlightedCodeBlock(codeText, rawLang = null)', script_text)
+        self.assertIn('async function saveCanvasEdits()', script_text)
         self.assertIn("async function deleteCanvasDocuments(", script_text)
+        self.assertIn('.canvas-workspace-shell', style_text)
+        self.assertIn('.canvas-tree-panel', style_text)
+        self.assertIn('.canvas-tree-file.active', style_text)
 
     def test_settings_ui_exposes_fetch_threshold_input(self):
         html = self.client.get("/settings").get_data(as_text=True)
@@ -1907,6 +2438,55 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(metadata["canvas_documents"][0]["title"], "Draft")
         self.assertEqual(metadata["canvas_documents"][1]["id"], "canvas-2")
 
+    def test_serialize_message_metadata_keeps_active_canvas_document_id(self):
+        payload = serialize_message_metadata(
+            {
+                "canvas_documents": [
+                    {
+                        "id": "canvas-1",
+                        "title": "Draft",
+                        "format": "markdown",
+                        "content": "# Draft",
+                    },
+                    {
+                        "id": "canvas-2",
+                        "title": "Notes",
+                        "format": "markdown",
+                        "content": "# Notes",
+                    },
+                ],
+                "active_document_id": "canvas-1",
+            }
+        )
+
+        metadata = parse_message_metadata(payload)
+        self.assertEqual(metadata["active_document_id"], "canvas-1")
+
+    def test_serialize_message_metadata_keeps_project_workflow(self):
+        payload = serialize_message_metadata(
+            {
+                "project_workflow": {
+                    "stage": "validate",
+                    "project_name": "Demo App",
+                    "goal": "Build a service",
+                    "target_type": "python-project",
+                    "files": [
+                        {"path": "demo-app/app.py", "role": "source", "purpose": "Entry point", "status": "written"},
+                    ],
+                    "validation": {
+                        "status": "needs_attention",
+                        "issues": ["Example issue"],
+                        "warnings": ["Example warning"],
+                    },
+                }
+            }
+        )
+
+        metadata = parse_message_metadata(payload)
+        self.assertEqual(metadata["project_workflow"]["stage"], "validate")
+        self.assertEqual(metadata["project_workflow"]["files"][0]["path"], "demo-app/app.py")
+        self.assertEqual(metadata["project_workflow"]["validation"]["status"], "needs_attention")
+
     def test_serialize_message_metadata_keeps_canvas_cleared_flag(self):
         payload = serialize_message_metadata(
             {
@@ -1944,6 +2524,112 @@ class AppRoutesTestCase(unittest.TestCase):
         ]
 
         self.assertEqual(find_latest_canvas_documents(messages), [])
+
+    def test_find_latest_canvas_state_restores_active_document_id(self):
+        messages = [
+            {
+                "id": 1,
+                "metadata": {
+                    "canvas_documents": [
+                        {
+                            "id": "canvas-1",
+                            "title": "app.py",
+                            "path": "src/app.py",
+                            "format": "code",
+                            "content": "print('hello')",
+                        },
+                        {
+                            "id": "canvas-2",
+                            "title": "README.md",
+                            "path": "README.md",
+                            "format": "markdown",
+                            "content": "# Demo",
+                        },
+                    ],
+                    "active_document_id": "canvas-1",
+                },
+            }
+        ]
+
+        runtime_state = find_latest_canvas_state(messages)
+        self.assertEqual(get_canvas_runtime_active_document_id(runtime_state), "canvas-1")
+        self.assertEqual(runtime_state["mode"], "project")
+
+    def test_canvas_project_manifest_prioritizes_source_and_config_files(self):
+        manifest = build_canvas_project_manifest(
+            [
+                {
+                    "id": "canvas-1",
+                    "title": "README.md",
+                    "path": "README.md",
+                    "role": "docs",
+                    "format": "markdown",
+                    "content": "# Demo",
+                },
+                {
+                    "id": "canvas-2",
+                    "title": "config.py",
+                    "path": "src/config.py",
+                    "role": "config",
+                    "format": "code",
+                    "content": "settings = {}",
+                },
+                {
+                    "id": "canvas-3",
+                    "title": "app.py",
+                    "path": "src/app.py",
+                    "role": "source",
+                    "format": "code",
+                    "content": "print('hello')",
+                },
+            ],
+            active_document_id="canvas-3",
+        )
+
+        self.assertEqual(manifest["active_file"], "src/app.py")
+        self.assertEqual(manifest["last_validation_status"], "ok")
+        self.assertEqual([entry["path"] for entry in manifest["file_list"]], ["src/app.py", "src/config.py", "README.md"])
+        self.assertEqual([entry["priority"] for entry in manifest["file_list"]], [10, 20, 60])
+
+    def test_canvas_project_manifest_flags_duplicate_paths(self):
+        manifest = build_canvas_project_manifest(
+            [
+                {
+                    "id": "canvas-1",
+                    "title": "app.py",
+                    "path": "src/app.py",
+                    "role": "source",
+                    "format": "code",
+                    "content": "print('one')",
+                },
+                {
+                    "id": "canvas-2",
+                    "title": "app copy.py",
+                    "path": "src/app.py",
+                    "role": "source",
+                    "format": "code",
+                    "content": "print('two')",
+                },
+            ],
+            active_document_id="canvas-1",
+        )
+
+        self.assertEqual(manifest["last_validation_status"], "needs_attention")
+        self.assertIn("Duplicate project paths detected.", manifest["open_issues"])
+
+    def test_normalize_canvas_document_accepts_code_format(self):
+        document = normalize_canvas_document(
+            {
+                "id": "canvas-code",
+                "title": "Script",
+                "format": "code",
+                "language": "python",
+                "content": "print('ok')",
+            }
+        )
+
+        self.assertEqual(document["format"], "code")
+        self.assertEqual(document["language"], "python")
 
     def test_create_canvas_runtime_state_preserves_multiple_documents(self):
         runtime_state = create_canvas_runtime_state(
@@ -2085,6 +2771,38 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(assistant_messages[0]["metadata"]["canvas_documents"], [])
         self.assertTrue(assistant_messages[0]["metadata"]["canvas_cleared"])
 
+    def test_uploaded_document_prompts_before_opening_canvas(self):
+        conversation_id = self._create_conversation()
+
+        fake_events = iter([
+            {"type": "done"},
+        ])
+
+        with patch("routes.chat.run_agent_stream", return_value=fake_events):
+            response = self.client.post(
+                "/chat",
+                data={
+                    "conversation_id": str(conversation_id),
+                    "model": "deepseek-chat",
+                    "user_content": "Please review this file",
+                    "messages": json.dumps([
+                        {"role": "user", "content": "Please review this file"},
+                    ]),
+                    "document": (io.BytesIO(b"Project notes\n\nDetails"), "notes.txt", "text/plain"),
+                },
+                content_type="multipart/form-data",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        events = [json.loads(line) for line in response.get_data(as_text=True).strip().splitlines()]
+        document_event = next((event for event in events if event["type"] == "document_processed"), None)
+        self.assertIsNotNone(document_event)
+        self.assertIn("canvas_document", document_event)
+
+        canvas_event = next((event for event in events if event["type"] == "canvas_sync"), None)
+        self.assertIsNotNone(canvas_event)
+        self.assertFalse(canvas_event.get("auto_open"))
+
     def test_canvas_export_endpoint_returns_markdown_and_pdf(self):
         conversation_id = self._create_conversation()
         metadata = serialize_message_metadata(
@@ -2125,6 +2843,37 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(html_response.mimetype, "text/html")
         self.assertIn("attachment; filename=\"Draft-Export.html\"", html_response.headers["Content-Disposition"])
         self.assertIn("<ul>", html_response.get_data(as_text=True))
+
+    def test_canvas_export_endpoint_renders_code_format(self):
+        conversation_id = self._create_conversation()
+        metadata = serialize_message_metadata(
+            {
+                "canvas_documents": [
+                    {
+                        "id": "canvas-code-export",
+                        "title": "main.py",
+                        "format": "code",
+                        "language": "python",
+                        "content": "print('hello')",
+                    }
+                ]
+            }
+        )
+
+        with get_db() as conn:
+            insert_message(conn, conversation_id, "assistant", "Here is the code.", metadata=metadata)
+
+        markdown_response = self.client.get(
+            f"/api/conversations/{conversation_id}/canvas/export?format=md&document_id=canvas-code-export"
+        )
+        self.assertEqual(markdown_response.status_code, 200)
+        self.assertIn("```python", markdown_response.get_data(as_text=True))
+
+        html_response = self.client.get(
+            f"/api/conversations/{conversation_id}/canvas/export?format=html&document_id=canvas-code-export"
+        )
+        self.assertEqual(html_response.status_code, 200)
+        self.assertIn("language-python", html_response.get_data(as_text=True))
 
     def test_canvas_delete_endpoint_updates_canvas_state(self):
         conversation_id = self._create_conversation()
@@ -2175,6 +2924,121 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(messages[-1]["role"], "tool")
         self.assertEqual(messages[-1]["metadata"]["canvas_documents"], [])
         self.assertTrue(messages[-1]["metadata"]["canvas_cleared"])
+
+    def test_canvas_delete_endpoint_accepts_document_path(self):
+        conversation_id = self._create_conversation()
+        metadata = serialize_message_metadata(
+            {
+                "canvas_documents": [
+                    {
+                        "id": "canvas-one",
+                        "title": "app.py",
+                        "path": "src/app.py",
+                        "format": "code",
+                        "content": "print('one')",
+                    },
+                    {
+                        "id": "canvas-two",
+                        "title": "config.py",
+                        "path": "src/config.py",
+                        "format": "code",
+                        "content": "settings = {}",
+                    },
+                ],
+                "active_document_id": "canvas-two",
+            }
+        )
+
+        with get_db() as conn:
+            insert_message(conn, conversation_id, "assistant", "Canvas ready.", metadata=metadata)
+
+        delete_response = self.client.delete(
+            f"/api/conversations/{conversation_id}/canvas?document_path=src/config.py"
+        )
+        self.assertEqual(delete_response.status_code, 200)
+        delete_payload = delete_response.get_json()
+        self.assertEqual(delete_payload["remaining_count"], 1)
+        self.assertEqual(delete_payload["documents"][0]["path"], "src/app.py")
+
+    def test_canvas_patch_endpoint_updates_document_content_and_format(self):
+        conversation_id = self._create_conversation()
+        metadata = serialize_message_metadata(
+            {
+                "canvas_documents": [
+                    {
+                        "id": "canvas-edit",
+                        "title": "Draft",
+                        "format": "markdown",
+                        "content": "# Draft\n\nInitial",
+                    }
+                ]
+            }
+        )
+
+        with get_db() as conn:
+            insert_message(conn, conversation_id, "assistant", "Here is the draft.", metadata=metadata)
+
+        response = self.client.patch(
+            f"/api/conversations/{conversation_id}/canvas",
+            json={
+                "document_id": "canvas-edit",
+                "content": "print('saved')",
+                "format": "code",
+                "language": "python",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["document"]["format"], "code")
+        self.assertEqual(payload["document"]["language"], "python")
+        self.assertEqual(payload["document"]["content"], "print('saved')")
+
+        conversation_response = self.client.get(f"/api/conversations/{conversation_id}")
+        messages = conversation_response.get_json()["messages"]
+        latest_canvas = find_latest_canvas_documents(messages)
+        self.assertEqual(latest_canvas[0]["format"], "code")
+        self.assertEqual(latest_canvas[0]["content"], "print('saved')")
+
+    def test_canvas_patch_endpoint_accepts_document_path(self):
+        conversation_id = self._create_conversation()
+        metadata = serialize_message_metadata(
+            {
+                "canvas_documents": [
+                    {
+                        "id": "canvas-edit",
+                        "title": "app.py",
+                        "path": "src/app.py",
+                        "format": "code",
+                        "content": "print('old')",
+                    }
+                ]
+            }
+        )
+
+        with get_db() as conn:
+            insert_message(conn, conversation_id, "assistant", "Here is the draft.", metadata=metadata)
+
+        response = self.client.patch(
+            f"/api/conversations/{conversation_id}/canvas",
+            json={
+                "document_path": "src/app.py",
+                "content": "print('new')",
+                "format": "code",
+                "language": "python",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["document"]["path"], "src/app.py")
+        self.assertEqual(payload["document"]["content"], "print('new')")
+
+    def test_document_canvas_inference_for_code_files(self):
+        self.assertEqual(infer_canvas_format("main.py"), "code")
+        self.assertEqual(infer_canvas_language("main.py"), "python")
+        self.assertEqual(build_canvas_markdown("main.py", "print('hello')"), "print('hello')")
+        self.assertEqual(infer_canvas_format("notes.md"), "markdown")
 
     def test_conversation_export_endpoint_returns_markdown_docx_and_pdf(self):
         conversation_id = self._create_conversation("Exportable Chat")
@@ -2261,6 +3125,51 @@ class AppRoutesTestCase(unittest.TestCase):
         )
 
         self.assertEqual(normalized["language"], "python")
+
+    def test_normalize_canvas_document_preserves_project_metadata(self):
+        normalized = normalize_canvas_document(
+            {
+                "id": "canvas-project",
+                "title": "app.py",
+                "path": "./src/app.py",
+                "role": "source",
+                "summary": " Main application entry point ",
+                "imports": ["config", "config", "os"],
+                "exports": ["create_app"],
+                "symbols": ["create_app", "main"],
+                "dependencies": ["flask", "python-dotenv"],
+                "project_id": "Demo App",
+                "workspace_id": "Workspace-1",
+                "format": "code",
+                "language": "python",
+                "content": "print('hello')",
+            }
+        )
+
+        self.assertEqual(normalized["path"], "src/app.py")
+        self.assertEqual(normalized["role"], "source")
+        self.assertEqual(normalized["summary"], "Main application entry point")
+        self.assertEqual(normalized["imports"], ["config", "os"])
+        self.assertEqual(normalized["dependencies"], ["flask", "python-dotenv"])
+        self.assertEqual(normalized["project_id"], "demoapp")
+        self.assertEqual(normalized["workspace_id"], "workspace-1")
+
+    def test_canvas_line_tools_accept_document_path(self):
+        runtime_state = create_canvas_runtime_state(
+            [
+                {
+                    "id": "canvas-1",
+                    "title": "app.py",
+                    "path": "src/app.py",
+                    "format": "code",
+                    "content": "line 1\nline 2",
+                }
+            ]
+        )
+
+        updated = replace_canvas_lines(runtime_state, 2, 2, ["line changed"], document_path="src/app.py")
+        self.assertEqual(updated["path"], "src/app.py")
+        self.assertEqual(updated["content"], "line 1\nline changed")
 
     def test_run_agent_stream_executes_native_tool_calls(self):
         responses = [

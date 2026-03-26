@@ -12,8 +12,10 @@ from canvas_service import (
     create_canvas_runtime_state,
     delete_canvas_document,
     find_latest_canvas_document,
-    find_latest_canvas_documents,
+    find_latest_canvas_state,
+    get_canvas_runtime_active_document_id,
     get_canvas_runtime_documents,
+    rewrite_canvas_document,
 )
 from conversation_export import (
     build_conversation_docx_download,
@@ -33,13 +35,14 @@ from db import (
     delete_conversation_file_assets,
     delete_conversation_image_assets,
     get_conversation_message_rows,
+    get_conversation_messages,
     get_db,
     insert_message,
     message_row_to_dict,
     parse_message_metadata,
     serialize_message_metadata,
 )
-from prune_service import prune_message
+from prune_service import prune_message, prune_conversation_batch
 from rag import delete_source as rag_delete_source
 from rag_service import (
     conversation_rag_source_key,
@@ -190,12 +193,17 @@ def register_conversation_routes(app) -> None:
     def delete_canvas(conv_id):
         clear_all = str(request.args.get("clear_all") or "").strip().lower() in {"1", "true", "yes", "on"}
         document_id = str(request.args.get("document_id") or "").strip() or None
+        document_path = str(request.args.get("document_path") or "").strip() or None
 
         conversation, messages = _load_conversation_payload(conv_id)
         if not conversation:
             return jsonify({"error": "Not found."}), 404
 
-        runtime_state = create_canvas_runtime_state(find_latest_canvas_documents(messages))
+        latest_canvas_state = find_latest_canvas_state(messages)
+        runtime_state = create_canvas_runtime_state(
+            latest_canvas_state.get("documents"),
+            active_document_id=latest_canvas_state.get("active_document_id"),
+        )
         current_documents = get_canvas_runtime_documents(runtime_state)
         if not current_documents:
             return jsonify({"error": "Canvas document not found."}), 404
@@ -204,7 +212,7 @@ def register_conversation_routes(app) -> None:
             if clear_all:
                 result = clear_canvas(runtime_state)
             else:
-                result = delete_canvas_document(runtime_state, document_id=document_id)
+                result = delete_canvas_document(runtime_state, document_id=document_id, document_path=document_path)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 404
 
@@ -212,6 +220,7 @@ def register_conversation_routes(app) -> None:
         metadata = serialize_message_metadata(
             {
                 "canvas_documents": next_documents,
+                "active_document_id": get_canvas_runtime_active_document_id(runtime_state),
                 "canvas_cleared": not next_documents,
             }
         )
@@ -241,6 +250,83 @@ def register_conversation_routes(app) -> None:
                 "active_document_id": active_document_id,
                 "remaining_count": len(next_documents),
                 "deleted_document_id": result.get("deleted_id"),
+                "messages": updated_messages,
+            }
+        )
+
+    @app.route("/api/conversations/<int:conv_id>/canvas", methods=["PATCH"])
+    def update_canvas(conv_id):
+        data = request.get_json(silent=True) or {}
+        document_id = str(data.get("document_id") or "").strip() or None
+        document_path = str(data.get("document_path") or "").strip() or None
+        content = data.get("content")
+        title = data.get("title")
+        format_name = data.get("format")
+        language = data.get("language")
+
+        if content is None and title is None and format_name is None and language is None:
+            return jsonify({"error": "Provide at least one canvas field to update."}), 400
+
+        conversation, messages = _load_conversation_payload(conv_id)
+        if not conversation:
+            return jsonify({"error": "Not found."}), 404
+
+        latest_canvas_state = find_latest_canvas_state(messages)
+        runtime_state = create_canvas_runtime_state(
+            latest_canvas_state.get("documents"),
+            active_document_id=latest_canvas_state.get("active_document_id"),
+        )
+        current_documents = get_canvas_runtime_documents(runtime_state)
+        if not current_documents:
+            return jsonify({"error": "Canvas document not found."}), 404
+
+        try:
+            active_document = find_latest_canvas_document(messages, document_id=document_id, document_path=document_path)
+            if not active_document:
+                return jsonify({"error": "Canvas document not found."}), 404
+            result = rewrite_canvas_document(
+                runtime_state,
+                content=active_document.get("content") if content is None else str(content),
+                document_id=document_id,
+                document_path=document_path,
+                title=title,
+                format_name=format_name,
+                language_name=language,
+            )
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+        next_documents = get_canvas_runtime_documents(runtime_state)
+        metadata = serialize_message_metadata(
+            {
+                "canvas_documents": next_documents,
+                "active_document_id": get_canvas_runtime_active_document_id(runtime_state),
+                "canvas_cleared": not next_documents,
+            }
+        )
+
+        with get_db() as conn:
+            insert_message(
+                conn,
+                conv_id,
+                "tool",
+                "",
+                metadata=metadata,
+            )
+            conn.execute(
+                "UPDATE conversations SET updated_at = datetime('now') WHERE id = ?",
+                (conv_id,),
+            )
+
+        if RAG_ENABLED:
+            sync_conversations_to_rag_safe(conversation_id=conv_id)
+
+        _, updated_messages = _load_conversation_payload(conv_id)
+        return jsonify(
+            {
+                "document": result,
+                "documents": next_documents,
+                "active_document_id": result.get("id"),
                 "messages": updated_messages,
             }
         )
@@ -295,6 +381,29 @@ def register_conversation_routes(app) -> None:
             sync_conversations_to_rag_safe(conversation_id=pruned_message["conversation_id"])
 
         return jsonify({"message": pruned_message, "pruned": True})
+
+    @app.route("/api/conversations/<int:conv_id>/prune-batch", methods=["POST"])
+    def prune_conversation_batch_route(conv_id):
+        with get_db() as conn:
+            conv = conn.execute(
+                "SELECT id FROM conversations WHERE id = ?", (conv_id,)
+            ).fetchone()
+            if not conv:
+                return jsonify({"error": "Not found."}), 404
+
+        data = request.get_json(silent=True) or {}
+        try:
+            count = max(1, min(50, int(data.get("count", 1))))
+        except (TypeError, ValueError):
+            return jsonify({"error": "count must be an integer between 1 and 50."}), 400
+
+        pruned_count = prune_conversation_batch(conv_id, count)
+        messages = get_conversation_messages(conv_id)
+
+        if RAG_ENABLED:
+            sync_conversations_to_rag_safe(conversation_id=conv_id)
+
+        return jsonify({"pruned_count": pruned_count, "messages": messages})
 
     @app.route("/api/conversations/<int:conv_id>", methods=["DELETE"])
     def delete_conversation(conv_id):

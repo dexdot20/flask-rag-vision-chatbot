@@ -46,7 +46,26 @@ CANVAS_MAX_DOCUMENTS = 12
 CANVAS_MAX_TITLE_LENGTH = 160
 CANVAS_MAX_CONTENT_LENGTH = 120_000
 CANVAS_MAX_LANGUAGE_LENGTH = 48
-CANVAS_ALLOWED_FORMATS = {"markdown"}
+CANVAS_MAX_PATH_LENGTH = 240
+CANVAS_MAX_SUMMARY_LENGTH = 280
+CANVAS_MAX_SCOPE_ID_LENGTH = 80
+CANVAS_MAX_RELATION_COUNT = 24
+CANVAS_MAX_RELATION_ITEM_LENGTH = 120
+CANVAS_CONTEXT_MAX_CHARS = 20_000
+CANVAS_CONTEXT_MAX_LINES = 800
+CANVAS_ALLOWED_FORMATS = {"markdown", "code"}
+CANVAS_ALLOWED_ROLES = {"source", "config", "dependency", "docs", "test", "script", "note"}
+CANVAS_MODE_DOCUMENT = "document"
+CANVAS_MODE_PROJECT = "project"
+CANVAS_FILE_PRIORITY = {
+    "source": 10,
+    "config": 20,
+    "dependency": 30,
+    "test": 40,
+    "script": 50,
+    "docs": 60,
+    "note": 70,
+}
 
 
 def _normalize_line_endings(text: str) -> str:
@@ -71,6 +90,372 @@ def _normalize_canvas_language(value) -> str | None:
     return language or None
 
 
+def _normalize_canvas_short_text(value, max_length: int) -> str | None:
+    text = re.sub(r"\s+", " ", _normalize_line_endings(str(value or "")).strip())[:max_length]
+    return text or None
+
+
+def _normalize_canvas_identifier(value) -> str | None:
+    identifier = re.sub(r"[^a-z0-9_.:-]", "", str(value or "").strip().lower())[:CANVAS_MAX_SCOPE_ID_LENGTH]
+    return identifier or None
+
+
+def _normalize_canvas_path(value) -> str | None:
+    raw_path = _normalize_line_endings(str(value or "")).strip().replace("\\", "/")
+    if not raw_path:
+        return None
+    raw_path = re.sub(r"/{2,}", "/", raw_path)
+    while raw_path.startswith("./"):
+        raw_path = raw_path[2:]
+    raw_path = raw_path.lstrip("/")
+
+    normalized_parts = []
+    for part in raw_path.split("/"):
+        cleaned_part = part.strip()
+        if not cleaned_part or cleaned_part == ".":
+            continue
+        if cleaned_part == "..":
+            if normalized_parts:
+                normalized_parts.pop()
+            continue
+        normalized_parts.append(cleaned_part)
+
+    normalized_path = "/".join(normalized_parts)[:CANVAS_MAX_PATH_LENGTH]
+    return normalized_path or None
+
+
+def _normalize_canvas_role(value) -> str | None:
+    role = re.sub(r"[^a-z]", "", str(value or "").strip().lower())
+    if role in CANVAS_ALLOWED_ROLES:
+        return role
+    return None
+
+
+def _normalize_canvas_string_list(values) -> list[str]:
+    if not isinstance(values, (list, tuple, set)):
+        return []
+
+    normalized = []
+    seen = set()
+    for raw_value in values:
+        item = _normalize_canvas_short_text(raw_value, CANVAS_MAX_RELATION_ITEM_LENGTH)
+        if not item:
+            continue
+        dedupe_key = item.lower()
+        if dedupe_key in seen:
+            continue
+        normalized.append(item)
+        seen.add(dedupe_key)
+        if len(normalized) >= CANVAS_MAX_RELATION_COUNT:
+            break
+    return normalized
+
+
+def _infer_canvas_role(path: str | None, title: str, format_name: str) -> str | None:
+    candidate = (path or title or "").strip().lower()
+    if not candidate:
+        return None
+    filename = candidate.rsplit("/", 1)[-1]
+    if filename.startswith("test_") or "/tests/" in f"/{candidate}" or candidate.endswith("_test.py"):
+        return "test"
+    if filename in {"readme", "readme.md", "readme.txt"} or candidate.startswith("docs/"):
+        return "docs"
+    if filename in {"requirements.txt", "requirements-dev.txt", "package.json", "pyproject.toml", ".env", ".env.example"}:
+        return "dependency" if "requirements" in filename or filename == "package.json" else "config"
+    if filename.endswith((".ini", ".cfg", ".toml", ".yaml", ".yml", ".json", ".env")):
+        return "config"
+    if filename.endswith((".sh", ".bash")):
+        return "script"
+    if format_name == "code":
+        return "source"
+    return "note"
+
+
+def _build_canvas_summary(title: str, path: str | None, role: str | None, content: str) -> str:
+    label = path or title or "Canvas"
+    first_meaningful_line = ""
+    for line in _normalize_line_endings(content).split("\n"):
+        stripped = re.sub(r"\s+", " ", line.strip())
+        if not stripped:
+            continue
+        first_meaningful_line = stripped.lstrip("#*- ").strip()
+        if first_meaningful_line:
+            break
+
+    role_label = (role or "document").replace("_", " ")
+    if first_meaningful_line:
+        return f"{role_label.capitalize()} {label}: {first_meaningful_line}"[:CANVAS_MAX_SUMMARY_LENGTH]
+    return f"{role_label.capitalize()} {label}"[:CANVAS_MAX_SUMMARY_LENGTH]
+
+
+def _number_canvas_lines(content: str, *, max_lines: int = CANVAS_CONTEXT_MAX_LINES, max_chars: int = CANVAS_CONTEXT_MAX_CHARS) -> tuple[list[str], bool]:
+    normalized = _normalize_line_endings(content)
+    all_lines = normalized.split("\n") if normalized else []
+    visible_lines = []
+    visible_char_count = 0
+
+    for index, line in enumerate(all_lines, start=1):
+        numbered_line = f"{index}: {line}"
+        extra_chars = len(numbered_line) + (1 if visible_lines else 0)
+        if visible_lines and (len(visible_lines) >= max_lines or visible_char_count + extra_chars > max_chars):
+            return visible_lines, True
+        if not visible_lines and extra_chars > max_chars:
+            visible_lines.append(numbered_line[:max_chars])
+            return visible_lines, True
+        visible_lines.append(numbered_line)
+        visible_char_count += extra_chars
+
+    return visible_lines, False
+
+
+def build_canvas_relationship_map(documents: list[dict] | None) -> dict | None:
+    normalized_documents = extract_canvas_documents({"canvas_documents": documents or []})
+    if not normalized_documents:
+        return None
+
+    files = []
+    aggregate_imports = []
+    aggregate_exports = []
+    aggregate_symbols = []
+    aggregate_dependencies = []
+    seen_buckets = {
+        "imports": set(),
+        "exports": set(),
+        "symbols": set(),
+        "dependencies": set(),
+    }
+
+    for document in sorted(normalized_documents, key=_document_sort_key):
+        entry = {
+            "file": document.get("path") or document.get("title") or document.get("id"),
+            "role": document.get("role") or "note",
+        }
+        for key in ("imports", "exports", "symbols", "dependencies"):
+            values = document.get(key) if isinstance(document.get(key), list) else []
+            if values:
+                entry[key] = values[:8]
+            for value in values:
+                normalized_value = str(value).strip()
+                dedupe_key = normalized_value.lower()
+                if not normalized_value or dedupe_key in seen_buckets[key]:
+                    continue
+                seen_buckets[key].add(dedupe_key)
+                if key == "imports":
+                    aggregate_imports.append(normalized_value)
+                elif key == "exports":
+                    aggregate_exports.append(normalized_value)
+                elif key == "symbols":
+                    aggregate_symbols.append(normalized_value)
+                elif key == "dependencies":
+                    aggregate_dependencies.append(normalized_value)
+        files.append(entry)
+
+    return {
+        "files": files,
+        "imports": aggregate_imports[:24],
+        "exports": aggregate_exports[:24],
+        "symbols": aggregate_symbols[:24],
+        "dependencies": aggregate_dependencies[:24],
+    }
+
+
+def _resolve_active_canvas_document(documents: list[dict], active_document_id: str | None = None) -> dict | None:
+    target_id = str(active_document_id or "").strip()
+    if target_id:
+        for document in documents:
+            if str(document.get("id") or "") == target_id:
+                return document
+    return documents[-1] if documents else None
+
+
+def _document_sort_key(document: dict) -> tuple[int, str, str, str]:
+    role = str(document.get("role") or "note")
+    priority = CANVAS_FILE_PRIORITY.get(role, 999)
+    path = str(document.get("path") or "").strip().lower()
+    title = str(document.get("title") or "").strip().lower()
+    document_id = str(document.get("id") or "").strip()
+    return priority, path, title, document_id
+
+
+def _normalize_document_path_for_lookup(document_path: str | None) -> str | None:
+    normalized_path = _normalize_canvas_path(document_path)
+    return normalized_path or None
+
+
+def extract_canvas_primary_locator(document: dict | None) -> dict | None:
+    if not isinstance(document, dict):
+        return None
+    path = _normalize_document_path_for_lookup(document.get("path"))
+    if path:
+        return {"type": "path", "value": path}
+    document_id = str(document.get("id") or "").strip()
+    if document_id:
+        return {"type": "id", "value": document_id}
+    return None
+
+
+def extract_canvas_active_document_id(metadata: dict | None, documents: list[dict] | None = None) -> str | None:
+    source = metadata if isinstance(metadata, dict) else {}
+    normalized_documents = documents if isinstance(documents, list) else extract_canvas_documents(source)
+    active_document_id = str(source.get("active_document_id") or "").strip()[:80]
+    if active_document_id and any(str(document.get("id") or "") == active_document_id for document in normalized_documents):
+        return active_document_id
+    active_document = _resolve_active_canvas_document(normalized_documents)
+    if not active_document:
+        return None
+    return str(active_document.get("id") or "").strip() or None
+
+
+def determine_canvas_mode(documents: list[dict] | None) -> str:
+    normalized_documents = documents if isinstance(documents, list) else []
+    scope_ids = {
+        str(document.get("project_id") or document.get("workspace_id") or "").strip()
+        for document in normalized_documents
+        if str(document.get("project_id") or document.get("workspace_id") or "").strip()
+    }
+    paths = {str(document.get("path") or "").strip() for document in normalized_documents if str(document.get("path") or "").strip()}
+    if len(normalized_documents) > 1 or scope_ids or len(paths) > 1:
+        return CANVAS_MODE_PROJECT
+    return CANVAS_MODE_DOCUMENT
+
+
+def _infer_canvas_target_type(documents: list[dict], active_document: dict | None) -> str:
+    active_path = str((active_document or {}).get("path") or "").lower()
+    dependency_paths = {
+        str(document.get("path") or "").lower()
+        for document in documents
+        if str(document.get("role") or "") == "dependency"
+    }
+    if active_path.endswith(".py") or "pyproject.toml" in dependency_paths or "requirements.txt" in dependency_paths:
+        return "python-project"
+    if any(str(document.get("role") or "") == "source" for document in documents):
+        return "multi-file-project"
+    return "document-set"
+
+
+def _infer_manifest_name(documents: list[dict], active_document: dict | None) -> str:
+    active_document = active_document or {}
+    for key in ("project_id", "workspace_id"):
+        value = str(active_document.get(key) or "").strip()
+        if value:
+            return value
+    for document in documents:
+        for key in ("project_id", "workspace_id"):
+            value = str(document.get(key) or "").strip()
+            if value:
+                return value
+    active_path = str(active_document.get("path") or "").strip()
+    if active_path:
+        top_level = active_path.split("/", 1)[0].strip()
+        if top_level:
+            return top_level
+    return str(active_document.get("title") or "Canvas").strip() or "Canvas"
+
+
+def build_canvas_project_manifest(documents: list[dict] | None, active_document_id: str | None = None) -> dict | None:
+    raw_documents = documents or []
+    normalized_documents = extract_canvas_documents({"canvas_documents": raw_documents})
+    if not normalized_documents:
+        return None
+
+    raw_normalized_documents = [
+        cleaned
+        for cleaned in (normalize_canvas_document(entry) for entry in raw_documents[:CANVAS_MAX_DOCUMENTS])
+        if cleaned
+    ]
+
+    active_document = _resolve_active_canvas_document(normalized_documents, active_document_id)
+    mode = determine_canvas_mode(raw_normalized_documents or normalized_documents)
+    dependency_summaries = []
+    seen_dependency_summaries = set()
+    open_issues = []
+    file_list = []
+
+    missing_paths = 0
+    missing_roles = 0
+    for document in normalized_documents:
+        summary = str(document.get("summary") or "").strip() or _build_canvas_summary(
+            str(document.get("title") or "Canvas"),
+            document.get("path"),
+            document.get("role"),
+            str(document.get("content") or ""),
+        )
+        role = str(document.get("role") or "note")
+        entry = {
+            "id": document["id"],
+            "title": document["title"],
+            "format": document["format"],
+            "summary": summary,
+            "line_count": int(document.get("line_count") or 0),
+            "active": active_document is not None and document["id"] == active_document["id"],
+            "priority": CANVAS_FILE_PRIORITY.get(role, 999),
+        }
+        for key in ("path", "role", "language", "project_id", "workspace_id"):
+            if document.get(key):
+                entry[key] = document[key]
+        for key in ("imports", "exports", "symbols", "dependencies"):
+            values = document.get(key) if isinstance(document.get(key), list) else []
+            if values:
+                entry[key] = values[:8]
+        file_list.append(entry)
+
+        if mode == CANVAS_MODE_PROJECT and not document.get("path"):
+            missing_paths += 1
+        if mode == CANVAS_MODE_PROJECT and not document.get("role"):
+            missing_roles += 1
+
+        dependency_values = document.get("dependencies") if isinstance(document.get("dependencies"), list) else []
+        for value in dependency_values:
+            normalized_value = str(value).strip()
+            dedupe_key = normalized_value.lower()
+            if not normalized_value or dedupe_key in seen_dependency_summaries:
+                continue
+            dependency_summaries.append(normalized_value)
+            seen_dependency_summaries.add(dedupe_key)
+
+    if mode == CANVAS_MODE_PROJECT and missing_paths:
+        open_issues.append("Some project canvas documents are missing a path.")
+    if mode == CANVAS_MODE_PROJECT and missing_roles:
+        open_issues.append("Some project canvas documents are missing a role.")
+
+    file_list.sort(key=_document_sort_key)
+
+    validation_issues = []
+    if mode == CANVAS_MODE_PROJECT:
+        raw_normalized_paths = []
+        for entry in raw_documents[:CANVAS_MAX_DOCUMENTS]:
+            if not isinstance(entry, dict):
+                continue
+            path = _normalize_document_path_for_lookup(entry.get("path"))
+            if path:
+                raw_normalized_paths.append(path.lower())
+        if len(raw_normalized_paths) != len(set(raw_normalized_paths)):
+            validation_issues.append("Duplicate project paths detected.")
+        active_paths = [entry.get("path") for entry in file_list if entry.get("path")]
+        if not any((entry.get("role") == "source") for entry in file_list):
+            validation_issues.append("No source file is marked in the project manifest.")
+
+    manifest = {
+        "mode": mode,
+        "project_name": _infer_manifest_name(normalized_documents, active_document),
+        "target_type": _infer_canvas_target_type(normalized_documents, active_document),
+        "document_count": len(normalized_documents),
+        "active_document_id": active_document["id"] if active_document else None,
+        "active_path": active_document.get("path") if active_document else None,
+        "active_file": active_document.get("path") or active_document.get("title") if active_document else None,
+        "file_list": file_list,
+        "open_issues": [*open_issues, *validation_issues],
+        "last_validation_status": "ok" if not validation_issues else "needs_attention",
+        "dependency_summaries": dependency_summaries[:16],
+        "relationship_map": build_canvas_relationship_map(normalized_documents),
+    }
+    if active_document and active_document.get("project_id"):
+        manifest["project_id"] = active_document["project_id"]
+    if active_document and active_document.get("workspace_id"):
+        manifest["workspace_id"] = active_document["workspace_id"]
+    return manifest
+
+
 def normalize_canvas_document(value, *, fallback_title: str = "Canvas") -> dict | None:
     if not isinstance(value, dict):
         return None
@@ -83,8 +468,17 @@ def normalize_canvas_document(value, *, fallback_title: str = "Canvas") -> dict 
 
     content = _clip_text(value.get("content") or "", CANVAS_MAX_CONTENT_LENGTH)
     language = _normalize_canvas_language(value.get("language"))
+    path = _normalize_canvas_path(value.get("path"))
     created_at = str(value.get("created_at") or "").strip()[:80]
     updated_at = str(value.get("updated_at") or "").strip()[:80]
+    role = _normalize_canvas_role(value.get("role")) or _infer_canvas_role(path, title, format_name)
+    summary = _normalize_canvas_short_text(value.get("summary"), CANVAS_MAX_SUMMARY_LENGTH)
+    imports = _normalize_canvas_string_list(value.get("imports"))
+    exports = _normalize_canvas_string_list(value.get("exports"))
+    symbols = _normalize_canvas_string_list(value.get("symbols"))
+    dependencies = _normalize_canvas_string_list(value.get("dependencies"))
+    project_id = _normalize_canvas_identifier(value.get("project_id"))
+    workspace_id = _normalize_canvas_identifier(value.get("workspace_id"))
 
     cleaned = {
         "id": document_id,
@@ -94,8 +488,26 @@ def normalize_canvas_document(value, *, fallback_title: str = "Canvas") -> dict 
         "line_count": _line_count(content),
     }
 
+    if path:
+        cleaned["path"] = path
+    if role:
+        cleaned["role"] = role
+    cleaned["summary"] = summary or _build_canvas_summary(title, path, role, content)
+
     if language:
         cleaned["language"] = language
+    if imports:
+        cleaned["imports"] = imports
+    if exports:
+        cleaned["exports"] = exports
+    if symbols:
+        cleaned["symbols"] = symbols
+    if dependencies:
+        cleaned["dependencies"] = dependencies
+    if project_id:
+        cleaned["project_id"] = project_id
+    if workspace_id:
+        cleaned["workspace_id"] = workspace_id
 
     if created_at:
         cleaned["created_at"] = created_at
@@ -117,14 +529,20 @@ def extract_canvas_documents(metadata: dict | None) -> list[dict]:
 
     normalized = []
     seen_ids = set()
+    seen_paths = set()
     for entry in raw_documents[:CANVAS_MAX_DOCUMENTS]:
         cleaned = normalize_canvas_document(entry)
         if not cleaned:
             continue
         if cleaned["id"] in seen_ids:
             continue
+        normalized_path = str(cleaned.get("path") or "").strip().lower()
+        if normalized_path and normalized_path in seen_paths:
+            continue
         normalized.append(cleaned)
         seen_ids.add(cleaned["id"])
+        if normalized_path:
+            seen_paths.add(normalized_path)
     return normalized
 
 
@@ -139,12 +557,34 @@ def join_canvas_lines(lines: Iterable[str]) -> str:
     return "\n".join(str(line) for line in lines)
 
 
-def create_canvas_runtime_state(initial_documents: list[dict] | None = None) -> dict:
+def create_canvas_runtime_state(initial_documents: list[dict] | None = None, active_document_id: str | None = None) -> dict:
     documents = extract_canvas_documents({"canvas_documents": initial_documents or []})
-    active_document_id = documents[-1]["id"] if documents else None
+    resolved_active_document_id = extract_canvas_active_document_id({"active_document_id": active_document_id}, documents)
+    runtime_state = {
+        "documents": documents,
+        "active_document_id": resolved_active_document_id,
+    }
+    runtime_state["mode"] = determine_canvas_mode(documents)
+    return runtime_state
+
+
+def get_canvas_runtime_active_document_id(runtime_state: dict | None) -> str | None:
+    if not isinstance(runtime_state, dict):
+        return None
+    return extract_canvas_active_document_id(
+        {"active_document_id": runtime_state.get("active_document_id")},
+        runtime_state.get("documents") if isinstance(runtime_state.get("documents"), list) else [],
+    )
+
+
+def get_canvas_runtime_snapshot(runtime_state: dict | None) -> dict:
+    documents = get_canvas_runtime_documents(runtime_state)
+    active_document_id = get_canvas_runtime_active_document_id(runtime_state)
     return {
         "documents": documents,
         "active_document_id": active_document_id,
+        "mode": determine_canvas_mode(documents),
+        "manifest": build_canvas_project_manifest(documents, active_document_id=active_document_id),
     }
 
 
@@ -154,16 +594,38 @@ def get_canvas_runtime_documents(runtime_state: dict | None) -> list[dict]:
     return extract_canvas_documents({"canvas_documents": runtime_state.get("documents") or []})
 
 
-def _find_canvas_document(runtime_state: dict, document_id: str | None = None) -> tuple[int, dict]:
+def _refresh_canvas_runtime_state(runtime_state: dict) -> None:
+    documents = get_canvas_runtime_documents(runtime_state)
+    runtime_state["documents"] = documents
+    runtime_state["active_document_id"] = extract_canvas_active_document_id(
+        {"active_document_id": runtime_state.get("active_document_id")},
+        documents,
+    )
+    runtime_state["mode"] = determine_canvas_mode(documents)
+
+
+def _find_canvas_document(
+    runtime_state: dict,
+    document_id: str | None = None,
+    document_path: str | None = None,
+) -> tuple[int, dict]:
     documents = runtime_state.get("documents") if isinstance(runtime_state, dict) else None
     if not isinstance(documents, list) or not documents:
         raise ValueError("No canvas document is available yet.")
+
+    normalized_path = _normalize_document_path_for_lookup(document_path)
+    if normalized_path:
+        for index, document in enumerate(documents):
+            if str(document.get("path") or "").strip().lower() == normalized_path.lower():
+                return index, document
+        raise ValueError(f"Canvas document not found for path: {normalized_path}")
 
     target_id = str(document_id or runtime_state.get("active_document_id") or "").strip()
     if target_id:
         for index, document in enumerate(documents):
             if str(document.get("id") or "") == target_id:
                 return index, document
+        raise ValueError(f"Canvas document not found for id: {target_id}")
 
     return len(documents) - 1, documents[-1]
 
@@ -185,6 +647,7 @@ def _store_canvas_document(runtime_state: dict, document: dict) -> dict:
         if len(documents) > CANVAS_MAX_DOCUMENTS:
             documents[:] = documents[-CANVAS_MAX_DOCUMENTS:]
     runtime_state["active_document_id"] = normalized["id"]
+    _refresh_canvas_runtime_state(runtime_state)
     return normalized
 
 
@@ -194,6 +657,15 @@ def create_canvas_document(
     content: str,
     format_name: str = "markdown",
     language_name: str | None = None,
+    path: str | None = None,
+    role: str | None = None,
+    summary: str | None = None,
+    imports: list[str] | None = None,
+    exports: list[str] | None = None,
+    symbols: list[str] | None = None,
+    dependencies: list[str] | None = None,
+    project_id: str | None = None,
+    workspace_id: str | None = None,
 ) -> dict:
     normalized = normalize_canvas_document(
         {
@@ -202,6 +674,15 @@ def create_canvas_document(
             "format": format_name,
             "content": content,
             "language": language_name,
+            "path": path,
+            "role": role,
+            "summary": summary,
+            "imports": imports,
+            "exports": exports,
+            "symbols": symbols,
+            "dependencies": dependencies,
+            "project_id": project_id,
+            "workspace_id": workspace_id,
         }
     )
     return _store_canvas_document(runtime_state, normalized)
@@ -211,21 +692,59 @@ def rewrite_canvas_document(
     runtime_state: dict,
     content: str,
     document_id: str | None = None,
+    document_path: str | None = None,
     title: str | None = None,
+    format_name: str | None = None,
     language_name: str | None = None,
+    path: str | None = None,
+    role: str | None = None,
+    summary: str | None = None,
+    imports: list[str] | None = None,
+    exports: list[str] | None = None,
+    symbols: list[str] | None = None,
+    dependencies: list[str] | None = None,
+    project_id: str | None = None,
+    workspace_id: str | None = None,
 ) -> dict:
-    _, document = _find_canvas_document(runtime_state, document_id=document_id)
+    _, document = _find_canvas_document(runtime_state, document_id=document_id, document_path=document_path)
     next_document = dict(document)
     next_document["content"] = _clip_text(content, CANVAS_MAX_CONTENT_LENGTH)
     if title is not None:
         next_document["title"] = str(title or "Canvas").strip()[:CANVAS_MAX_TITLE_LENGTH] or "Canvas"
+    if format_name is not None:
+        next_document["format"] = format_name
     if language_name is not None:
         next_document["language"] = language_name
+    if path is not None:
+        next_document["path"] = path
+    if role is not None:
+        next_document["role"] = role
+    if summary is not None:
+        next_document["summary"] = summary
+    if imports is not None:
+        next_document["imports"] = imports
+    if exports is not None:
+        next_document["exports"] = exports
+    if symbols is not None:
+        next_document["symbols"] = symbols
+    if dependencies is not None:
+        next_document["dependencies"] = dependencies
+    if project_id is not None:
+        next_document["project_id"] = project_id
+    if workspace_id is not None:
+        next_document["workspace_id"] = workspace_id
     return _store_canvas_document(runtime_state, next_document)
 
 
-def replace_canvas_lines(runtime_state: dict, start_line: int, end_line: int, lines: list[str], document_id: str | None = None) -> dict:
-    _, document = _find_canvas_document(runtime_state, document_id=document_id)
+def replace_canvas_lines(
+    runtime_state: dict,
+    start_line: int,
+    end_line: int,
+    lines: list[str],
+    document_id: str | None = None,
+    document_path: str | None = None,
+) -> dict:
+    _, document = _find_canvas_document(runtime_state, document_id=document_id, document_path=document_path)
     existing_lines = list_canvas_lines(document.get("content") or "")
     if start_line < 1 or end_line < start_line:
         raise ValueError("start_line and end_line must define a valid 1-based inclusive range.")
@@ -241,8 +760,14 @@ def replace_canvas_lines(runtime_state: dict, start_line: int, end_line: int, li
     return _store_canvas_document(runtime_state, next_document)
 
 
-def insert_canvas_lines(runtime_state: dict, after_line: int, lines: list[str], document_id: str | None = None) -> dict:
-    _, document = _find_canvas_document(runtime_state, document_id=document_id)
+def insert_canvas_lines(
+    runtime_state: dict,
+    after_line: int,
+    lines: list[str],
+    document_id: str | None = None,
+    document_path: str | None = None,
+) -> dict:
+    _, document = _find_canvas_document(runtime_state, document_id=document_id, document_path=document_path)
     existing_lines = list_canvas_lines(document.get("content") or "")
     if after_line < 0 or after_line > len(existing_lines):
         raise ValueError("after_line must be between 0 and the current line count.")
@@ -254,18 +779,29 @@ def insert_canvas_lines(runtime_state: dict, after_line: int, lines: list[str], 
     return _store_canvas_document(runtime_state, next_document)
 
 
-def delete_canvas_lines(runtime_state: dict, start_line: int, end_line: int, document_id: str | None = None) -> dict:
-    return replace_canvas_lines(runtime_state, start_line, end_line, [], document_id=document_id)
+def delete_canvas_lines(
+    runtime_state: dict,
+    start_line: int,
+    end_line: int,
+    document_id: str | None = None,
+    document_path: str | None = None,
+) -> dict:
+    return replace_canvas_lines(runtime_state, start_line, end_line, [], document_id=document_id, document_path=document_path)
 
 
-def delete_canvas_document(runtime_state: dict, document_id: str | None = None) -> dict:
-    index, document = _find_canvas_document(runtime_state, document_id=document_id)
+def delete_canvas_document(
+    runtime_state: dict,
+    document_id: str | None = None,
+    document_path: str | None = None,
+) -> dict:
+    index, document = _find_canvas_document(runtime_state, document_id=document_id, document_path=document_path)
     documents = runtime_state.get("documents") if isinstance(runtime_state, dict) else None
     if not isinstance(documents, list):
         raise ValueError("No canvas document is available yet.")
 
     removed = documents.pop(index)
     runtime_state["active_document_id"] = documents[-1]["id"] if documents else None
+    _refresh_canvas_runtime_state(runtime_state)
     return {
         "status": "ok",
         "action": "deleted",
@@ -280,6 +816,7 @@ def clear_canvas(runtime_state: dict) -> dict:
     cleared_count = len(documents)
     runtime_state["documents"] = []
     runtime_state["active_document_id"] = None
+    runtime_state["mode"] = CANVAS_MODE_DOCUMENT
     return {
         "status": "ok",
         "action": "cleared",
@@ -297,6 +834,7 @@ def build_canvas_tool_result(document: dict, *, action: str) -> dict:
         "action": action,
         "document": normalized,
         "document_id": normalized["id"],
+        "primary_locator": extract_canvas_primary_locator(normalized),
         "title": normalized["title"],
         "format": normalized["format"],
         "line_count": normalized["line_count"],
@@ -305,32 +843,97 @@ def build_canvas_tool_result(document: dict, *, action: str) -> dict:
     }
     if normalized.get("language"):
         result["language"] = normalized["language"]
+    for key in ("path", "role", "summary", "project_id", "workspace_id"):
+        if normalized.get(key):
+            result[key] = normalized[key]
+    for key in ("imports", "exports", "symbols", "dependencies"):
+        values = normalized.get(key) if isinstance(normalized.get(key), list) else []
+        if values:
+            result[key] = values
     return result
 
 
-def find_latest_canvas_documents(messages: list[dict]) -> list[dict]:
+def build_canvas_document_context_result(
+    runtime_state: dict,
+    *,
+    document_id: str | None = None,
+    document_path: str | None = None,
+) -> dict:
+    _, document = _find_canvas_document(runtime_state, document_id=document_id, document_path=document_path)
+    normalized = normalize_canvas_document(document)
+    if not normalized:
+        raise ValueError("Canvas document is invalid.")
+
+    numbered_lines, is_truncated = _number_canvas_lines(normalized.get("content") or "")
+    documents = get_canvas_runtime_documents(runtime_state)
+    manifest = build_canvas_project_manifest(documents, active_document_id=get_canvas_runtime_active_document_id(runtime_state))
+    relationship_map = build_canvas_relationship_map(documents)
+    return {
+        "status": "ok",
+        "action": "expanded",
+        "document": normalized,
+        "document_id": normalized["id"],
+        "document_path": normalized.get("path"),
+        "title": normalized["title"],
+        "format": normalized["format"],
+        "language": normalized.get("language"),
+        "role": normalized.get("role"),
+        "summary": normalized.get("summary"),
+        "line_count": normalized.get("line_count"),
+        "visible_lines": numbered_lines,
+        "visible_line_end": len(numbered_lines),
+        "is_truncated": is_truncated,
+        "primary_locator": extract_canvas_primary_locator(normalized),
+        "manifest_excerpt": {
+            "project_name": (manifest or {}).get("project_name"),
+            "target_type": (manifest or {}).get("target_type"),
+            "active_file": (manifest or {}).get("active_file"),
+        },
+        "relationship_map": relationship_map,
+    }
+
+
+def find_latest_canvas_state(messages: list[dict]) -> dict:
     for message in reversed(messages or []):
         metadata = message.get("metadata") if isinstance(message, dict) else None
         if isinstance(metadata, dict) and metadata.get("canvas_cleared") is True:
-            return []
+            return create_canvas_runtime_state([], active_document_id=None)
         documents = extract_canvas_documents(metadata)
         if not documents:
             continue
-        message_id = message.get("id") if isinstance(message.get("id"), int) else None
-        results = []
-        for document in documents:
-            result = dict(document)
-            if message_id is not None:
-                result["source_message_id"] = message_id
-            results.append(result)
-        return results
-    return []
+        active_document_id = extract_canvas_active_document_id(metadata, documents)
+        return create_canvas_runtime_state(documents, active_document_id=active_document_id)
+    return create_canvas_runtime_state()
 
 
-def find_latest_canvas_document(messages: list[dict], document_id: str | None = None) -> dict | None:
+def find_latest_canvas_documents(messages: list[dict]) -> list[dict]:
+    runtime_state = find_latest_canvas_state(messages)
+    message_id = None
+    for message in reversed(messages or []):
+        metadata = message.get("metadata") if isinstance(message, dict) else None
+        if isinstance(metadata, dict) and extract_canvas_documents(metadata):
+            message_id = message.get("id") if isinstance(message.get("id"), int) else None
+            break
+    results = []
+    for document in get_canvas_runtime_documents(runtime_state):
+        result = dict(document)
+        if message_id is not None:
+            result["source_message_id"] = message_id
+        results.append(result)
+    return results
+
+
+def find_latest_canvas_document(
+    messages: list[dict],
+    document_id: str | None = None,
+    document_path: str | None = None,
+) -> dict | None:
     target_id = str(document_id or "").strip()
+    target_path = _normalize_document_path_for_lookup(document_path)
     for document in reversed(find_latest_canvas_documents(messages)):
-        if not target_id or document.get("id") == target_id:
+        if target_path and str(document.get("path") or "").strip().lower() == target_path.lower():
+            return dict(document)
+        if not target_path and (not target_id or document.get("id") == target_id):
             return dict(document)
     return None
 
@@ -339,7 +942,11 @@ def build_markdown_download(document: dict) -> bytes:
     normalized = normalize_canvas_document(document)
     if not normalized:
         raise ValueError("Canvas document is invalid.")
-    return _normalize_line_endings(normalized["content"]).encode("utf-8")
+    content = _normalize_line_endings(normalized["content"])
+    if normalized.get("format") == "code":
+        language = normalized.get("language") or "text"
+        return f"```{language}\n{content}\n```\n".encode("utf-8")
+    return content.encode("utf-8")
 
 
 def build_html_download(document: dict) -> bytes:
@@ -348,7 +955,10 @@ def build_html_download(document: dict) -> bytes:
         raise ValueError("Canvas document is invalid.")
 
     content = _normalize_line_endings(normalized["content"])
-    if markdown_lib is not None:
+    if normalized.get("format") == "code":
+        language = escape(normalized.get("language") or "text")
+        rendered = f'<pre><code class="language-{language}">{escape(content)}</code></pre>'
+    elif markdown_lib is not None:
         rendered = markdown_lib.markdown(
             content,
             extensions=["extra", "fenced_code", "tables", "sane_lists"],
@@ -462,6 +1072,13 @@ def build_pdf_download(document: dict) -> bytes:
     )
 
     story = [Paragraph(normalized["title"], title_style), Spacer(1, 6)]
+    if normalized.get("format") == "code":
+        story.append(Preformatted(_normalize_line_endings(normalized["content"]), code_style))
+        output = BytesIO()
+        doc = SimpleDocTemplate(output, pagesize=A4, topMargin=18 * mm, bottomMargin=18 * mm)
+        doc.build(story)
+        return output.getvalue()
+
     lines = list_canvas_lines(normalized["content"])
     in_code_block = False
     code_lines: list[str] = []

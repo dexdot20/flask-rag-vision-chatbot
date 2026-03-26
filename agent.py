@@ -7,20 +7,44 @@ import json
 import logging
 import os
 import re
+import string
 from logging.handlers import RotatingFileHandler
 from uuid import uuid4
 
 from canvas_service import (
+    build_canvas_document_context_result,
     build_canvas_tool_result,
     clear_canvas,
     create_canvas_document,
     create_canvas_runtime_state,
     delete_canvas_document,
     delete_canvas_lines,
+    get_canvas_runtime_active_document_id,
     get_canvas_runtime_documents,
     insert_canvas_lines,
     replace_canvas_lines,
     rewrite_canvas_document,
+)
+from project_workspace_service import (
+    bulk_update_workspace_files,
+    build_project_plan,
+    create_directory as workspace_create_directory,
+    create_file as workspace_create_file,
+    create_project_workflow_runtime_state,
+    create_project_scaffold,
+    create_workspace_runtime_state,
+    get_workspace_file_history,
+    get_project_workflow,
+    list_dir as workspace_list_dir,
+    preview_workspace_changes,
+    redo_workspace_file_change,
+    update_project_workflow,
+    read_file as workspace_read_file,
+    search_files as workspace_search_files,
+    undo_workspace_file_change,
+    update_file as workspace_update_file,
+    validate_project_workspace,
+    write_project_tree,
 )
 from config import (
     AGENT_CONTEXT_COMPACTION_KEEP_RECENT_ROUNDS,
@@ -58,6 +82,7 @@ CONTEXT_OVERFLOW_RECOVERY_ERROR_TEXT = (
 MISSING_FINAL_ANSWER_MARKER = "[INSTRUCTION: MISSING FINAL ANSWER"
 TOOL_EXECUTION_RESULTS_MARKER = "[TOOL EXECUTION RESULTS]"
 CANVAS_TOOL_NAMES = {
+    "expand_canvas_document",
     "create_canvas_document",
     "rewrite_canvas_document",
     "replace_canvas_lines",
@@ -65,6 +90,24 @@ CANVAS_TOOL_NAMES = {
     "delete_canvas_lines",
     "delete_canvas_document",
     "clear_canvas",
+}
+CANVAS_MUTATION_TOOL_NAMES = {
+    "create_canvas_document",
+    "rewrite_canvas_document",
+    "replace_canvas_lines",
+    "insert_canvas_lines",
+    "delete_canvas_lines",
+    "delete_canvas_document",
+    "clear_canvas",
+}
+CANVAS_STREAM_OPEN_TOOL_NAMES = {
+    "create_canvas_document",
+    "rewrite_canvas_document",
+    "expand_canvas_document",
+}
+CANVAS_STREAM_CONTENT_TOOL_NAMES = {
+    "create_canvas_document",
+    "rewrite_canvas_document",
 }
 WEB_TOOL_NAMES = {
     "search_web",
@@ -739,6 +782,140 @@ def _merge_stream_tool_call_delta(tool_call_parts: list[dict], delta) -> None:
             entry["arguments_parts"].append(arguments_part)
 
 
+def _extract_partial_json_string_value(arguments_text: str, field_name: str) -> str | None:
+    raw_arguments = str(arguments_text or "")
+    raw_field_name = str(field_name or "").strip()
+    if not raw_arguments or not raw_field_name:
+        return None
+
+    depth = 0
+    in_string = False
+    escape_next = False
+    string_chars: list[str] = []
+    value_start = None
+
+    for index, char in enumerate(raw_arguments):
+        if in_string:
+            if escape_next:
+                string_chars.append(char)
+                escape_next = False
+                continue
+            if char == "\\":
+                escape_next = True
+                string_chars.append(char)
+                continue
+            if char == '"':
+                in_string = False
+                if depth == 1:
+                    candidate_key = "".join(string_chars)
+                    look_ahead = index + 1
+                    while look_ahead < len(raw_arguments) and raw_arguments[look_ahead].isspace():
+                        look_ahead += 1
+                    if candidate_key == raw_field_name and look_ahead < len(raw_arguments) and raw_arguments[look_ahead] == ":":
+                        look_ahead += 1
+                        while look_ahead < len(raw_arguments) and raw_arguments[look_ahead].isspace():
+                            look_ahead += 1
+                        if look_ahead < len(raw_arguments) and raw_arguments[look_ahead] == '"':
+                            value_start = look_ahead + 1
+                            break
+                string_chars = []
+                continue
+            string_chars.append(char)
+            continue
+
+        if char == '"':
+            in_string = True
+            escape_next = False
+            string_chars = []
+            continue
+        if char == "{":
+            depth += 1
+            continue
+        if char == "}" and depth > 0:
+            depth -= 1
+
+    if value_start is None:
+        return None
+
+    value_chars = []
+    index = value_start
+    while index < len(raw_arguments):
+        char = raw_arguments[index]
+        if char == '"':
+            return "".join(value_chars)
+        if char != "\\":
+            value_chars.append(char)
+            index += 1
+            continue
+
+        index += 1
+        if index >= len(raw_arguments):
+            break
+
+        escape_char = raw_arguments[index]
+        if escape_char in {'"', "\\", "/"}:
+            value_chars.append(escape_char)
+            index += 1
+            continue
+        if escape_char == "b":
+            value_chars.append("\b")
+            index += 1
+            continue
+        if escape_char == "f":
+            value_chars.append("\f")
+            index += 1
+            continue
+        if escape_char == "n":
+            value_chars.append("\n")
+            index += 1
+            continue
+        if escape_char == "r":
+            value_chars.append("\r")
+            index += 1
+            continue
+        if escape_char == "t":
+            value_chars.append("\t")
+            index += 1
+            continue
+        if escape_char == "u":
+            hex_value = raw_arguments[index + 1:index + 5]
+            if len(hex_value) < 4 or any(char not in string.hexdigits for char in hex_value):
+                break
+            value_chars.append(chr(int(hex_value, 16)))
+            index += 5
+            continue
+
+        value_chars.append(escape_char)
+        index += 1
+
+    return "".join(value_chars)
+
+
+def _build_streaming_canvas_tool_preview(tool_call_parts: list[dict]) -> dict | None:
+    for raw_call in tool_call_parts:
+        tool_name = str(raw_call.get("name") or "").strip()
+        if tool_name not in CANVAS_STREAM_OPEN_TOOL_NAMES:
+            continue
+
+        arguments_text = "".join(raw_call.get("arguments_parts") or [])
+        snapshot = {}
+        for field_name in ("title", "format", "language", "path", "role"):
+            value = _extract_partial_json_string_value(arguments_text, field_name)
+            if value is not None:
+                snapshot[field_name] = value
+
+        content = None
+        if tool_name in CANVAS_STREAM_CONTENT_TOOL_NAMES:
+            content = _extract_partial_json_string_value(arguments_text, "content")
+
+        return {
+            "tool": tool_name,
+            "snapshot": snapshot,
+            "content": content,
+        }
+    return None
+
+
 def _finalize_stream_tool_calls(tool_call_parts: list[dict]) -> tuple[list[dict] | None, str | None]:
     if not tool_call_parts:
         return None, None
@@ -1239,8 +1416,208 @@ def _run_create_canvas_document(tool_args: dict, runtime_state: dict):
         content=tool_args.get("content", ""),
         format_name=tool_args.get("format", "markdown"),
         language_name=tool_args.get("language"),
+        path=tool_args.get("path"),
+        role=tool_args.get("role"),
+        summary=tool_args.get("summary"),
+        imports=tool_args.get("imports"),
+        exports=tool_args.get("exports"),
+        symbols=tool_args.get("symbols"),
+        dependencies=tool_args.get("dependencies"),
+        project_id=tool_args.get("project_id"),
+        workspace_id=tool_args.get("workspace_id"),
     )
     return build_canvas_tool_result(document, action="created"), f"Canvas created: {document['title']}"
+
+
+def _run_expand_canvas_document(tool_args: dict, runtime_state: dict):
+    canvas_state = _get_canvas_runtime_state(runtime_state)
+    result = build_canvas_document_context_result(
+        canvas_state,
+        document_id=tool_args.get("document_id"),
+        document_path=tool_args.get("document_path"),
+    )
+    target_label = str(result.get("document_path") or result.get("title") or "Canvas").strip()
+    return result, f"Canvas expanded: {target_label}"
+
+
+def _get_workspace_runtime_state(runtime_state: dict) -> dict:
+    return runtime_state.setdefault("workspace", create_workspace_runtime_state())
+
+
+def _get_project_workflow_state(runtime_state: dict) -> dict:
+    return runtime_state.setdefault("project_workflow", create_project_workflow_runtime_state())
+
+
+def _run_plan_project_workspace(tool_args: dict, runtime_state: dict):
+    workflow = build_project_plan(
+        tool_args.get("goal", ""),
+        tool_args.get("project_name", "Project"),
+        target_type=tool_args.get("target_type", "python-project"),
+        files=tool_args.get("files"),
+        dependencies=tool_args.get("dependencies"),
+    )
+    stored = update_project_workflow(_get_project_workflow_state(runtime_state), **workflow)
+    return {"status": "ok", "action": "planned", "project_workflow": stored}, f"Project planned: {stored.get('project_name', '')}"
+
+
+def _run_get_project_workflow_status(tool_args: dict, runtime_state: dict):
+    del tool_args
+    workflow = get_project_workflow(_get_project_workflow_state(runtime_state))
+    return {"status": "ok", "action": "workflow_status", "project_workflow": workflow}, f"Workflow stage: {str((workflow or {}).get('stage') or 'plan')}"
+
+
+def _run_create_directory(tool_args: dict, runtime_state: dict):
+    result = workspace_create_directory(_get_workspace_runtime_state(runtime_state), tool_args.get("path", ""))
+    return result, f"Directory created: {result.get('path', '')}"
+
+
+def _run_create_file(tool_args: dict, runtime_state: dict):
+    result = workspace_create_file(
+        _get_workspace_runtime_state(runtime_state),
+        tool_args.get("path", ""),
+        tool_args.get("content", ""),
+    )
+    return result, f"File created: {result.get('path', '')}"
+
+
+def _run_update_file(tool_args: dict, runtime_state: dict):
+    result = workspace_update_file(
+        _get_workspace_runtime_state(runtime_state),
+        tool_args.get("path", ""),
+        tool_args.get("content", ""),
+    )
+    return result, f"File updated: {result.get('path', '')}"
+
+
+def _run_read_file(tool_args: dict, runtime_state: dict):
+    result = workspace_read_file(
+        _get_workspace_runtime_state(runtime_state),
+        tool_args.get("path", ""),
+        start_line=tool_args.get("start_line", 1),
+        end_line=tool_args.get("end_line"),
+    )
+    return result, f"File read: {result.get('path', '')}"
+
+
+def _run_list_dir(tool_args: dict, runtime_state: dict):
+    result = workspace_list_dir(_get_workspace_runtime_state(runtime_state), tool_args.get("path"))
+    return result, f"Directory listed: {result.get('path', '')}"
+
+
+def _run_search_files(tool_args: dict, runtime_state: dict):
+    result = workspace_search_files(
+        _get_workspace_runtime_state(runtime_state),
+        tool_args.get("query", ""),
+        path_prefix=tool_args.get("path_prefix"),
+        search_content=tool_args.get("search_content") is True,
+    )
+    return result, f"{len(result.get('matches') or [])} workspace matches found"
+
+
+def _run_preview_workspace_changes(tool_args: dict, runtime_state: dict):
+    result = preview_workspace_changes(
+        _get_workspace_runtime_state(runtime_state),
+        tool_args.get("files") or [],
+    )
+    return result, f"Workspace diff preview: {len(result.get('diffs') or [])} files"
+
+
+def _run_get_workspace_file_history(tool_args: dict, runtime_state: dict):
+    result = get_workspace_file_history(
+        _get_workspace_runtime_state(runtime_state),
+        tool_args.get("path", ""),
+    )
+    return result, f"Workspace history: {result.get('path', '')}"
+
+
+def _run_undo_workspace_file_change(tool_args: dict, runtime_state: dict):
+    result = undo_workspace_file_change(
+        _get_workspace_runtime_state(runtime_state),
+        tool_args.get("path", ""),
+    )
+    return result, f"Workspace undo: {result.get('path', '')}"
+
+
+def _run_redo_workspace_file_change(tool_args: dict, runtime_state: dict):
+    result = redo_workspace_file_change(
+        _get_workspace_runtime_state(runtime_state),
+        tool_args.get("path", ""),
+    )
+    return result, f"Workspace redo: {result.get('path', '')}"
+
+
+def _run_create_project_scaffold(tool_args: dict, runtime_state: dict):
+    result = create_project_scaffold(
+        _get_workspace_runtime_state(runtime_state),
+        tool_args.get("project_name", "Project"),
+        target_type=tool_args.get("target_type", "python-project"),
+        confirm=tool_args.get("confirm") is True,
+    )
+    if result.get("status") == "ok":
+        update_project_workflow(
+            _get_project_workflow_state(runtime_state),
+            project_name=tool_args.get("project_name", "Project"),
+            target_type=tool_args.get("target_type", "python-project"),
+            stage="skeleton",
+        )
+    return result, f"Project scaffold: {result.get('project_root', '')}"
+
+
+def _run_write_project_tree(tool_args: dict, runtime_state: dict):
+    result = write_project_tree(
+        _get_workspace_runtime_state(runtime_state),
+        directories=tool_args.get("directories") or [],
+        files=tool_args.get("files") or [],
+        confirm=tool_args.get("confirm") is True,
+    )
+    if result.get("status") == "ok":
+        current = get_project_workflow(_get_project_workflow_state(runtime_state)) or {}
+        file_updates = list(current.get("files") or [])
+        known_by_path = {str(entry.get("path") or ""): dict(entry) for entry in file_updates}
+        for path in result.get("files") or []:
+            entry = known_by_path.get(path, {"path": path})
+            entry["status"] = "written"
+            known_by_path[path] = entry
+        update_project_workflow(_get_project_workflow_state(runtime_state), files=list(known_by_path.values()), stage="content")
+    return result, f"Project tree write: {len(result.get('files') or [])} files"
+
+
+def _run_bulk_update_workspace_files(tool_args: dict, runtime_state: dict):
+    result = bulk_update_workspace_files(
+        _get_workspace_runtime_state(runtime_state),
+        tool_args.get("files") or [],
+        confirm=tool_args.get("confirm") is True,
+    )
+    if result.get("status") == "ok":
+        current = get_project_workflow(_get_project_workflow_state(runtime_state)) or {}
+        file_updates = list(current.get("files") or [])
+        known_by_path = {str(entry.get("path") or ""): dict(entry) for entry in file_updates}
+        for path in result.get("files") or []:
+            entry = known_by_path.get(path, {"path": path})
+            entry["status"] = "written"
+            known_by_path[path] = entry
+        update_project_workflow(_get_project_workflow_state(runtime_state), files=list(known_by_path.values()), stage="content")
+    return result, f"Bulk workspace update: {len(result.get('files') or [])} files"
+
+
+def _run_validate_project_workspace(tool_args: dict, runtime_state: dict):
+    result = validate_project_workspace(
+        _get_workspace_runtime_state(runtime_state),
+        path=tool_args.get("path"),
+    )
+    workflow_state = _get_project_workflow_state(runtime_state)
+    next_stage = "validated" if result.get("status") == "ok" else "fix"
+    update_project_workflow(
+        workflow_state,
+        stage=next_stage,
+        validation={
+            "status": result.get("status", "ok"),
+            "issues": result.get("issues") or [],
+            "warnings": result.get("warnings") or [],
+        },
+        open_issues=result.get("issues") or [],
+    )
+    return result, f"Workspace validation: {result.get('status', 'ok')}"
 
 
 def _run_rewrite_canvas_document(tool_args: dict, runtime_state: dict):
@@ -1249,8 +1626,19 @@ def _run_rewrite_canvas_document(tool_args: dict, runtime_state: dict):
         canvas_state,
         content=tool_args.get("content", ""),
         document_id=tool_args.get("document_id"),
+        document_path=tool_args.get("document_path"),
         title=tool_args.get("title"),
+        format_name=tool_args.get("format"),
         language_name=tool_args.get("language"),
+        path=tool_args.get("path"),
+        role=tool_args.get("role"),
+        summary=tool_args.get("summary"),
+        imports=tool_args.get("imports"),
+        exports=tool_args.get("exports"),
+        symbols=tool_args.get("symbols"),
+        dependencies=tool_args.get("dependencies"),
+        project_id=tool_args.get("project_id"),
+        workspace_id=tool_args.get("workspace_id"),
     )
     return build_canvas_tool_result(document, action="rewritten"), f"Canvas updated: {document['title']}"
 
@@ -1263,6 +1651,7 @@ def _run_replace_canvas_lines(tool_args: dict, runtime_state: dict):
         end_line=tool_args.get("end_line", 0),
         lines=tool_args.get("lines", []),
         document_id=tool_args.get("document_id"),
+        document_path=tool_args.get("document_path"),
     )
     return build_canvas_tool_result(document, action="lines_replaced"), f"Canvas lines replaced in {document['title']}"
 
@@ -1274,6 +1663,7 @@ def _run_insert_canvas_lines(tool_args: dict, runtime_state: dict):
         after_line=tool_args.get("after_line", 0),
         lines=tool_args.get("lines", []),
         document_id=tool_args.get("document_id"),
+        document_path=tool_args.get("document_path"),
     )
     return build_canvas_tool_result(document, action="lines_inserted"), f"Canvas lines inserted in {document['title']}"
 
@@ -1285,6 +1675,7 @@ def _run_delete_canvas_lines(tool_args: dict, runtime_state: dict):
         start_line=tool_args.get("start_line", 0),
         end_line=tool_args.get("end_line", 0),
         document_id=tool_args.get("document_id"),
+        document_path=tool_args.get("document_path"),
     )
     return build_canvas_tool_result(document, action="lines_deleted"), f"Canvas lines deleted in {document['title']}"
 
@@ -1294,6 +1685,7 @@ def _run_delete_canvas_document(tool_args: dict, runtime_state: dict):
     result = delete_canvas_document(
         canvas_state,
         document_id=tool_args.get("document_id"),
+        document_path=tool_args.get("document_path"),
     )
     deleted_title = str(result.get("deleted_title") or "Canvas")
     return result, f"Canvas deleted: {deleted_title}"
@@ -1317,6 +1709,23 @@ _TOOL_EXECUTORS = {
     "search_news_ddgs": _run_search_news_ddgs,
     "search_news_google": _run_search_news_google,
     "fetch_url": _run_fetch_url,
+    "expand_canvas_document": _run_expand_canvas_document,
+    "plan_project_workspace": _run_plan_project_workspace,
+    "get_project_workflow_status": _run_get_project_workflow_status,
+    "create_directory": _run_create_directory,
+    "create_file": _run_create_file,
+    "update_file": _run_update_file,
+    "read_file": _run_read_file,
+    "list_dir": _run_list_dir,
+    "search_files": _run_search_files,
+    "preview_workspace_changes": _run_preview_workspace_changes,
+    "get_workspace_file_history": _run_get_workspace_file_history,
+    "undo_workspace_file_change": _run_undo_workspace_file_change,
+    "redo_workspace_file_change": _run_redo_workspace_file_change,
+    "create_project_scaffold": _run_create_project_scaffold,
+    "write_project_tree": _run_write_project_tree,
+    "bulk_update_workspace_files": _run_bulk_update_workspace_files,
+    "validate_project_workspace": _run_validate_project_workspace,
     "create_canvas_document": _run_create_canvas_document,
     "rewrite_canvas_document": _run_rewrite_canvas_document,
     "replace_canvas_lines": _run_replace_canvas_lines,
@@ -1720,6 +2129,9 @@ def run_agent_stream(
     fetch_url_token_threshold: int | None = None,
     fetch_url_clip_aggressiveness: int | None = None,
     initial_canvas_documents: list[dict] | None = None,
+    initial_canvas_active_document_id: str | None = None,
+    workspace_runtime_state: dict | None = None,
+    initial_project_workflow: dict | None = None,
 ):
     messages = list(api_messages)
     step = 0
@@ -1743,7 +2155,12 @@ def run_agent_stream(
         "input_breakdown": _empty_input_breakdown(),
     }
     runtime_state = {
-        "canvas": create_canvas_runtime_state(initial_canvas_documents),
+        "canvas": create_canvas_runtime_state(
+            initial_canvas_documents,
+            active_document_id=initial_canvas_active_document_id,
+        ),
+        "workspace": workspace_runtime_state if isinstance(workspace_runtime_state, dict) else create_workspace_runtime_state(),
+        "project_workflow": create_project_workflow_runtime_state(initial_project_workflow),
     }
     working_state = {
         "current_goal": _extract_initial_goal(messages),
@@ -1753,11 +2170,15 @@ def run_agent_stream(
 
     def build_tool_capture_event() -> dict:
         current_canvas_documents = get_canvas_runtime_documents(runtime_state.get("canvas"))
+        active_canvas_document_id = get_canvas_runtime_active_document_id(runtime_state.get("canvas"))
+        project_workflow = get_project_workflow(runtime_state.get("project_workflow"))
         return {
             "type": "tool_capture",
             "tool_results": persisted_tool_results,
             "canvas_documents": current_canvas_documents,
+            "active_document_id": active_canvas_document_id,
             "canvas_cleared": canvas_modified and not current_canvas_documents,
+            "project_workflow": project_workflow,
         }
 
     pricing = get_model_pricing(model)
@@ -1940,6 +2361,8 @@ def run_agent_stream(
         tool_call_parts = []
         content_streaming_live = False
         stream_error = None
+        announced_canvas_tool = None
+        streamed_canvas_content_length = 0
 
         try:
             for chunk in response:
@@ -1952,6 +2375,28 @@ def run_agent_stream(
                     delta = getattr(chunk.choices[0], "delta", None)
                     if delta is not None:
                         _merge_stream_tool_call_delta(tool_call_parts, delta)
+                        canvas_preview = _build_streaming_canvas_tool_preview(tool_call_parts)
+                        if canvas_preview is not None:
+                            preview_tool_name = canvas_preview["tool"]
+                            if announced_canvas_tool != preview_tool_name:
+                                announced_canvas_tool = preview_tool_name
+                                streamed_canvas_content_length = 0
+                                yield {
+                                    "type": "canvas_tool_starting",
+                                    "tool": preview_tool_name,
+                                    "snapshot": canvas_preview["snapshot"],
+                                }
+                            preview_content = canvas_preview.get("content")
+                            if preview_content is not None and len(preview_content) > streamed_canvas_content_length:
+                                next_content_delta = preview_content[streamed_canvas_content_length:]
+                                streamed_canvas_content_length = len(preview_content)
+                                if next_content_delta:
+                                    yield {
+                                        "type": "canvas_content_delta",
+                                        "tool": preview_tool_name,
+                                        "delta": next_content_delta,
+                                        "snapshot": canvas_preview["snapshot"],
+                                    }
                 if content_delta:
                     content_parts.append(content_delta)
                     if not turn_tools:
@@ -2436,7 +2881,7 @@ def run_agent_stream(
                         "result": transcript_result,
                     }
                 )
-                if tool_name in CANVAS_TOOL_NAMES:
+                if tool_name in CANVAS_MUTATION_TOOL_NAMES:
                     canvas_modified = True
 
                 clarification_event = _extract_clarification_event(result)

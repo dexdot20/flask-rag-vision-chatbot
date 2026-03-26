@@ -6,6 +6,7 @@ import json
 from config import RAG_ENABLED
 
 CANVAS_DOCUMENT_TOOL_NAMES = {
+    "expand_canvas_document",
     "rewrite_canvas_document",
     "replace_canvas_lines",
     "insert_canvas_lines",
@@ -374,10 +375,424 @@ TOOL_SPECS = [
         },
     },
     {
+        "name": "expand_canvas_document",
+        "description": (
+            "Load the full context of a specific canvas document when the active excerpt and manifest summaries are not enough. "
+            "Prefer targeting by document_path in project mode."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "document_id": {
+                    "type": "string",
+                    "description": "Optional target canvas document id."
+                },
+                "document_path": {
+                    "type": "string",
+                    "description": "Optional target project-relative path. Prefer this in project mode."
+                }
+            }
+        },
+        "prompt": {
+            "purpose": "Expands one canvas document into full line-numbered context for focused reasoning or editing.",
+            "inputs": {"document_id": "optional target id", "document_path": "optional target project-relative path"},
+            "guidance": (
+                "Use this when the manifest and active-document excerpt are insufficient and you need another canvas file in full detail. "
+                "In project mode, prefer document_path over document_id so file targeting stays stable."
+            ),
+        },
+    },
+    {
+        "name": "plan_project_workspace",
+        "description": "Create or revise a structured project workflow plan before writing files to the workspace sandbox.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "goal": {
+                    "type": "string",
+                    "description": "User-visible project goal or outcome."
+                },
+                "project_name": {
+                    "type": "string",
+                    "description": "Human-readable project name."
+                },
+                "target_type": {
+                    "type": "string",
+                    "enum": ["python-project"],
+                    "description": "Project template family."
+                },
+                "files": {
+                    "type": "array",
+                    "description": "Optional planned files with path, role, and purpose.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "role": {"type": "string"},
+                            "purpose": {"type": "string"}
+                        },
+                        "required": ["path"]
+                    }
+                },
+                "dependencies": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional dependency shortlist to track in the workflow."
+                }
+            },
+            "required": ["goal", "project_name"]
+        },
+        "prompt": {
+            "purpose": "Creates a structured project workflow plan before scaffold and file generation.",
+            "inputs": {"goal": "project objective", "project_name": "human-readable project name", "target_type": "optional project family", "files": "optional planned files", "dependencies": "optional dependency shortlist"},
+            "guidance": "Use this before scaffold or file writes when the user is asking for a new project or multi-file output. Keep the plan concrete and immediately actionable.",
+        },
+    },
+    {
+        "name": "get_project_workflow_status",
+        "description": "Return the current project workflow stage and tracked plan state for the active conversation workspace.",
+        "parameters": {
+            "type": "object",
+            "properties": {}
+        },
+        "prompt": {
+            "purpose": "Reads the current project workflow state.",
+            "inputs": {},
+        },
+    },
+    {
+        "name": "create_directory",
+        "description": "Create a directory inside the conversation workspace sandbox.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Workspace-relative directory path to create."
+                }
+            },
+            "required": ["path"]
+        },
+        "prompt": {
+            "purpose": "Creates one or more directories inside the workspace sandbox.",
+            "inputs": {"path": "workspace-relative directory path"},
+            "guidance": "Use only workspace-relative paths. The sandbox rejects paths outside the conversation workspace.",
+        },
+    },
+    {
+        "name": "create_file",
+        "description": "Create a new UTF-8 text file inside the conversation workspace sandbox.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Workspace-relative file path to create."
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Full text content for the new file."
+                }
+            },
+            "required": ["path", "content"]
+        },
+        "prompt": {
+            "purpose": "Creates a new file in the workspace sandbox.",
+            "inputs": {"path": "workspace-relative file path", "content": "full file content"},
+            "guidance": "Fails if the file already exists. Use update_file for existing files.",
+        },
+    },
+    {
+        "name": "update_file",
+        "description": "Replace the full content of an existing UTF-8 text file inside the workspace sandbox.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Workspace-relative file path to update."
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Full replacement text content."
+                }
+            },
+            "required": ["path", "content"]
+        },
+        "prompt": {
+            "purpose": "Updates an existing file in the workspace sandbox.",
+            "inputs": {"path": "workspace-relative file path", "content": "full replacement content"},
+            "guidance": "Use this only for files that already exist.",
+        },
+    },
+    {
+        "name": "read_file",
+        "description": "Read a file from the conversation workspace sandbox with optional line limits.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Workspace-relative file path to read."
+                },
+                "start_line": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional first line to include. Defaults to 1."
+                },
+                "end_line": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional last line to include."
+                }
+            },
+            "required": ["path"]
+        },
+        "prompt": {
+            "purpose": "Reads a file from the workspace sandbox.",
+            "inputs": {"path": "workspace-relative file path", "start_line": "optional first line", "end_line": "optional last line"},
+        },
+    },
+    {
+        "name": "list_dir",
+        "description": "List files and directories inside the conversation workspace sandbox.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Optional workspace-relative directory path. Defaults to the workspace root."
+                }
+            }
+        },
+        "prompt": {
+            "purpose": "Lists workspace files and directories.",
+            "inputs": {"path": "optional workspace-relative directory path"},
+        },
+    },
+    {
+        "name": "search_files",
+        "description": "Search workspace file paths and optionally file contents inside the conversation sandbox.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Case-insensitive search text."
+                },
+                "path_prefix": {
+                    "type": "string",
+                    "description": "Optional workspace-relative directory to search under."
+                },
+                "search_content": {
+                    "type": "boolean",
+                    "description": "Whether to search inside file contents in addition to file paths."
+                }
+            },
+            "required": ["query"]
+        },
+        "prompt": {
+            "purpose": "Searches file paths or contents inside the workspace sandbox.",
+            "inputs": {"query": "case-insensitive search text", "path_prefix": "optional subdirectory", "search_content": "optional boolean"},
+        },
+    },
+    {
+        "name": "create_project_scaffold",
+        "description": "Create a starter project skeleton inside the conversation workspace sandbox.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "project_name": {
+                    "type": "string",
+                    "description": "Human-readable project name."
+                },
+                "target_type": {
+                    "type": "string",
+                    "enum": ["python-project"],
+                    "description": "Starter scaffold type."
+                },
+                "confirm": {
+                    "type": "boolean",
+                    "description": "Set true only after the user approves overwriting an existing non-empty project root."
+                }
+            },
+            "required": ["project_name"]
+        },
+        "prompt": {
+            "purpose": "Creates a starter project structure in the workspace sandbox.",
+            "inputs": {"project_name": "project name", "target_type": "optional scaffold type", "confirm": "optional overwrite confirmation"},
+            "guidance": "If the tool reports needs_confirmation, show the preview to the user and ask before re-running with confirm=true.",
+        },
+    },
+    {
+        "name": "write_project_tree",
+        "description": "Create or overwrite many directories and files inside the workspace sandbox in one operation.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "directories": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Workspace-relative directories to create."
+                },
+                "files": {
+                    "type": "array",
+                    "description": "Files to write with path and content.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "content": {"type": "string"}
+                        },
+                        "required": ["path", "content"]
+                    }
+                },
+                "confirm": {
+                    "type": "boolean",
+                    "description": "Set true only after the user approves overwriting existing files."
+                }
+            }
+        },
+        "prompt": {
+            "purpose": "Writes a batch of project directories and files into the workspace sandbox.",
+            "inputs": {"directories": "optional directories", "files": "optional file entries", "confirm": "optional overwrite confirmation"},
+            "guidance": "If the tool reports needs_confirmation, review the returned diffs with the user and do not re-run with confirm=true until the overwrite set is approved.",
+        },
+    },
+    {
+        "name": "bulk_update_workspace_files",
+        "description": "Overwrite many workspace files in one operation after explicit confirmation when required.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "files": {
+                    "type": "array",
+                    "description": "Files to overwrite with path and content.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "content": {"type": "string"}
+                        },
+                        "required": ["path", "content"]
+                    }
+                },
+                "confirm": {
+                    "type": "boolean",
+                    "description": "Set true only after the user approves overwriting the listed files."
+                }
+            },
+            "required": ["files"]
+        },
+        "prompt": {
+            "purpose": "Applies a batch file update inside the workspace sandbox.",
+            "inputs": {"files": "file entries with path and content", "confirm": "optional overwrite confirmation"},
+            "guidance": "If the tool reports needs_confirmation, review the returned diffs and wait for user approval before applying overwrites.",
+        },
+    },
+    {
+        "name": "preview_workspace_changes",
+        "description": "Preview unified diffs for one or more workspace file writes without applying them.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "files": {
+                    "type": "array",
+                    "description": "Files to preview with path and proposed content.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "content": {"type": "string"}
+                        },
+                        "required": ["path", "content"]
+                    }
+                }
+            },
+            "required": ["files"]
+        },
+        "prompt": {
+            "purpose": "Shows file-by-file unified diffs before a workspace change is applied.",
+            "inputs": {"files": "file entries with path and proposed content"},
+            "guidance": "Use this before larger rewrites or when you need an explicit diff review without modifying the workspace.",
+        },
+    },
+    {
+        "name": "get_workspace_file_history",
+        "description": "Inspect stored undo and redo history for one workspace file.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Workspace-relative file path."
+                }
+            },
+            "required": ["path"]
+        },
+        "prompt": {
+            "purpose": "Shows available revision history for a workspace file.",
+            "inputs": {"path": "workspace-relative file path"},
+        },
+    },
+    {
+        "name": "undo_workspace_file_change",
+        "description": "Undo the latest recorded change for one workspace file.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Workspace-relative file path."
+                }
+            },
+            "required": ["path"]
+        },
+        "prompt": {
+            "purpose": "Restores the previous file content from workspace history.",
+            "inputs": {"path": "workspace-relative file path"},
+        },
+    },
+    {
+        "name": "redo_workspace_file_change",
+        "description": "Re-apply the latest undone change for one workspace file.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Workspace-relative file path."
+                }
+            },
+            "required": ["path"]
+        },
+        "prompt": {
+            "purpose": "Reapplies the next available redo entry for a workspace file.",
+            "inputs": {"path": "workspace-relative file path"},
+        },
+    },
+    {
+        "name": "validate_project_workspace",
+        "description": "Run lightweight validation checks against the workspace sandbox or one project subdirectory.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Optional workspace-relative directory path. Defaults to the workspace root."
+                }
+            }
+        },
+        "prompt": {
+            "purpose": "Validates project files in the workspace sandbox.",
+            "inputs": {"path": "optional workspace-relative directory path"},
+        },
+    },
+    {
         "name": "create_canvas_document",
         "description": (
-            "Create or replace the active canvas document for the current conversation. "
-            "Use this when the user asks for a structured draft, outline, plan, article, note, or any long-form artifact that should stay editable."
+            "Create a canvas document for the current conversation. "
+            "Use this for a single editable draft or as one file inside a multi-file canvas project workspace."
         ),
         "parameters": {
             "type": "object",
@@ -392,27 +807,77 @@ TOOL_SPECS = [
                 },
                 "format": {
                     "type": "string",
-                    "enum": ["markdown"],
-                    "description": "Canvas document format. Only markdown is currently supported."
+                    "enum": ["markdown", "code"],
+                    "description": "Canvas document format. Use code for a raw code document without markdown wrappers."
                 },
                 "language": {
                     "type": "string",
                     "description": "Optional dominant code language for the document, such as python, javascript, or sql."
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Optional project-relative path such as src/app.py, README.md, or tests/test_app.py."
+                },
+                "role": {
+                    "type": "string",
+                    "enum": ["source", "config", "dependency", "docs", "test", "script", "note"],
+                    "description": "Optional semantic role for the document inside a project workspace."
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "Optional short semantic summary of the document's responsibility."
+                },
+                "imports": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional imported modules, files, or config keys referenced by this document."
+                },
+                "exports": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional exported entry points, functions, classes, or files produced by this document."
+                },
+                "symbols": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional important symbols defined in this document."
+                },
+                "dependencies": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional package or file dependencies associated with this document."
+                },
+                "project_id": {
+                    "type": "string",
+                    "description": "Optional stable project identifier grouping related canvas documents."
+                },
+                "workspace_id": {
+                    "type": "string",
+                    "description": "Optional stable workspace identifier grouping related canvas documents."
                 }
             },
             "required": ["title", "content"]
         },
         "prompt": {
-            "purpose": "Creates an editable canvas document attached to the conversation.",
+            "purpose": "Creates an editable canvas document attached to the conversation, optionally as part of a project workspace.",
             "inputs": {
                 "title": "document title",
                 "content": "full markdown body",
                 "format": "currently markdown",
-                "language": "optional dominant code language"
+                "language": "optional dominant code language",
+                "path": "optional project-relative file path",
+                "role": "optional semantic document role",
+                "summary": "optional short responsibility summary",
+                "imports": "optional referenced modules, files, or config keys",
+                "exports": "optional exported entry points or files",
+                "symbols": "optional key symbols defined in the document",
+                "dependencies": "optional package or file dependencies",
+                "project_id": "optional project identifier",
+                "workspace_id": "optional workspace identifier"
             },
             "guidance": (
                 "Use this when the user would benefit from a persistent artifact that can be revised. "
-                "Prefer creating the document before line-level edits."
+                "Prefer creating the document before line-level edits. In project mode, set path and role so the workspace manifest stays coherent."
             ),
         },
     },
@@ -430,20 +895,70 @@ TOOL_SPECS = [
                     "type": "string",
                     "description": "Optional replacement title."
                 },
+                "format": {
+                    "type": "string",
+                    "enum": ["markdown", "code"],
+                    "description": "Optional replacement format for the document."
+                },
                 "language": {
                     "type": "string",
                     "description": "Optional dominant code language for the updated document."
                 },
+                "path": {
+                    "type": "string",
+                    "description": "Optional replacement project-relative path for the document."
+                },
+                "role": {
+                    "type": "string",
+                    "enum": ["source", "config", "dependency", "docs", "test", "script", "note"],
+                    "description": "Optional replacement semantic role for the document."
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "Optional replacement short semantic summary."
+                },
+                "imports": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional replacement import list."
+                },
+                "exports": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional replacement export list."
+                },
+                "symbols": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional replacement symbol list."
+                },
+                "dependencies": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional replacement dependency list."
+                },
+                "project_id": {
+                    "type": "string",
+                    "description": "Optional replacement project identifier."
+                },
+                "workspace_id": {
+                    "type": "string",
+                    "description": "Optional replacement workspace identifier."
+                },
                 "document_id": {
                     "type": "string",
                     "description": "Optional target canvas document id. Defaults to the active document."
+                },
+                "document_path": {
+                    "type": "string",
+                    "description": "Optional target project-relative path. Prefer this over document_id in project mode."
                 }
             },
             "required": ["content"]
         },
         "prompt": {
             "purpose": "Replaces the full content of an existing canvas document.",
-            "inputs": {"content": "full markdown body", "title": "optional title", "language": "optional dominant code language", "document_id": "optional target id"},
+            "inputs": {"content": "full document body", "title": "optional title", "format": "optional markdown or code", "language": "optional dominant code language", "path": "optional project-relative file path", "role": "optional semantic role", "summary": "optional short responsibility summary", "imports": "optional import list", "exports": "optional export list", "symbols": "optional symbol list", "dependencies": "optional dependency list", "project_id": "optional project identifier", "workspace_id": "optional workspace identifier", "document_id": "optional target id", "document_path": "optional target project-relative path"},
         },
     },
     {
@@ -462,13 +977,17 @@ TOOL_SPECS = [
                 "document_id": {
                     "type": "string",
                     "description": "Optional target canvas document id. Defaults to the active document."
+                },
+                "document_path": {
+                    "type": "string",
+                    "description": "Optional target project-relative path. Prefer this over document_id in project mode."
                 }
             },
             "required": ["start_line", "end_line", "lines"]
         },
         "prompt": {
             "purpose": "Replaces specific lines in the canvas document.",
-            "inputs": {"start_line": "first line", "end_line": "last line", "lines": "replacement lines", "document_id": "optional target id"},
+            "inputs": {"start_line": "first line", "end_line": "last line", "lines": "replacement lines", "document_id": "optional target id", "document_path": "optional target project-relative path"},
         },
     },
     {
@@ -486,13 +1005,17 @@ TOOL_SPECS = [
                 "document_id": {
                     "type": "string",
                     "description": "Optional target canvas document id. Defaults to the active document."
+                },
+                "document_path": {
+                    "type": "string",
+                    "description": "Optional target project-relative path. Prefer this over document_id in project mode."
                 }
             },
             "required": ["after_line", "lines"]
         },
         "prompt": {
             "purpose": "Inserts lines into the canvas document.",
-            "inputs": {"after_line": "insertion point", "lines": "new lines", "document_id": "optional target id"},
+            "inputs": {"after_line": "insertion point", "lines": "new lines", "document_id": "optional target id", "document_path": "optional target project-relative path"},
         },
     },
     {
@@ -506,13 +1029,17 @@ TOOL_SPECS = [
                 "document_id": {
                     "type": "string",
                     "description": "Optional target canvas document id. Defaults to the active document."
+                },
+                "document_path": {
+                    "type": "string",
+                    "description": "Optional target project-relative path. Prefer this over document_id in project mode."
                 }
             },
             "required": ["start_line", "end_line"]
         },
         "prompt": {
             "purpose": "Deletes specific lines from the canvas document.",
-            "inputs": {"start_line": "first line", "end_line": "last line", "document_id": "optional target id"},
+            "inputs": {"start_line": "first line", "end_line": "last line", "document_id": "optional target id", "document_path": "optional target project-relative path"},
         },
     },
     {
@@ -524,12 +1051,16 @@ TOOL_SPECS = [
                 "document_id": {
                     "type": "string",
                     "description": "Optional target canvas document id. Defaults to the active document."
+                },
+                "document_path": {
+                    "type": "string",
+                    "description": "Optional target project-relative path. Prefer this over document_id in project mode."
                 }
             }
         },
         "prompt": {
             "purpose": "Deletes one canvas document from the current conversation.",
-            "inputs": {"document_id": "optional target id"},
+            "inputs": {"document_id": "optional target id", "document_path": "optional target project-relative path"},
         },
     },
     {
