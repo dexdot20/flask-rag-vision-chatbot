@@ -1,8 +1,8 @@
-# Flask ChatBot: DeepSeek + Tools + RAG + Vision + Canvas
+# Flask ChatBot: DeepSeek + Tools + RAG + Vision + Canvas + Memory
 
-This is a single-page Flask chat application built around DeepSeek models, multi-step tool use, local RAG, local vision OCR, conversation summarization, persistent memory, and editable canvas documents.
+This is a single-page Flask chat application built around DeepSeek models, multi-step tool use, local RAG, local vision OCR, conversation summarization, pruning, persistent memory, and editable canvas documents.
 
-It is not a minimal prompt/response demo. The app keeps conversation history in SQLite, restores assistant metadata when a conversation is reopened, supports editing earlier user messages, streams tool progress and reasoning, and can enrich a user turn with local OCR or extracted document text before the model sees it.
+It is not a minimal prompt/response demo. The app keeps conversation history in SQLite, restores assistant metadata when a conversation is reopened, supports editing earlier user messages, streams tool progress and reasoning, can enrich a user turn with local OCR or extracted document text before the model sees it, and can compact older content with summaries and pruning.
 
 ## Contents
 
@@ -18,6 +18,7 @@ It is not a minimal prompt/response demo. The app keeps conversation history in 
 - [Development](#development)
 - [Security and operational notes](#security-and-operational-notes)
 - [Troubleshooting](#troubleshooting)
+- [FAQ](#faq)
 - [License](#license)
 
 ## What the app does
@@ -29,10 +30,11 @@ It is not a minimal prompt/response demo. The app keeps conversation history in 
 - Persist messages, usage metadata, tool traces, reasoning content, and canvas state in SQLite
 - Cancel an active response mid-stream
 - Clear the current chat view without deleting stored conversations
-- Automatically generate a short title after the first exchange
+- Automatically generate a short title after the first exchange or on demand
 - Edit a previous user message, delete later turns, and regenerate from that branch
 - Restore assistant metadata, reasoning, tool results, and canvas state when reopening a conversation
-- Show a separate fix-text action that rewrites the current draft before sending
+- Show a separate Fix action that rewrites the current draft before sending
+- Manually summarize a conversation, undo an inserted summary, and prune older visible messages
 
 ### Model and agent behavior
 
@@ -73,6 +75,7 @@ It is not a minimal prompt/response demo. The app keeps conversation history in 
 ### Memory and retrieval
 
 - Persistent scratchpad for durable user-specific facts and preferences
+- Persistent user profile memory extracted from structured conversation summaries
 - Tool memory for successful web/news/URL results from earlier sessions
 - RAG knowledge base built from stored conversations, successful text-like tool results, and tool memory entries
 - Optional auto-injection of retrieved RAG context into each turn
@@ -84,12 +87,14 @@ It is not a minimal prompt/response demo. The app keeps conversation history in 
 - The model can create and edit Markdown canvas documents attached to the current conversation
 - The UI can display multiple canvas documents, search within them, and export them
 - Canvas documents can be edited line-by-line by the model
+- Canvas documents can be downloaded as Markdown, HTML, or PDF
 
 ### Observability
 
 - Usage panel separates provider-reported usage from local input-source estimates
 - Panel shows session totals, latest-turn totals, per-turn cost, and non-zero input-source chips
 - Stored assistant metadata is used to rebuild the panel after reload
+- Summary inspector surfaces trigger thresholds, token gaps, source-message counts, and recent summary status
 
 ## Architecture overview
 
@@ -99,12 +104,12 @@ It is not a minimal prompt/response demo. The app keeps conversation history in 
 4. If a document is attached, its text is extracted and added to the turn context.
 5. If RAG auto-injection is enabled, the user message is searched against the knowledge base.
 6. If tool-memory auto-injection is enabled, the same query searches remembered web results.
-7. A runtime system message is built with the current time, preferences, scratchpad, tool guidance, and any retrieved context.
+7. A runtime system message is built with the current time, preferences, scratchpad, user profile facts, tool guidance, and any retrieved context.
 8. The agent streams model output.
 9. Tool calls are validated, executed, cached, and appended to the transcript.
 10. Tool progress, reasoning deltas, answer deltas, usage, and message IDs are streamed back as NDJSON.
 11. The final assistant message is stored with metadata such as reasoning, usage, tool trace, canvas state, and stored tool results.
-12. Conversations, tool results, and web-tool results can be synced into the RAG store.
+12. After a turn finishes, the app may summarize older context, prune older visible messages, and sync conversations or tool results into the RAG store.
 
 ## Project structure
 
@@ -114,17 +119,18 @@ It is not a minimal prompt/response demo. The app keeps conversation history in 
 ├── agent.py                # Streaming agent loop, tool execution, usage tracking, trace logging
 ├── canvas_service.py       # Canvas document storage and line-level editing
 ├── config.py               # Environment variables, defaults, feature flags, runtime limits
-├── conversation_export.py  # Conversation export utilities
+├── conversation_export.py  # Conversation and canvas export utilities
 ├── db.py                   # SQLite schema, settings, assets, cache, metadata helpers
 ├── doc_service.py          # Document upload and text extraction
 ├── messages.py             # Runtime prompt construction and API message preparation
+├── prune_service.py        # Message pruning helpers
 ├── rag_service.py          # RAG sync/search orchestration and tool-memory storage
 ├── token_utils.py          # Token counting and prompt-source estimation
 ├── tool_registry.py        # Tool definitions and schemas exposed to the model
 ├── vision.py               # Local Qwen2.5-VL OCR and image analysis pipeline
 ├── web_tools.py            # Web search, news search, safe URL fetch, proxy rotation
 ├── routes/
-│   ├── chat.py             # /chat, /api/fix-text, title generation, preload helpers
+│   ├── chat.py             # /chat, /api/fix-text, title generation, summarization, pruning helpers
 │   ├── conversations.py    # Conversation CRUD, export, RAG maintenance, canvas maintenance
 │   ├── pages.py            # Main page, settings page, settings API
 │   └── request_utils.py    # Request parsing helpers
@@ -140,7 +146,7 @@ It is not a minimal prompt/response demo. The app keeps conversation history in 
 │   ├── index.html          # Chat UI
 │   └── settings.html       # Dedicated settings page
 ├── tests/
-│   └── test_app.py         # Backend, streaming, tool, RAG, and UI bootstrap tests
+│   └── test_app.py         # Backend, streaming, tool, RAG, pruning, and UI bootstrap tests
 ├── proxies.example.txt     # Sample proxy file
 ├── requirements.txt        # Runtime dependencies
 ├── requirements-dev.txt    # Runtime + development tooling
@@ -170,7 +176,7 @@ Development:
 pip install -r requirements-dev.txt
 ```
 
-`requirements.txt` includes the heavier RAG, OCR, and export dependencies. There is no separate lightweight runtime requirements file in this repository.
+`requirements.txt` includes the heavier RAG, OCR, export, and document-processing dependencies.
 
 ### 3) Hardware and runtime requirements
 
@@ -178,6 +184,7 @@ The RAG embedder and the local vision model are GPU-backed in this codebase.
 
 - RAG embeddings require PyTorch with CUDA support and a CUDA-capable GPU.
 - Local Qwen2.5-VL vision inference requires CUDA and a local model directory.
+- There is no CPU fallback in the current codebase for either local RAG or local vision.
 - If you do not have the required GPU stack, disable the features explicitly in `.env` instead of leaving them enabled.
 
 Example overrides for a lighter setup:
@@ -241,6 +248,7 @@ Some settings come from environment variables, and some are stored in SQLite thr
 | `AGENT_TRACE_LOG_PATH` | `logs/agent-trace.log` | Rotating agent trace log file |
 | `IMAGE_STORAGE_DIR` | `./data/images` | Directory used for uploaded image assets |
 | `DOCUMENT_STORAGE_DIR` | `./data/documents` | Directory used for uploaded document assets |
+| `SCRATCHPAD_ADMIN_EDITING_ENABLED` | `false` | Shows scratchpad editing in the UI |
 
 ### RAG and embedding
 
@@ -257,9 +265,11 @@ Some settings come from environment variables, and some are stored in SQLite thr
 | `RAG_AUTO_INJECT_TOP_K` | `5` | Auto-inject candidate count |
 | `RAG_SEARCH_DEFAULT_TOP_K` | `5` | Default knowledge-base search size |
 | `RAG_AUTO_INJECT_THRESHOLD` | `0.35` | Similarity threshold for auto-injected context |
-| `RAG_SEARCH_MIN_SIMILARITY` | `0.2` | Minimum similarity shown in search results |
-| `RAG_SENSITIVITY_PRESETS` | `flexible / normal / strict` | Named injection sensitivity presets |
-| `RAG_CONTEXT_SIZE_PRESETS` | `small / medium / large` | Named context-size presets |
+| `RAG_SEARCH_MIN_SIMILARITY` | `0.35` | Minimum similarity shown in search results |
+| `RAG_QUERY_EXPANSION_ENABLED` | `true` | Expands some search queries before retrieval |
+| `RAG_QUERY_EXPANSION_MAX_VARIANTS` | `3` | Maximum query expansion variants |
+| `RAG_TEMPORAL_DECAY_ALPHA` | `0.15` | Score decay factor for recency weighting |
+| `RAG_TEMPORAL_DECAY_LAMBDA` | `0.05` | Score decay factor for time-based weighting |
 
 ### Vision and OCR
 
@@ -295,14 +305,17 @@ Some settings come from environment variables, and some are stored in SQLite thr
 | `PROMPT_RAG_MAX_TOKENS` | `6000` | Max RAG budget |
 | `PROMPT_TOOL_MEMORY_MAX_TOKENS` | `4000` | Max tool-memory budget |
 | `PROMPT_PREFLIGHT_SUMMARY_TOKEN_COUNT` | `90000` | Preflight summary trigger budget |
+| `AGENT_CONTEXT_COMPACTION_THRESHOLD` | `0.85` | Fraction of budget that triggers context compaction |
+| `AGENT_CONTEXT_COMPACTION_KEEP_RECENT_ROUNDS` | `2` | How many recent exchanges are preserved during compaction |
+| `AGENT_TOOL_RESULT_TRANSCRIPT_MAX_CHARS` | `16000` | Maximum transcript length retained for tool results |
 | `SUMMARY_SOURCE_TARGET_TOKENS` | `6000` | Target source size for summarization |
 | `SUMMARY_RETRY_MIN_SOURCE_TOKENS` | `1500` | Minimum source size before retrying summary |
+| `FETCH_RAW_TOOL_RESULT_MAX_TEXT_CHARS` | `24000` | Maximum raw tool-result text kept for fetch-style results |
 
 ### Scratchpad and memory
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `SCRATCHPAD_ADMIN_EDITING_ENABLED` | `false` | Show scratchpad editing in the UI |
 | `MAX_USER_PREFERENCES_LENGTH` | `2000` | Internal limit for stored user preferences |
 | `MAX_SCRATCHPAD_LENGTH` | `4000` | Internal limit for scratchpad text |
 
@@ -332,12 +345,15 @@ The Settings page persists these values in `app_settings`:
 - `rag_sensitivity`
 - `rag_context_size`
 - `tool_memory_auto_inject`
-- `fetch_url_token_threshold`
-- `fetch_url_clip_aggressiveness`
-- `chat_summary_trigger_token_count`
 - `chat_summary_mode`
+- `chat_summary_trigger_token_count`
 - `summary_skip_first`
 - `summary_skip_last`
+- `pruning_enabled`
+- `pruning_token_threshold`
+- `pruning_batch_size`
+- `fetch_url_token_threshold`
+- `fetch_url_clip_aggressiveness`
 
 ## Using the app
 
@@ -350,12 +366,19 @@ The Settings page persists these values in `app_settings`:
 5. Press Enter to send, or Shift+Enter for a new line.
 6. Watch tool progress, reasoning, and answer text stream live.
 
+### Title, summary, and pruning actions
+
+- Use Generate Title to refresh a conversation title manually.
+- Use Summarize to force a summary pass for the current conversation.
+- Use Undo on a summary message to restore the summarized messages.
+- Use Prune on a message to replace verbose visible content with a compact version while preserving the original in metadata.
+
 ### Settings page
 
 The app includes a dedicated `/settings` page.
 
-- Assistant tab: user preferences, web-step budget, fetch clipping, and conversation summarization
-- Memory tab: scratchpad, tool-memory auto-injection, and RAG auto-injection
+- Assistant tab: user preferences, web-step budget, fetch clipping, summarization, and pruning
+- Memory tab: scratchpad, tool-memory auto-injection, RAG auto-injection, and user profile memory behavior
 - Tools tab: active tool permissions
 - Knowledge tab: RAG maintenance and sync controls
 
@@ -423,6 +446,13 @@ If you attach a document (DOCX, PDF, TXT, CSV, or MD):
 - The scratchpad is included in the runtime system prompt for every turn.
 - Use it for long-term user facts, preferences, or constraints that should survive across conversations.
 
+### User profile memory workflow
+
+- Structured conversation summaries can contain `facts`, `decisions`, `open_issues`, `entities`, and `tool_outcomes`.
+- Facts that look like durable user preferences or stable constraints are written to the persistent `user_profile` table.
+- Those facts are injected back into the runtime system context as a compact bullet list.
+- This is separate from the scratchpad and complements it with automatically extracted memory.
+
 ### Tool memory workflow
 
 - Successful web search, news search, and URL fetch results can be stored as tool memory when RAG is enabled.
@@ -456,6 +486,15 @@ Canvas documents can also be exported individually with `/api/conversations/<id>
 - `CHAT_SUMMARY_MODE` can be `auto`, `never`, or `aggressive`.
 - Summaries are stored as special system messages so the original flow is preserved while context size is reduced.
 - Summary behavior also respects the `summary_skip_first` and `summary_skip_last` settings from the UI.
+- Summary generation also feeds durable facts into the user profile memory when the output includes usable facts.
+
+### Pruning workflow
+
+- Pruning is separate from summarization and targets visible user and assistant messages.
+- The background post-response task can prune older visible messages once the prunable-token count crosses `pruning_token_threshold`.
+- `pruning_batch_size` controls how many messages are compacted per pass.
+- Messages that already contain tool calls, summaries, or prior pruning markers are skipped.
+- A manual prune endpoint exists for individual messages.
 
 ### Knowledge base workflow
 
@@ -503,6 +542,8 @@ Ask one or more structured clarification questions and stop answering until the 
   - `intro` (string, optional) - short lead-in shown before the questions
   - `submit_label` (string, optional) - optional button label in the UI
 
+Each question item can also include `required`, `placeholder`, `options`, and `allow_free_text`.
+
 #### `image_explain`
 
 Answer a follow-up question about a previously uploaded image saved in the current conversation.
@@ -522,6 +563,8 @@ Semantic search over synced conversations and stored tool results.
   - `query` (string, required) - semantic search query
   - `category` (string, optional) - optional category filter
   - `top_k` (integer, optional, 1-12) - maximum number of chunks to retrieve
+
+The current code accepts conversation, tool_result, and tool_memory categories.
 
 #### `search_tool_memory`
 
@@ -577,6 +620,7 @@ Create a new canvas document for the current conversation.
   - `title` (string, required) - document title
   - `content` (string, required) - full Markdown content
   - `format` (string, optional) - currently only `markdown`
+  - `language` (string, optional) - optional dominant code language
 
 #### `rewrite_canvas_document`
 
@@ -585,6 +629,7 @@ Rewrite the full active canvas document while keeping the same document id.
 - Arguments:
   - `content` (string, required) - full replacement Markdown content
   - `title` (string, optional) - optional replacement title
+  - `language` (string, optional) - optional dominant code language
   - `document_id` (string, optional) - optional target document id
 
 #### `replace_canvas_lines`
@@ -638,6 +683,10 @@ Delete all canvas documents for the current conversation.
 | `PATCH` | `/api/settings` | Update persisted settings |
 | `POST` | `/api/fix-text` | Rewrite the current draft before sending |
 | `POST` | `/chat` | Main streamed chat endpoint; accepts JSON or multipart uploads |
+| `POST` | `/api/conversations/<id>/generate-title` | Generate a title from conversation content |
+| `POST` | `/api/conversations/<id>/summarize` | Manually summarize a conversation |
+| `POST` | `/api/conversations/<id>/summaries/<summary_id>/undo` | Undo a summary message |
+| `POST` | `/api/messages/<id>/prune` | Prune a visible user or assistant message |
 | `GET` | `/api/conversations` | List conversations |
 | `POST` | `/api/conversations` | Create a conversation |
 | `GET` | `/api/conversations/<id>` | Load one conversation and all messages |
@@ -661,6 +710,7 @@ The app creates and uses these tables:
 - `conversations`
 - `messages`
 - `app_settings`
+- `user_profile`
 - `image_assets`
 - `file_assets`
 - `web_cache`
@@ -679,6 +729,8 @@ The app creates and uses these tables:
 - canvas documents
 - pending clarification payloads
 - usage data
+- summary metadata
+- pruning metadata
 
 ### ChromaDB
 
@@ -698,7 +750,7 @@ RAG data is stored in a persistent Chroma collection under `CHROMA_DB_PATH`.
 ### Run tests
 
 ```bash
-python -m unittest discover -s tests
+/home/ricky/Desktop/os-chatbot/venv/bin/python -m pytest tests/test_app.py
 ```
 
 ### Lint
@@ -747,6 +799,7 @@ A sample `.pre-commit-config.yaml` is not included in the repository.
 - the app stores conversation content locally; plan backups accordingly
 - local vision requires a local model download and enough hardware to run it
 - scratchpad admin editing is disabled by default; enable it only if you trust the UI users
+- pruning rewrites message content in place and stores the original text in message metadata
 
 ## Troubleshooting
 
@@ -766,6 +819,10 @@ Check that `tool_memory_auto_inject` is enabled in Settings and that RAG is enab
 
 Increase `CHAT_SUMMARY_TRIGGER_TOKEN_COUNT` or set `chat_summary_mode` to `never` in Settings.
 
+**Pruning is too aggressive**
+
+Raise `pruning_token_threshold`, lower `pruning_batch_size`, or disable pruning in the Settings page.
+
 **Scratchpad is not visible in the UI**
 
 The scratchpad editor is only shown when `SCRATCHPAD_ADMIN_EDITING_ENABLED` is true. The scratchpad still exists for the model even when the UI editor is hidden.
@@ -782,7 +839,7 @@ Image uploads require an existing saved conversation and a supported image type.
 
 Only DOCX, PDF, TXT, CSV, and Markdown files are accepted. The document must also contain extractable text.
 
-## Frequently asked questions
+## FAQ
 
 **How do I reset the database?**
 
