@@ -27,7 +27,6 @@ from config import (
     FETCH_RAW_TOOL_RESULT_MAX_TEXT_CHARS,
     FETCH_SUMMARY_TOKEN_THRESHOLD,
     IMAGE_STORAGE_DIR,
-    MAX_SCRATCHPAD_LENGTH,
     PROMPT_MAX_INPUT_TOKENS,
     PROMPT_PREFLIGHT_SUMMARY_TOKEN_COUNT,
     PROMPT_RAG_MAX_TOKENS,
@@ -1392,33 +1391,51 @@ def normalize_scratchpad_text(value) -> str:
         lines.append(line)
 
     normalized = "\n".join(lines)
-    if len(normalized) > MAX_SCRATCHPAD_LENGTH:
-        raise ValueError(f"Scratchpad cannot exceed {MAX_SCRATCHPAD_LENGTH} characters.")
     return normalized
 
 
-def append_to_scratchpad(note) -> tuple[dict, str]:
-    normalized_note = " ".join(str(note or "").strip().split())
-    if not normalized_note:
-        return {"status": "rejected", "reason": "empty_note"}, "Scratchpad note is empty"
+def append_to_scratchpad(notes) -> tuple[dict, str]:
+    """Append one or more notes. `notes` may be a string or a list of strings."""
+    if isinstance(notes, str):
+        note_list = [notes]
+    else:
+        note_list = list(notes or [])
 
     settings = get_app_settings()
     current = normalize_scratchpad_text(settings.get("scratchpad", ""))
     current_lines = current.splitlines() if current else []
-    if normalized_note in current_lines:
+    current_set = set(current_lines)
+
+    appended = []
+    skipped = []
+    for raw in note_list:
+        normalized_note = " ".join(str(raw or "").strip().split())
+        if not normalized_note:
+            continue
+        if normalized_note in current_set:
+            skipped.append(normalized_note)
+        else:
+            current_lines.append(normalized_note)
+            current_set.add(normalized_note)
+            appended.append(normalized_note)
+
+    if not appended:
+        if not skipped:
+            return {"status": "rejected", "reason": "empty_notes"}, "Scratchpad notes are empty"
         return {
             "status": "skipped",
-            "reason": "duplicate_note",
-            "note": normalized_note,
+            "reason": "duplicate_notes",
+            "notes": skipped,
             "scratchpad": current,
-        }, "Scratchpad note already exists"
+        }, "Scratchpad notes already exist"
 
-    next_value = normalize_scratchpad_text("\n".join([*current_lines, normalized_note]))
+    next_value = normalize_scratchpad_text("\n".join(current_lines))
     settings["scratchpad"] = next_value
     save_app_settings(settings)
     return {
         "status": "appended",
-        "note": normalized_note,
+        "notes": appended,
+        "skipped": skipped,
         "scratchpad": next_value,
     }, "Scratchpad updated"
 

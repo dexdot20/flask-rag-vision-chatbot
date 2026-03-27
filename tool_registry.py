@@ -20,27 +20,30 @@ TOOL_SPECS = [
     {
         "name": "append_scratchpad",
         "description": (
-            "Append one durable user-specific fact or preference to the persistent scratchpad. "
+            "Append one or more durable user-specific facts or preferences to the persistent scratchpad. "
             "Use this only for long-lived, high-signal information that will likely change future answers or actions. "
             "Do not store temporary task details, sensitive secrets, one-off requests, or speculative inferences."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "note": {
-                    "type": "string",
-                    "description": "One short durable note to append to the scratchpad.",
+                "notes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of short durable facts to append. Each item must be a single standalone fact — do not bundle multiple facts into one item. Minimum 1 item.",
+                    "minItems": 1,
                 }
             },
-            "required": ["note"],
+            "required": ["notes"],
         },
         "prompt": {
-            "purpose": "Saves one short durable user fact or preference into persistent scratchpad memory only when it is likely to matter later.",
-            "inputs": {"note": "single short durable memory line"},
+            "purpose": "Saves one or more short durable user facts or preferences into persistent scratchpad memory only when they are likely to matter later.",
+            "inputs": {"notes": "list of single short durable memory lines — one fact per item"},
             "guidance": (
                 "Use very sparingly. Save only durable user-specific facts, recurring constraints, or stable preferences that are likely to matter in future conversations. "
                 "Do not save temporary requests, current-task details, large summaries, tool outputs, web/search results, speculative guesses, or sensitive data. "
-                "If the information would not change future responses or behavior, do not store it. Prefer one short standalone line instead of paragraphs."
+                "If the information would not change future responses or behavior, do not store it. "
+                "Each item in `notes` must be a single short standalone fact. Never combine multiple facts into one item."
             ),
         },
     },

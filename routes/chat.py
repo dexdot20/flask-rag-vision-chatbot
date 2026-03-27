@@ -744,12 +744,10 @@ def _classify_summary_generation_failure(summary_text: str, summary_errors: list
     return "rejected_output", "Summary output did not pass validation."
 
 
-def _resolve_summary_model(fallback_model: str) -> str:
+def _resolve_summary_model() -> str:
     configured_model = str(CHAT_SUMMARY_MODEL or "").strip()
     if is_valid_model_id(configured_model):
         return configured_model
-    if is_valid_model_id(fallback_model):
-        return fallback_model
     return "deepseek-chat"
 
 
@@ -1175,7 +1173,7 @@ def maybe_create_conversation_summary(
             canonical_messages, skip_first=skip_first, skip_last=skip_last,
         )
 
-        summary_model = _resolve_summary_model(fallback_model)
+        summary_model = _resolve_summary_model()
         attempt_token_target = base_source_token_target
         failure_payload = None
         source_messages: list[dict] = []
@@ -1908,7 +1906,7 @@ def register_chat_routes(app) -> None:
                         "mode": preflight_summary_outcome.get("mode") or get_chat_summary_mode(settings),
                         "trigger_token_count": preflight_summary_outcome.get("trigger_token_count"),
                         "visible_token_count": preflight_summary_outcome.get("visible_token_count"),
-                        "summary_model": preflight_summary_outcome.get("summary_model") or _resolve_summary_model(model),
+                        "summary_model": preflight_summary_outcome.get("summary_model") or _resolve_summary_model(),
                         "checked_at": preflight_summary_outcome.get("checked_at"),
                         "candidate_message_count": preflight_summary_outcome.get("candidate_message_count"),
                         "excluded_message_count": preflight_summary_outcome.get("excluded_message_count"),
@@ -2141,7 +2139,7 @@ def register_chat_routes(app) -> None:
                             "mode": summary_outcome.get("mode") or get_chat_summary_mode(settings),
                             "trigger_token_count": summary_outcome.get("trigger_token_count"),
                             "visible_token_count": summary_outcome.get("visible_token_count"),
-                            "summary_model": summary_outcome.get("summary_model") or _resolve_summary_model(model),
+                            "summary_model": summary_outcome.get("summary_model") or _resolve_summary_model(),
                             "checked_at": summary_outcome.get("checked_at"),
                             "candidate_message_count": summary_outcome.get("candidate_message_count"),
                             "excluded_message_count": summary_outcome.get("excluded_message_count"),
@@ -2173,7 +2171,7 @@ def register_chat_routes(app) -> None:
                             "mode": summary_outcome.get("mode") or get_chat_summary_mode(settings),
                             "trigger_token_count": summary_outcome.get("trigger_token_count"),
                             "visible_token_count": summary_outcome.get("visible_token_count"),
-                            "summary_model": summary_outcome.get("summary_model") or _resolve_summary_model(model),
+                            "summary_model": summary_outcome.get("summary_model") or _resolve_summary_model(),
                             "checked_at": summary_outcome.get("checked_at"),
                             "failure_stage": summary_outcome.get("failure_stage"),
                             "failure_detail": summary_outcome.get("failure_detail"),

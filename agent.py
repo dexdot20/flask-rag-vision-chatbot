@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import logging
@@ -117,6 +118,9 @@ WEB_TOOL_NAMES = {
     "fetch_url",
     "search_news_ddgs",
     "search_news_google",
+}
+PARALLEL_SAFE_TOOL_NAMES = WEB_TOOL_NAMES | {
+    "image_explain",
 }
 INPUT_BREAKDOWN_KEYS = (
     "core_instructions",
@@ -1104,6 +1108,10 @@ def _validate_tool_arguments(tool_name: str, tool_args: dict) -> str | None:
     if not isinstance(tool_args, dict):
         return f"Tool arguments for {tool_name} must be a JSON object"
 
+    if tool_name == "append_scratchpad" and "notes" not in tool_args and "note" in tool_args:
+        legacy_note = tool_args.pop("note")
+        tool_args["notes"] = [legacy_note]
+
     schema = spec.get("parameters") or {}
     properties = schema.get("properties") or {}
     required = schema.get("required") or []
@@ -1372,7 +1380,8 @@ def _get_canvas_runtime_state(runtime_state: dict) -> dict:
 
 def _run_append_scratchpad(tool_args: dict, runtime_state: dict):
     del runtime_state
-    return append_to_scratchpad(tool_args.get("note", ""))
+    notes = tool_args.get("notes") or tool_args.get("note", "")
+    return append_to_scratchpad(notes)
 
 
 def _run_replace_scratchpad(tool_args: dict, runtime_state: dict):
@@ -2204,13 +2213,14 @@ def _build_working_state_instruction(working_state: dict) -> dict | None:
     return {"role": "system", "content": "\n\n".join(parts)}
 
 
-def _get_tool_step_limit(tool_name: str) -> int:
+def _get_tool_step_limit(tool_name: str, max_steps: int = 5) -> int:
     normalized_name = str(tool_name or "").strip()
-    value = TOOL_STEP_LIMITS.get(normalized_name, TOOL_STEP_LIMITS.get("default", 5))
+    default = int(TOOL_STEP_LIMITS.get("default", max_steps))
+    value = TOOL_STEP_LIMITS.get(normalized_name, default)
     try:
         limit = int(value)
     except (TypeError, ValueError):
-        limit = int(TOOL_STEP_LIMITS.get("default", 5))
+        limit = max_steps
     return max(1, limit)
 
 
@@ -2688,45 +2698,37 @@ def run_agent_stream(
         transcript_results = []
         tool_messages = []
 
+        # ---- Phase 1: validate, pre-check, build execution slots (sequential) ----
+        slots = []
         for call_index, tool_call in enumerate(tool_calls, start=1):
             tool_name = tool_call["name"]
             tool_args = tool_call["arguments"]
             call_id = str(tool_call.get("id") or f"step-{step}-call-{call_index}-{tool_name}")
+            slot = {
+                "call_index": call_index,
+                "tool_name": tool_name,
+                "tool_args": tool_args,
+                "call_id": call_id,
+                "preview": "",
+                "cache_key": "",
+                "has_step_update": False,
+            }
+
             if tool_name not in enabled_tool_names:
-                error = f"Tool disabled: {tool_name}"
-                yield {"type": "tool_error", "step": step, "tool": tool_name, "error": error, "call_id": call_id}
-                tool_messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call_id,
-                        "content": _serialize_tool_message_content({"ok": False, "error": error}),
-                    }
-                )
-                transcript_results.append({"tool_name": tool_name, "arguments": tool_args, "ok": False, "error": error})
+                slot["kind"] = "error"
+                slot["error"] = f"Tool disabled: {tool_name}"
+                slots.append(slot)
                 continue
 
             validation_error = _validate_tool_arguments(tool_name, tool_args)
             if validation_error:
-                yield {
-                    "type": "tool_error",
-                    "step": step,
-                    "tool": tool_name,
-                    "error": validation_error,
-                    "call_id": call_id,
-                }
-                tool_messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call_id,
-                        "content": _serialize_tool_message_content({"ok": False, "error": validation_error}),
-                    }
-                )
-                transcript_results.append(
-                    {"tool_name": tool_name, "arguments": tool_args, "ok": False, "error": validation_error}
-                )
+                slot["kind"] = "error"
+                slot["error"] = validation_error
+                slots.append(slot)
                 continue
 
             cache_key = build_tool_cache_key(tool_name, tool_args)
+            slot["cache_key"] = cache_key
             if tool_name == "search_knowledge_base":
                 preview = tool_args.get("query", "")[:80]
             elif tool_name in ("search_web", "search_news_ddgs", "search_news_google"):
@@ -2735,26 +2737,27 @@ def run_agent_stream(
                 preview = tool_args.get("url", "")[:80]
             else:
                 preview = ""
+            slot["preview"] = preview
 
             if tool_name == "fetch_url":
-                fetch_url = str(tool_args.get("url") or "").strip()
-                fetch_attempt_counts[fetch_url] = fetch_attempt_counts.get(fetch_url, 0) + 1
+                fetch_url_val = str(tool_args.get("url") or "").strip()
+                fetch_attempt_counts[fetch_url_val] = fetch_attempt_counts.get(fetch_url_val, 0) + 1
                 _trace_agent_event(
                     "fetch_url_requested",
                     trace_id=trace_id,
                     step=step,
-                    url=fetch_url,
-                    attempt_count=fetch_attempt_counts[fetch_url],
-                    repeated=fetch_attempt_counts[fetch_url] > 1,
+                    url=fetch_url_val,
+                    attempt_count=fetch_attempt_counts[fetch_url_val],
+                    repeated=fetch_attempt_counts[fetch_url_val] > 1,
                     call_id=call_id,
                 )
-                if fetch_attempt_counts[fetch_url] > 1:
+                if fetch_attempt_counts[fetch_url_val] > 1:
                     _trace_agent_event(
                         "duplicate_fetch_attempt",
                         trace_id=trace_id,
                         step=step,
-                        url=fetch_url,
-                        attempt_count=fetch_attempt_counts[fetch_url],
+                        url=fetch_url_val,
+                        attempt_count=fetch_attempt_counts[fetch_url_val],
                         call_id=call_id,
                     )
 
@@ -2767,25 +2770,16 @@ def run_agent_stream(
                 preview=preview,
                 cache_key=cache_key,
             )
-
             _append_working_state_attempt(working_state, tool_name, preview)
-            yield {"type": "step_update", "step": step, "tool": tool_name, "preview": preview, "call_id": call_id}
+            slot["has_step_update"] = True
 
-            tool_limit = _get_tool_step_limit(tool_name)
+            tool_limit = _get_tool_step_limit(tool_name, max_steps)
             if tool_call_counts[tool_name] >= tool_limit:
                 error = f"Per-tool step limit reached for {tool_name}. Try a different tool or produce the best available answer."
                 _append_working_state_blocker(working_state, tool_name, error)
-                yield {"type": "tool_error", "step": step, "tool": tool_name, "error": error, "call_id": call_id}
-                tool_messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call_id,
-                        "content": _serialize_tool_message_content({"ok": False, "error": error}),
-                    }
-                )
-                transcript_results.append(
-                    {"tool_name": tool_name, "arguments": tool_args, "ok": False, "error": error}
-                )
+                slot["kind"] = "error"
+                slot["error"] = error
+                slots.append(slot)
                 continue
             tool_call_counts[tool_name] += 1
 
@@ -2797,6 +2791,21 @@ def run_agent_stream(
                     fetch_url_token_threshold=fetch_url_token_threshold,
                     fetch_url_clip_aggressiveness=fetch_url_clip_aggressiveness,
                 )
+                remember_tool_result(
+                    tool_name,
+                    tool_args,
+                    cached_result,
+                    cached_summary,
+                    cache_key,
+                    transcript_result=transcript_result,
+                )
+                storage_entry = _build_tool_result_storage_entry(
+                    tool_name,
+                    tool_args,
+                    cached_result,
+                    cached_summary,
+                    transcript_result=transcript_result,
+                )
                 _trace_agent_event(
                     "tool_cache_hit",
                     trace_id=trace_id,
@@ -2806,54 +2815,12 @@ def run_agent_stream(
                     summary=cached_summary,
                     transcript_result=transcript_result,
                 )
-
-                remember_tool_result(
-                    tool_name,
-                    tool_args,
-                    cached_result,
-                    cached_summary,
-                    cache_key,
-                    transcript_result=transcript_result,
-                )
-                yield {
-                    "type": "tool_result",
-                    "step": step,
-                    "tool": tool_name,
-                    "summary": f"{cached_summary} (cached)",
-                    "call_id": call_id,
-                    "cached": True,
-                }
-                cached_storage_entry = _build_tool_result_storage_entry(
-                    tool_name,
-                    tool_args,
-                    cached_result,
-                    cached_summary,
-                    transcript_result=transcript_result,
-                )
-                tool_messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call_id,
-                        "content": _build_compact_tool_message_content(
-                            tool_name,
-                            tool_args,
-                            cached_result,
-                            f"{cached_summary} (cached)",
-                            transcript_result=transcript_result,
-                            storage_entry=cached_storage_entry,
-                        ),
-                    }
-                )
-                transcript_results.append(
-                    {
-                        "tool_name": tool_name,
-                        "arguments": tool_args,
-                        "ok": not (tool_name == "fetch_url" and isinstance(cached_result, dict) and cached_result.get("error")),
-                        "summary": f"{cached_summary} (cached)",
-                        "result": transcript_result,
-                        "cached": True,
-                    }
-                )
+                slot["kind"] = "session_cache_hit"
+                slot["result"] = cached_result
+                slot["summary"] = cached_summary
+                slot["transcript_result"] = transcript_result
+                slot["storage_entry"] = storage_entry
+                slots.append(slot)
                 continue
 
             cross_turn_cache_hit = _lookup_cross_turn_tool_memory(tool_name, tool_args)
@@ -2867,11 +2834,92 @@ def run_agent_stream(
                     tool_args=tool_args,
                     summary=cached_summary,
                 )
+                slot["kind"] = "memory_cache_hit"
+                slot["result"] = cached_excerpt
+                slot["summary"] = cached_summary
+                slot["transcript_result"] = cached_excerpt
+                slots.append(slot)
+                continue
+
+            slot["kind"] = "execute"
+            slot["is_canvas"] = tool_name in CANVAS_TOOL_NAMES
+            slots.append(slot)
+
+        # ---- Phase 1b: yield step_update events for all non-error, non-disabled calls ----
+        for slot in slots:
+            if slot.get("has_step_update"):
+                yield {
+                    "type": "step_update",
+                    "step": step,
+                    "tool": slot["tool_name"],
+                    "preview": slot["preview"],
+                    "call_id": slot["call_id"],
+                }
+
+        # ---- Phase 2: execute pending slots (parallel for safe read-only tools, sequential for mutators) ----
+        pending_slots = [s for s in slots if s["kind"] == "execute"]
+        if pending_slots:
+            parallel_slots = [s for s in pending_slots if s["tool_name"] in PARALLEL_SAFE_TOOL_NAMES]
+            sequential_slots = [s for s in pending_slots if s["tool_name"] not in PARALLEL_SAFE_TOOL_NAMES]
+
+            if len(parallel_slots) > 1:
+                def _run_slot(s):
+                    try:
+                        res, summ = _execute_tool(s["tool_name"], s["tool_args"], runtime_state=runtime_state)
+                        return {"ok": True, "result": res, "summary": summ}
+                    except Exception as exc:
+                        return {"ok": False, "error": str(exc)}
+
+                with ThreadPoolExecutor(max_workers=len(parallel_slots)) as executor:
+                    futures_list = [(executor.submit(_run_slot, s), s) for s in parallel_slots]
+                for future, s in futures_list:
+                    s["exec_result"] = future.result()
+            else:
+                for s in parallel_slots:
+                    try:
+                        res, summ = _execute_tool(s["tool_name"], s["tool_args"], runtime_state=runtime_state)
+                        s["exec_result"] = {"ok": True, "result": res, "summary": summ}
+                    except Exception as exc:
+                        s["exec_result"] = {"ok": False, "error": str(exc)}
+
+            for s in sequential_slots:
+                try:
+                    res, summ = _execute_tool(s["tool_name"], s["tool_args"], runtime_state=runtime_state)
+                    s["exec_result"] = {"ok": True, "result": res, "summary": summ}
+                except Exception as exc:
+                    s["exec_result"] = {"ok": False, "error": str(exc)}
+
+        # ---- Phase 3: post-process all slots in original order ----
+        for slot in slots:
+            kind = slot["kind"]
+            tool_name = slot["tool_name"]
+            tool_args = slot["tool_args"]
+            call_id = slot["call_id"]
+            preview = slot["preview"]
+            cache_key = slot["cache_key"]
+
+            if kind == "error":
+                error = slot["error"]
+                yield {"type": "tool_error", "step": step, "tool": tool_name, "error": error, "call_id": call_id}
+                tool_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": _serialize_tool_message_content({"ok": False, "error": error}),
+                    }
+                )
+                transcript_results.append({"tool_name": tool_name, "arguments": tool_args, "ok": False, "error": error})
+
+            elif kind == "session_cache_hit":
+                result = slot["result"]
+                summary = slot["summary"]
+                transcript_result = slot["transcript_result"]
+                storage_entry = slot["storage_entry"]
                 yield {
                     "type": "tool_result",
                     "step": step,
                     "tool": tool_name,
-                    "summary": f"{cached_summary} (cached)",
+                    "summary": f"{summary} (cached)",
                     "call_id": call_id,
                     "cached": True,
                 }
@@ -2882,90 +2930,8 @@ def run_agent_stream(
                         "content": _build_compact_tool_message_content(
                             tool_name,
                             tool_args,
-                            cached_excerpt,
-                            f"{cached_summary} (cached)",
-                            transcript_result=cached_excerpt,
-                        ),
-                    }
-                )
-                transcript_results.append(
-                    {
-                        "tool_name": tool_name,
-                        "arguments": tool_args,
-                        "ok": True,
-                        "summary": f"{cached_summary} (cached)",
-                        "result": cached_excerpt,
-                        "cached": True,
-                    }
-                )
-                continue
-
-            try:
-                result, summary = _execute_tool(tool_name, tool_args, runtime_state=runtime_state)
-                transcript_result = _prepare_tool_result_for_transcript(
-                    tool_name,
-                    result,
-                    fetch_url_token_threshold=fetch_url_token_threshold,
-                    fetch_url_clip_aggressiveness=fetch_url_clip_aggressiveness,
-                )
-
-                if tool_name not in CANVAS_TOOL_NAMES:
-                    tool_result_cache[cache_key] = (result, summary)
-                storage_entry = _build_tool_result_storage_entry(
-                    tool_name,
-                    tool_args,
-                    result,
-                    summary,
-                    transcript_result=transcript_result,
-                )
-                if storage_entry and cache_key not in persisted_tool_cache_keys:
-                    persisted_tool_cache_keys.add(cache_key)
-                    persisted_tool_results.append(storage_entry)
-                if tool_name in WEB_TOOL_NAMES and storage_entry:
-                    try:
-                        upsert_tool_memory_result(
-                            tool_name,
-                            storage_entry.get("input_preview", ""),
-                            storage_entry.get("content", ""),
-                            storage_entry.get("summary", ""),
-                        )
-                    except Exception as exc:
-                        _trace_agent_event(
-                            "tool_memory_upsert_failed",
-                            trace_id=trace_id,
-                            step=step,
-                            tool_name=tool_name,
-                            tool_args=tool_args,
-                            error=str(exc),
-                        )
-                _trace_agent_event(
-                    "tool_call_completed",
-                    trace_id=trace_id,
-                    step=step,
-                    tool_name=tool_name,
-                    tool_args=tool_args,
-                    summary=summary,
-                    result=result,
-                    transcript_result=transcript_result,
-                )
-
-                yield {
-                    "type": "tool_result",
-                    "step": step,
-                    "tool": tool_name,
-                    "summary": summary,
-                    "call_id": call_id,
-                    "cached": False,
-                }
-                tool_messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call_id,
-                        "content": _build_compact_tool_message_content(
-                            tool_name,
-                            tool_args,
                             result,
-                            summary,
+                            f"{summary} (cached)",
                             transcript_result=transcript_result,
                             storage_entry=storage_entry,
                         ),
@@ -2976,59 +2942,177 @@ def run_agent_stream(
                         "tool_name": tool_name,
                         "arguments": tool_args,
                         "ok": not (tool_name == "fetch_url" and isinstance(result, dict) and result.get("error")),
-                        "summary": summary,
+                        "summary": f"{summary} (cached)",
                         "result": transcript_result,
+                        "cached": True,
                     }
                 )
-                if tool_name in CANVAS_MUTATION_TOOL_NAMES:
-                    canvas_modified = True
 
-                clarification_event = _extract_clarification_event(result)
-                if clarification_event is not None:
-                    _trace_agent_event(
-                        "clarification_requested",
-                        trace_id=trace_id,
-                        step=step,
-                        clarification=clarification_event.get("clarification"),
-                    )
-                    yield {
-                        "type": "tool_history",
-                        "step": step,
-                        "messages": [assistant_tool_call_message, *tool_messages],
-                    }
-                    yield clarification_event
-                    if usage_totals["total_tokens"]:
-                        yield usage_event()
-                    yield build_tool_capture_event()
-                    yield {"type": "done"}
-                    return
-            except Exception as exc:
-                error = str(exc)
-                _append_working_state_blocker(working_state, tool_name, error)
-                _trace_agent_event(
-                    "tool_call_failed",
-                    trace_id=trace_id,
-                    step=step,
-                    tool_name=tool_name,
-                    tool_args=tool_args,
-                    error=error,
-                )
-                yield {"type": "tool_error", "step": step, "tool": tool_name, "error": error, "call_id": call_id}
+            elif kind == "memory_cache_hit":
+                result = slot["result"]
+                summary = slot["summary"]
+                transcript_result = slot["transcript_result"]
+                yield {
+                    "type": "tool_result",
+                    "step": step,
+                    "tool": tool_name,
+                    "summary": f"{summary} (cached)",
+                    "call_id": call_id,
+                    "cached": True,
+                }
                 tool_messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": call_id,
-                        "content": _serialize_tool_message_content({"ok": False, "error": error}),
+                        "content": _build_compact_tool_message_content(
+                            tool_name,
+                            tool_args,
+                            result,
+                            f"{summary} (cached)",
+                            transcript_result=transcript_result,
+                        ),
                     }
                 )
                 transcript_results.append(
                     {
                         "tool_name": tool_name,
                         "arguments": tool_args,
-                        "ok": False,
-                        "error": error,
+                        "ok": True,
+                        "summary": f"{summary} (cached)",
+                        "result": transcript_result,
+                        "cached": True,
                     }
                 )
+
+            elif kind == "execute":
+                exec_result = slot["exec_result"]
+                if exec_result["ok"]:
+                    result = exec_result["result"]
+                    summary = exec_result["summary"]
+                    transcript_result = _prepare_tool_result_for_transcript(
+                        tool_name,
+                        result,
+                        fetch_url_token_threshold=fetch_url_token_threshold,
+                        fetch_url_clip_aggressiveness=fetch_url_clip_aggressiveness,
+                    )
+                    if tool_name not in CANVAS_TOOL_NAMES:
+                        tool_result_cache[cache_key] = (result, summary)
+                    storage_entry = _build_tool_result_storage_entry(
+                        tool_name,
+                        tool_args,
+                        result,
+                        summary,
+                        transcript_result=transcript_result,
+                    )
+                    if storage_entry and cache_key not in persisted_tool_cache_keys:
+                        persisted_tool_cache_keys.add(cache_key)
+                        persisted_tool_results.append(storage_entry)
+                    if tool_name in WEB_TOOL_NAMES and storage_entry:
+                        try:
+                            upsert_tool_memory_result(
+                                tool_name,
+                                storage_entry.get("input_preview", ""),
+                                storage_entry.get("content", ""),
+                                storage_entry.get("summary", ""),
+                            )
+                        except Exception as exc:
+                            _trace_agent_event(
+                                "tool_memory_upsert_failed",
+                                trace_id=trace_id,
+                                step=step,
+                                tool_name=tool_name,
+                                tool_args=tool_args,
+                                error=str(exc),
+                            )
+                    _trace_agent_event(
+                        "tool_call_completed",
+                        trace_id=trace_id,
+                        step=step,
+                        tool_name=tool_name,
+                        tool_args=tool_args,
+                        summary=summary,
+                        result=result,
+                        transcript_result=transcript_result,
+                    )
+                    yield {
+                        "type": "tool_result",
+                        "step": step,
+                        "tool": tool_name,
+                        "summary": summary,
+                        "call_id": call_id,
+                        "cached": False,
+                    }
+                    tool_messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": _build_compact_tool_message_content(
+                                tool_name,
+                                tool_args,
+                                result,
+                                summary,
+                                transcript_result=transcript_result,
+                                storage_entry=storage_entry,
+                            ),
+                        }
+                    )
+                    transcript_results.append(
+                        {
+                            "tool_name": tool_name,
+                            "arguments": tool_args,
+                            "ok": not (tool_name == "fetch_url" and isinstance(result, dict) and result.get("error")),
+                            "summary": summary,
+                            "result": transcript_result,
+                        }
+                    )
+                    if tool_name in CANVAS_MUTATION_TOOL_NAMES:
+                        canvas_modified = True
+                    clarification_event = _extract_clarification_event(result)
+                    if clarification_event is not None:
+                        _trace_agent_event(
+                            "clarification_requested",
+                            trace_id=trace_id,
+                            step=step,
+                            clarification=clarification_event.get("clarification"),
+                        )
+                        yield {
+                            "type": "tool_history",
+                            "step": step,
+                            "messages": [assistant_tool_call_message, *tool_messages],
+                        }
+                        yield clarification_event
+                        if usage_totals["total_tokens"]:
+                            yield usage_event()
+                        yield build_tool_capture_event()
+                        yield {"type": "done"}
+                        return
+                else:
+                    error = exec_result["error"]
+                    _append_working_state_blocker(working_state, tool_name, error)
+                    _trace_agent_event(
+                        "tool_call_failed",
+                        trace_id=trace_id,
+                        step=step,
+                        tool_name=tool_name,
+                        tool_args=tool_args,
+                        error=error,
+                    )
+                    yield {"type": "tool_error", "step": step, "tool": tool_name, "error": error, "call_id": call_id}
+                    tool_messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": _serialize_tool_message_content({"ok": False, "error": error}),
+                        }
+                    )
+                    transcript_results.append(
+                        {
+                            "tool_name": tool_name,
+                            "arguments": tool_args,
+                            "ok": False,
+                            "error": error,
+                        }
+                    )
 
         _trace_agent_event(
             "tool_transcript_appended",

@@ -93,6 +93,7 @@ const mobileToolsBtn = document.getElementById("mobile-tools-btn");
 const mobileToolsPanel = document.getElementById("mobile-tools-panel");
 const mobileToolsOverlay = document.getElementById("mobile-tools-overlay");
 const mobileToolsClose = document.getElementById("mobile-tools-close");
+const mobileCanvasBtn = document.getElementById("mobile-canvas-btn");
 const mobileExportBtn = document.getElementById("mobile-export-btn");
 const mobilePruneBtn = document.getElementById("mobile-prune-btn");
 const mobileTokensBtn = document.getElementById("mobile-tokens-btn");
@@ -2663,6 +2664,9 @@ if (canvasCancelBtn) {
 if (exportBtn) {
   exportBtn.addEventListener("click", openExportPanel);
 }
+if (mobileCanvasBtn) {
+  mobileCanvasBtn.addEventListener("click", openCanvas);
+}
 if (mobileExportBtn) {
   mobileExportBtn.addEventListener("click", openExportPanel);
 }
@@ -3506,6 +3510,7 @@ if (pruneHistoryBtn) {
 
 inputEl.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey) {
+    if ("ontouchstart" in window || navigator.maxTouchPoints > 0) return;
     event.preventDefault();
     if (!isStreaming && !isFixing) {
       sendMessage();

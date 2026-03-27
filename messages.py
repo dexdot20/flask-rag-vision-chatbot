@@ -5,7 +5,6 @@ from datetime import datetime
 
 from canvas_service import build_canvas_project_manifest, extract_canvas_documents, scale_canvas_char_limit
 from config import (
-    MAX_SCRATCHPAD_LENGTH,
     MAX_USER_PREFERENCES_LENGTH,
     RAG_ENABLED,
 )
@@ -270,7 +269,7 @@ def build_runtime_system_message(
 ):
     now = (now or datetime.now().astimezone()).astimezone()
     preferences_text = (user_preferences or "").strip()[:MAX_USER_PREFERENCES_LENGTH]
-    scratchpad_text = (scratchpad or "").strip()[:MAX_SCRATCHPAD_LENGTH]
+    scratchpad_text = (scratchpad or "").strip()
     active_tool_names = resolve_runtime_tool_names(active_tool_names or [], canvas_documents=canvas_documents)
     offset = now.strftime("%z")
     timezone_label = f"UTC{offset[:3]}:{offset[3:]}" if offset else (now.tzname() or "UTC")
@@ -296,6 +295,7 @@ def build_runtime_system_message(
     # Scratchpad
     if scratchpad_text or any(name in {"append_scratchpad", "replace_scratchpad"} for name in active_tool_names):
         parts.append("## Scratchpad (AI Persistent Memory)")
+        parts.append("*This section is your complete scratchpad — you can read it directly here without calling any tool.*\n")
         if scratchpad_text:
             parts.append(scratchpad_text)
         else:
@@ -307,7 +307,7 @@ def build_runtime_system_message(
                 "- **DO NOT save**: One-off tasks, transient project state, raw tool outputs, web/search results, speculative inferences, broad summaries, or details already obvious from the current chat.\n"
                 "- **Before saving**: Ask whether this information will still matter in a future conversation and whether it is specific enough to be useful as a single short note. If not, do not save it.\n"
                 "- **Web findings**: Do not turn search/news/URL results into scratchpad entries unless the result is clearly durable and the user would reasonably expect it to be remembered later. Never save them just because they were requested.\n"
-                "- **Style**: Prefer one short line per fact. Avoid paragraphs, lists of facts, or duplicated variants of the same note."
+                "- **Style**: Each `notes` item must be one single short standalone fact. Never put multiple facts in one item. Call `append_scratchpad` once per batch of facts instead of once per fact."
             )
         parts.append("")
 

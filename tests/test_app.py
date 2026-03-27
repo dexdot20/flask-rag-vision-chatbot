@@ -104,11 +104,14 @@ class AppRoutesTestCase(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.db_path = f"{self.temp_dir.name}/test.db"
         self.image_storage_dir = f"{self.temp_dir.name}/image-store"
+        self.login_pin_patcher = patch("config.LOGIN_PIN", "")
+        self.login_pin_patcher.start()
         self.app = create_app(database_path=self.db_path)
         self.app.config.update(TESTING=True)
         self.client = self.app.test_client()
 
     def tearDown(self):
+        self.login_pin_patcher.stop()
         self.temp_dir.cleanup()
 
     def _create_conversation(self, title: str = "Test Chat") -> int:
@@ -1321,7 +1324,7 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(result["status"], "appended")
 
         duplicate_result, duplicate_summary = append_to_scratchpad("The   user is 22 years old.   ")
-        self.assertEqual(duplicate_summary, "Scratchpad note already exists")
+        self.assertEqual(duplicate_summary, "Scratchpad notes already exist")
         self.assertEqual(duplicate_result["status"], "skipped")
 
         settings = get_app_settings()
@@ -2224,7 +2227,7 @@ class AppRoutesTestCase(unittest.TestCase):
         responses = [
             iter(
                 [
-                    self._tool_call_chunk("append_scratchpad", {"note": "The user is 22 years old."}),
+                    self._tool_call_chunk("append_scratchpad", {"notes": ["The user is 22 years old."]}),
                     self._stream_chunk(usage=SimpleNamespace(prompt_tokens=3, completion_tokens=3, total_tokens=6)),
                 ]
             ),
