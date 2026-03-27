@@ -3570,9 +3570,10 @@ class AppRoutesTestCase(unittest.TestCase):
         )
 
         second_call_messages = mocked_create.call_args_list[1].kwargs["messages"]
-        self.assertEqual([message["role"] for message in second_call_messages], ["user", "assistant", "tool"])
+        self.assertEqual([message["role"] for message in second_call_messages], ["user", "assistant", "tool", "system"])
         self.assertEqual(second_call_messages[1]["tool_calls"][0]["function"]["name"], "search_web")
         self.assertEqual(second_call_messages[2]["tool_call_id"], "tool-call-1")
+        self.assertIn("[AGENT REASONING CONTEXT]", second_call_messages[3]["content"])
 
         tool_history_event = next((event for event in events if event["type"] == "tool_history"), None)
         self.assertIsNotNone(tool_history_event)
@@ -3921,6 +3922,126 @@ class AppRoutesTestCase(unittest.TestCase):
 
         reasoning_deltas = [event["text"] for event in events if event["type"] == "reasoning_delta"]
         self.assertEqual(reasoning_deltas, ["First reasoning block.", "\n\n", "Second reasoning block."])
+
+    def test_run_agent_stream_replays_reasoning_into_next_tool_step(self):
+        responses = [
+            iter(
+                [
+                    self._stream_chunk(reasoning="Need current info before I answer."),
+                    self._tool_call_chunk("search_web", {"queries": ["latest update"]}),
+                    self._stream_chunk(usage=SimpleNamespace(prompt_tokens=2, completion_tokens=3, total_tokens=5)),
+                ]
+            ),
+            iter(
+                [
+                    self._stream_chunk(content="Final answer."),
+                    self._stream_chunk(usage=SimpleNamespace(prompt_tokens=2, completion_tokens=4, total_tokens=6)),
+                ]
+            ),
+        ]
+
+        with patch("agent.client.chat.completions.create", side_effect=responses) as mocked_create, patch(
+            "agent.search_web_tool",
+            return_value=[{"title": "Test", "url": "https://example.com", "snippet": "Snippet"}],
+        ):
+            events = list(run_agent_stream([{"role": "user", "content": "Test"}], "deepseek-reasoner", 2, ["search_web"]))
+
+        self.assertIn({"type": "answer_delta", "text": "Final answer."}, events)
+        second_call_messages = mocked_create.call_args_list[1].kwargs["messages"]
+        replay_message = next(
+            (
+                message
+                for message in second_call_messages
+                if message.get("role") == "system" and "[AGENT REASONING CONTEXT]" in message.get("content", "")
+            ),
+            None,
+        )
+        self.assertIsNotNone(replay_message)
+        self.assertIn("Need current info before I answer.", replay_message["content"])
+        self.assertIn("planned tools = search_web", replay_message["content"])
+
+    def test_run_agent_stream_skips_reasoning_replay_when_reasoning_empty(self):
+        responses = [
+            iter(
+                [
+                    self._tool_call_chunk("search_web", {"queries": ["latest update"]}),
+                    self._stream_chunk(usage=SimpleNamespace(prompt_tokens=2, completion_tokens=3, total_tokens=5)),
+                ]
+            ),
+            iter(
+                [
+                    self._stream_chunk(content="Final answer."),
+                    self._stream_chunk(usage=SimpleNamespace(prompt_tokens=2, completion_tokens=4, total_tokens=6)),
+                ]
+            ),
+        ]
+
+        with patch("agent.client.chat.completions.create", side_effect=responses) as mocked_create, patch(
+            "agent.search_web_tool",
+            return_value=[{"title": "Test", "url": "https://example.com", "snippet": "Snippet"}],
+        ):
+            events = list(run_agent_stream([{"role": "user", "content": "Test"}], "deepseek-chat", 2, ["search_web"]))
+
+        self.assertIn({"type": "answer_delta", "text": "Final answer."}, events)
+        second_call_messages = mocked_create.call_args_list[1].kwargs["messages"]
+        replay_messages = [
+            message
+            for message in second_call_messages
+            if message.get("role") == "system" and "[AGENT REASONING CONTEXT]" in message.get("content", "")
+        ]
+        self.assertEqual(replay_messages, [])
+
+    def test_run_agent_stream_replays_reasoning_alongside_blocker_memory(self):
+        responses = [
+            iter(
+                [
+                    self._stream_chunk(reasoning="I should search first, then summarize whatever I find."),
+                    self._tool_call_chunk("search_web", {"queries": ["latest update"]}),
+                    self._stream_chunk(usage=SimpleNamespace(prompt_tokens=2, completion_tokens=3, total_tokens=5)),
+                ]
+            ),
+            iter(
+                [
+                    self._stream_chunk(content="Fallback answer."),
+                    self._stream_chunk(usage=SimpleNamespace(prompt_tokens=2, completion_tokens=4, total_tokens=6)),
+                ]
+            ),
+        ]
+
+        with patch("agent.client.chat.completions.create", side_effect=responses) as mocked_create, patch(
+            "agent.search_web_tool",
+            side_effect=RuntimeError("search backend unavailable"),
+        ):
+            events = list(run_agent_stream([{"role": "user", "content": "Find current info"}], "deepseek-reasoner", 2, ["search_web"]))
+
+        self.assertIn({"type": "answer_delta", "text": "Fallback answer."}, events)
+        second_call_messages = mocked_create.call_args_list[1].kwargs["messages"]
+        replay_message = next(
+            (
+                message
+                for message in second_call_messages
+                if message.get("role") == "system" and "[AGENT REASONING CONTEXT]" in message.get("content", "")
+            ),
+            None,
+        )
+        blocker_message = next(
+            (
+                message
+                for message in second_call_messages
+                if message.get("role") == "system" and "AGENT WORKING MEMORY" in message.get("content", "")
+            ),
+            None,
+        )
+        self.assertIsNotNone(replay_message)
+        self.assertIsNotNone(blocker_message)
+        self.assertIn("I should search first", replay_message["content"])
+        self.assertIn("search backend unavailable", blocker_message["content"])
+
+    def test_estimate_message_breakdown_counts_reasoning_replay_as_internal_state(self):
+        content = "[AGENT REASONING CONTEXT]\n\nPrior reasoning"
+        breakdown = _estimate_message_breakdown({"role": "system", "content": content})
+
+        self.assertEqual(breakdown, {"internal_state": estimate_text_tokens(content)})
 
     def test_run_agent_stream_reports_missing_final_content_after_retry_budget(self):
         responses = [

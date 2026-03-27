@@ -83,6 +83,9 @@ CONTEXT_OVERFLOW_RECOVERY_ERROR_TEXT = (
 )
 MISSING_FINAL_ANSWER_MARKER = "[INSTRUCTION: MISSING FINAL ANSWER"
 TOOL_EXECUTION_RESULTS_MARKER = "[TOOL EXECUTION RESULTS]"
+REASONING_REPLAY_MARKER = "[AGENT REASONING CONTEXT]"
+MAX_REASONING_REPLAY_ENTRIES = 2
+MAX_REASONING_REPLAY_CHARS = 4_000
 CANVAS_TOOL_NAMES = {
     "expand_canvas_document",
     "scroll_canvas_document",
@@ -335,6 +338,8 @@ def _estimate_message_breakdown(message: dict) -> dict[str, int]:
     # Classify system messages by their distinctive markers
     if content.startswith(TOOL_EXECUTION_RESULTS_MARKER):
         return {"tool_results": total_tokens}
+    if content.startswith(REASONING_REPLAY_MARKER):
+        return {"internal_state": total_tokens}
     if content.startswith("[AGENT WORKING MEMORY]"):
         return {"internal_state": total_tokens}
     if content.startswith("[INSTRUCTION: FINAL ANSWER REQUIRED]"):
@@ -2253,6 +2258,64 @@ def _append_working_state_blocker(working_state: dict, tool_name: str, error: st
         del blockers[:-6]
 
 
+def _append_reasoning_replay_entry(reasoning_state: dict, step: int, reasoning_text: str, tool_calls: list[dict] | None) -> None:
+    if not isinstance(reasoning_state, dict):
+        return
+
+    cleaned_reasoning = _clean_tool_text(reasoning_text or "", limit=MAX_REASONING_REPLAY_CHARS)
+    if not cleaned_reasoning:
+        return
+
+    entries = reasoning_state.setdefault("entries", [])
+    tool_names = [
+        str(tool_call.get("name") or "").strip()
+        for tool_call in (tool_calls or [])
+        if str(tool_call.get("name") or "").strip()
+    ]
+    entry = {
+        "step": max(1, int(step or 0)),
+        "reasoning": cleaned_reasoning,
+        "tool_names": tool_names,
+    }
+    if entries and entries[-1] == entry:
+        return
+    entries.append(entry)
+    if len(entries) > MAX_REASONING_REPLAY_ENTRIES:
+        del entries[:-MAX_REASONING_REPLAY_ENTRIES]
+
+
+def _build_reasoning_replay_instruction(reasoning_state: dict, current_goal: str = "") -> dict | None:
+    if not isinstance(reasoning_state, dict):
+        return None
+
+    entries = reasoning_state.get("entries") if isinstance(reasoning_state.get("entries"), list) else []
+    if not entries:
+        return None
+
+    parts = [REASONING_REPLAY_MARKER]
+    parts.append(
+        "Use this as your prior reasoning from earlier steps in the current run. Continue from it when it still fits, but correct it if tool results changed the picture."
+    )
+
+    normalized_goal = _clean_tool_text(current_goal or "", limit=180)
+    if normalized_goal:
+        parts.append(f"Current goal: {normalized_goal}")
+
+    for entry in entries[-MAX_REASONING_REPLAY_ENTRIES:]:
+        step_number = max(1, int(entry.get("step") or 0))
+        tool_names = [
+            str(tool_name or "").strip()
+            for tool_name in (entry.get("tool_names") or [])
+            if str(tool_name or "").strip()
+        ]
+        header = f"Step {step_number} reasoning"
+        if tool_names:
+            header += ": planned tools = " + ", ".join(tool_names)
+        parts.append(header + "\n" + str(entry.get("reasoning") or ""))
+
+    return {"role": "system", "content": "\n\n".join(parts)}
+
+
 def _build_working_state_instruction(working_state: dict) -> dict | None:
     if not isinstance(working_state, dict):
         return None
@@ -2354,6 +2417,9 @@ def run_agent_stream(
         "current_goal": _extract_initial_goal(messages),
         "steps_tried": [],
         "blockers": [],
+    }
+    reasoning_state = {
+        "entries": [],
     }
 
     def build_tool_capture_event() -> dict:
@@ -2698,8 +2764,22 @@ def run_agent_stream(
         needs_separator_for_sync = pending_answer_separator
         step_retry_reason = pending_step_retry_reason
         pending_step_retry_reason = None
+        reasoning_replay_instruction = _build_reasoning_replay_instruction(
+            reasoning_state,
+            current_goal=working_state.get("current_goal") or "",
+        )
         working_memory_instruction = _build_working_state_instruction(working_state)
-        extra_messages = [working_memory_instruction] if working_memory_instruction else []
+        extra_messages = []
+        if reasoning_replay_instruction:
+            extra_messages.append(reasoning_replay_instruction)
+            _trace_agent_event(
+                "reasoning_replay_injected",
+                trace_id=trace_id,
+                step=step,
+                entry_count=len(reasoning_state.get("entries") or []),
+            )
+        if working_memory_instruction:
+            extra_messages.append(working_memory_instruction)
         turn_messages, _ = apply_context_compaction(extra_messages, reason="pre_model_turn")
 
         try:
@@ -2738,6 +2818,7 @@ def run_agent_stream(
             yield {"type": "tool_error", "step": step, "tool": "api", "error": fatal_api_error}
             break
 
+        reasoning_text = turn_result.get("reasoning_text") or ""
         content_text = turn_result.get("content_text") or ""
         tool_calls = turn_result.get("tool_calls")
         tool_call_error = turn_result.get("tool_call_error")
@@ -2833,6 +2914,19 @@ def run_agent_stream(
             pending_step_retry_reason = "missing_final_answer"
             continue
 
+        _append_reasoning_replay_entry(reasoning_state, step, reasoning_text, tool_calls)
+        if reasoning_text:
+            _trace_agent_event(
+                "reasoning_replay_updated",
+                trace_id=trace_id,
+                step=step,
+                chars=len(reasoning_text),
+                tool_names=[
+                    str(tool_call.get("name") or "").strip()
+                    for tool_call in (tool_calls or [])
+                    if str(tool_call.get("name") or "").strip()
+                ],
+            )
         assistant_tool_call_message = _build_assistant_tool_call_message(content_text, tool_calls)
         messages.append(assistant_tool_call_message)
         if content_text.strip() and answer_started:
