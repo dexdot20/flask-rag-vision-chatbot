@@ -36,6 +36,7 @@ from db import (
     count_visible_message_tokens,
     create_file_asset,
     create_image_asset,
+    extract_message_attachments,
     extract_message_tool_results,
     extract_message_tool_trace,
     delete_file_asset,
@@ -1438,14 +1439,16 @@ def _maybe_run_conversation_pruning(conversation_id: int, settings: dict) -> Non
 
 def parse_chat_request_payload():
     if request.mimetype and request.mimetype.startswith("multipart/form-data"):
+        image_files = [file for file in request.files.getlist("image") if getattr(file, "filename", "")]
+        document_files = [file for file in request.files.getlist("document") if getattr(file, "filename", "")]
         return {
             "messages": parse_messages_payload(request.form.get("messages", "[]")),
             "model": normalize_model_id(request.form.get("model")),
             "conversation_id": parse_optional_int(request.form.get("conversation_id")),
             "edited_message_id": parse_optional_int(request.form.get("edited_message_id")),
             "user_content": request.form.get("user_content", ""),
-            "image": request.files.get("image"),
-            "document": request.files.get("document"),
+            "images": image_files,
+            "documents": document_files,
         }
 
     data = request.get_json(silent=True) or {}
@@ -1456,9 +1459,36 @@ def parse_chat_request_payload():
         "conversation_id": parse_optional_int(data.get("conversation_id")),
         "edited_message_id": parse_optional_int(data.get("edited_message_id")),
         "user_content": data.get("user_content", ""),
-        "image": None,
-        "document": None,
+        "images": [],
+        "documents": [],
     }
+
+
+def _strip_attachment_metadata(metadata: dict | None) -> dict:
+    source = metadata if isinstance(metadata, dict) else {}
+    blocked_keys = {
+        "attachments",
+        "image_id",
+        "image_name",
+        "image_mime_type",
+        "ocr_text",
+        "vision_summary",
+        "assistant_guidance",
+        "key_points",
+        "file_id",
+        "file_name",
+        "file_mime_type",
+        "file_text_truncated",
+        "file_context_block",
+    }
+    return {key: value for key, value in source.items() if key not in blocked_keys}
+
+
+def _merge_attachment_metadata(metadata: dict | None, attachments: list[dict]) -> dict:
+    cleaned = _strip_attachment_metadata(metadata)
+    if attachments:
+        cleaned["attachments"] = attachments
+    return cleaned
 
 
 def _is_failed_tool_summary(summary: str) -> bool:
@@ -1616,8 +1646,8 @@ def register_chat_routes(app) -> None:
         conv_id = payload["conversation_id"]
         edited_message_id = payload["edited_message_id"]
         user_content = payload["user_content"]
-        uploaded_file = payload["image"]
-        uploaded_document = payload["document"]
+        uploaded_images = payload["images"]
+        uploaded_documents = payload["documents"]
 
         if not messages:
             return jsonify({"error": "No messages provided."}), 400
@@ -1625,105 +1655,111 @@ def register_chat_routes(app) -> None:
         if not is_valid_model_id(model):
             return jsonify({"error": "Invalid model."}), 400
 
-        vision_event = None
+        vision_events = []
         latest_user_message = messages[-1] if messages and messages[-1]["role"] == "user" else None
 
-        if uploaded_file is not None:
+        processed_attachments = []
+        processed_document_uploads = []
+        created_image_assets = []
+        created_file_assets = []
+
+        if uploaded_images or uploaded_documents:
             if latest_user_message is None:
-                return jsonify({"error": "Image uploads require a user message."}), 400
-            if not VISION_ENABLED:
+                return jsonify({"error": "Attachments require a user message."}), 400
+            if uploaded_images and not VISION_ENABLED:
                 return jsonify({"error": VISION_DISABLED_FEATURE_ERROR}), 410
             if conv_id is None:
-                return jsonify({"error": "Image uploads require an existing saved conversation."}), 400
-            created_image_asset = None
+                return jsonify({"error": "Attachments require an existing saved conversation."}), 400
+
             try:
-                image_name, image_mime_type, image_bytes = read_uploaded_image(uploaded_file)
-                created_image_asset = create_image_asset(conv_id, image_name, image_mime_type, image_bytes)
-                vision_analysis = run_image_vision_analysis(
-                    image_bytes,
-                    image_mime_type,
-                    user_text=latest_user_message["content"],
-                )
+                processing_stage = "image"
+                for uploaded_file in uploaded_images:
+                    image_name, image_mime_type, image_bytes = read_uploaded_image(uploaded_file)
+                    created_image_asset = create_image_asset(conv_id, image_name, image_mime_type, image_bytes)
+                    created_image_assets.append(created_image_asset)
+                    vision_analysis = run_image_vision_analysis(
+                        image_bytes,
+                        image_mime_type,
+                        user_text=latest_user_message["content"],
+                    )
+                    attachment = {
+                        "kind": "image",
+                        "image_id": created_image_asset["image_id"],
+                        "image_name": image_name,
+                        "image_mime_type": image_mime_type,
+                        "ocr_text": vision_analysis.get("ocr_text", ""),
+                        "vision_summary": vision_analysis.get("vision_summary", ""),
+                        "assistant_guidance": vision_analysis.get("assistant_guidance", ""),
+                        "key_points": vision_analysis.get("key_points", []),
+                    }
+                    processed_attachments.append(attachment)
+                    vision_events.append(
+                        {
+                            "type": "vision_complete",
+                            "attachment": attachment,
+                            "image_id": created_image_asset["image_id"],
+                            "image_name": image_name,
+                            "ocr_text": vision_analysis.get("ocr_text", ""),
+                            "vision_summary": vision_analysis.get("vision_summary", ""),
+                            "assistant_guidance": vision_analysis.get("assistant_guidance", ""),
+                            "key_points": vision_analysis.get("key_points", []),
+                        }
+                    )
+
+                processing_stage = "document"
+                for uploaded_document in uploaded_documents:
+                    doc_name, doc_mime_type, doc_bytes = read_uploaded_document(uploaded_document)
+                    extracted_text = extract_document_text(doc_bytes, doc_mime_type)
+                    if not extracted_text.strip():
+                        raise ValueError("Could not extract any text from the uploaded document.")
+                    created_file_asset = create_file_asset(conv_id, doc_name, doc_mime_type, doc_bytes, extracted_text)
+                    created_file_assets.append(created_file_asset)
+                    context_block, text_truncated = build_document_context_block(doc_name, extracted_text)
+                    attachment = {
+                        "kind": "document",
+                        "file_id": created_file_asset["file_id"],
+                        "file_name": doc_name,
+                        "file_mime_type": doc_mime_type,
+                        "file_text_truncated": text_truncated,
+                        "file_context_block": context_block,
+                    }
+                    processed_attachments.append(attachment)
+                    processed_document_uploads.append(
+                        {
+                            "attachment": attachment,
+                            "doc_name": doc_name,
+                            "doc_mime_type": doc_mime_type,
+                            "text_truncated": text_truncated,
+                            "canvas_md": build_canvas_markdown(doc_name, extracted_text),
+                            "canvas_format": infer_canvas_format(doc_name),
+                            "canvas_language": infer_canvas_language(doc_name),
+                        }
+                    )
             except ValueError as exc:
-                if created_image_asset is not None:
-                    delete_image_asset(created_image_asset["image_id"], conversation_id=conv_id)
+                for asset in created_image_assets:
+                    delete_image_asset(asset["image_id"], conversation_id=conv_id)
+                for asset in created_file_assets:
+                    delete_file_asset(asset["file_id"], conversation_id=conv_id)
                 return jsonify({"error": str(exc)}), 400
+            except RuntimeError as exc:
+                for asset in created_image_assets:
+                    delete_image_asset(asset["image_id"], conversation_id=conv_id)
+                for asset in created_file_assets:
+                    delete_file_asset(asset["file_id"], conversation_id=conv_id)
+                return jsonify({"error": str(exc)}), 410
             except Exception as exc:
-                if created_image_asset is not None:
-                    delete_image_asset(created_image_asset["image_id"], conversation_id=conv_id)
+                for asset in created_image_assets:
+                    delete_image_asset(asset["image_id"], conversation_id=conv_id)
+                for asset in created_file_assets:
+                    delete_file_asset(asset["file_id"], conversation_id=conv_id)
+                if processing_stage == "document":
+                    return jsonify({"error": f"Document processing failed: {exc}"}), 502
                 return jsonify({"error": f"Local image analysis failed: {exc}"}), 502
 
-            latest_user_message["metadata"] = {
-                **latest_user_message.get("metadata", {}),
-                "image_id": created_image_asset["image_id"],
-                "ocr_text": vision_analysis.get("ocr_text", ""),
-                "vision_summary": vision_analysis.get("vision_summary", ""),
-                "assistant_guidance": vision_analysis.get("assistant_guidance", ""),
-                "key_points": vision_analysis.get("key_points", []),
-                "image_name": image_name,
-                "image_mime_type": image_mime_type,
-            }
-            vision_event = {
-                "type": "vision_complete",
-                "image_id": created_image_asset["image_id"],
-                "image_name": image_name,
-                "ocr_text": vision_analysis.get("ocr_text", ""),
-                "vision_summary": vision_analysis.get("vision_summary", ""),
-                "assistant_guidance": vision_analysis.get("assistant_guidance", ""),
-                "key_points": vision_analysis.get("key_points", []),
-            }
-
-        document_event = None
-        pre_created_canvas_state = None
-        if uploaded_document is not None:
-            if latest_user_message is None:
-                return jsonify({"error": "Document uploads require a user message."}), 400
-            if conv_id is None:
-                return jsonify({"error": "Document uploads require an existing saved conversation."}), 400
-            created_file_asset = None
-            try:
-                doc_name, doc_mime_type, doc_bytes = read_uploaded_document(uploaded_document)
-                extracted_text = extract_document_text(doc_bytes, doc_mime_type)
-                if not extracted_text.strip():
-                    raise ValueError("Could not extract any text from the uploaded document.")
-                created_file_asset = create_file_asset(conv_id, doc_name, doc_mime_type, doc_bytes, extracted_text)
-                context_block, text_truncated = build_document_context_block(doc_name, extracted_text)
-                canvas_md = build_canvas_markdown(doc_name, extracted_text)
-                canvas_format = infer_canvas_format(doc_name)
-                canvas_language = infer_canvas_language(doc_name)
-                pre_created_canvas_state = create_canvas_runtime_state()
-                canvas_doc = create_canvas_document(
-                    pre_created_canvas_state,
-                    doc_name,
-                    canvas_md,
-                    format_name=canvas_format,
-                    language_name=canvas_language,
-                )
-                latest_user_message["metadata"] = {
-                    **latest_user_message.get("metadata", {}),
-                    "file_id": created_file_asset["file_id"],
-                    "file_name": doc_name,
-                    "file_mime_type": doc_mime_type,
-                    "file_text_truncated": text_truncated,
-                    "file_context_block": context_block,
-                }
-                document_event = {
-                    "type": "document_processed",
-                    "file_id": created_file_asset["file_id"],
-                    "file_name": doc_name,
-                    "file_mime_type": doc_mime_type,
-                    "text_truncated": text_truncated,
-                    "canvas_document": canvas_doc,
-                    "open_canvas": False,
-                }
-            except ValueError as exc:
-                if created_file_asset is not None:
-                    delete_file_asset(created_file_asset["file_id"], conversation_id=conv_id)
-                return jsonify({"error": str(exc)}), 400
-            except Exception as exc:
-                if created_file_asset is not None:
-                    delete_file_asset(created_file_asset["file_id"], conversation_id=conv_id)
-                return jsonify({"error": f"Document processing failed: {exc}"}), 502
+            latest_user_message["metadata"] = _merge_attachment_metadata(
+                latest_user_message.get("metadata"),
+                processed_attachments,
+            )
 
         settings = get_app_settings()
         max_steps = max(1, min(10, int(settings.get("max_steps", 5))))
@@ -1798,17 +1834,22 @@ def register_chat_routes(app) -> None:
                         (conv_id,),
                     )
 
-            image_id = ((latest_user_message.get("metadata") or {}).get("image_id") or "").strip()
-            if image_id and persisted_user_message_id is not None:
-                update_image_asset(
-                    image_id,
-                    message_id=persisted_user_message_id,
-                    initial_analysis=latest_user_message.get("metadata"),
-                )
+            attachments = extract_message_attachments(latest_user_message.get("metadata"))
+            if persisted_user_message_id is not None:
+                for attachment in attachments:
+                    if attachment.get("kind") == "image":
+                        image_id = str(attachment.get("image_id") or "").strip()
+                        if image_id:
+                            update_image_asset(
+                                image_id,
+                                message_id=persisted_user_message_id,
+                                initial_analysis=attachment,
+                            )
+                        continue
 
-            file_id = ((latest_user_message.get("metadata") or {}).get("file_id") or "").strip()
-            if file_id and persisted_user_message_id is not None:
-                update_file_asset(file_id, message_id=persisted_user_message_id)
+                    file_id = str(attachment.get("file_id") or "").strip()
+                    if file_id:
+                        update_file_asset(file_id, message_id=persisted_user_message_id)
 
             canonical_messages = get_conversation_messages(conv_id)
         elif conv_id:
@@ -1856,11 +1897,34 @@ def register_chat_routes(app) -> None:
         workspace_runtime_state = create_workspace_runtime_state(conv_id)
         workspace_root = get_workspace_root(workspace_runtime_state)
         initial_project_workflow = find_latest_project_workflow(canonical_messages)
-        if pre_created_canvas_state is not None:
-            pre_docs = get_canvas_runtime_documents(pre_created_canvas_state)
-            if pre_docs:
-                initial_canvas_documents = pre_docs
-                initial_canvas_active_document_id = get_canvas_runtime_active_document_id(pre_created_canvas_state)
+        document_events = []
+        if processed_document_uploads:
+            pre_created_canvas_state = create_canvas_runtime_state(
+                initial_canvas_documents,
+                active_document_id=initial_canvas_active_document_id,
+            )
+            for upload in processed_document_uploads:
+                canvas_doc = create_canvas_document(
+                    pre_created_canvas_state,
+                    upload["doc_name"],
+                    upload["canvas_md"],
+                    format_name=upload["canvas_format"],
+                    language_name=upload["canvas_language"],
+                )
+                document_events.append(
+                    {
+                        "type": "document_processed",
+                        "attachment": upload["attachment"],
+                        "file_id": upload["attachment"]["file_id"],
+                        "file_name": upload["doc_name"],
+                        "file_mime_type": upload["doc_mime_type"],
+                        "text_truncated": upload["text_truncated"],
+                        "canvas_document": canvas_doc,
+                        "open_canvas": False,
+                    }
+                )
+            initial_canvas_documents = get_canvas_runtime_documents(pre_created_canvas_state)
+            initial_canvas_active_document_id = get_canvas_runtime_active_document_id(pre_created_canvas_state)
         runtime_tool_names = resolve_runtime_tool_names(active_tool_names, canvas_documents=initial_canvas_documents)
         api_messages, prompt_budget_stats = _build_budgeted_prompt_messages(
             canonical_messages,
@@ -1893,7 +1957,7 @@ def register_chat_routes(app) -> None:
             persisted_assistant_message_id = None
             summary_future = None
 
-            if vision_event:
+            for vision_event in vision_events:
                 yield json.dumps(vision_event, ensure_ascii=False) + "\n"
 
             if preflight_summary_outcome and preflight_summary_outcome.get("applied"):
@@ -1930,17 +1994,18 @@ def register_chat_routes(app) -> None:
                     ensure_ascii=False,
                 ) + "\n"
 
-            if document_event:
-                yield json.dumps(document_event, ensure_ascii=False) + "\n"
-                if document_event.get("canvas_document"):
-                    yield json.dumps(
-                        {
-                            "type": "canvas_sync",
-                            "documents": [document_event["canvas_document"]],
-                                "auto_open": False,
-                        },
-                        ensure_ascii=False,
-                    ) + "\n"
+            if document_events:
+                for document_event in document_events:
+                    yield json.dumps(document_event, ensure_ascii=False) + "\n"
+                yield json.dumps(
+                    {
+                        "type": "canvas_sync",
+                        "documents": initial_canvas_documents,
+                        "active_document_id": initial_canvas_active_document_id,
+                        "auto_open": False,
+                    },
+                    ensure_ascii=False,
+                ) + "\n"
 
             for event in run_agent_stream(
                 api_messages,

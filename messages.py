@@ -8,7 +8,7 @@ from config import (
     MAX_USER_PREFERENCES_LENGTH,
     RAG_ENABLED,
 )
-from db import parse_message_metadata, parse_message_tool_calls
+from db import extract_message_attachments, parse_message_metadata, parse_message_tool_calls
 from tool_registry import get_prompt_tool_context, resolve_runtime_tool_names
 
 SUMMARY_LABEL = "Conversation summary (generated from deleted messages):"
@@ -104,35 +104,54 @@ def build_user_message_for_model(content: str, metadata: dict | None = None) -> 
     content = (content or "").strip()
     metadata = metadata if isinstance(metadata, dict) else {}
 
-    # --- Document context block ---
-    file_context_block = (metadata.get("file_context_block") or "").strip()
+    attachments = extract_message_attachments(metadata)
+    file_context_blocks = []
+    vision_attachments = []
+    for attachment in attachments:
+        if attachment.get("kind") == "document":
+            context_block = str(attachment.get("file_context_block") or "").strip()
+            if context_block and context_block not in file_context_blocks:
+                file_context_blocks.append(context_block)
+            continue
 
-    # --- Vision/Image block ---
-    image_id = (metadata.get("image_id") or "").strip()
-    image_name = (metadata.get("image_name") or "").strip()
-    ocr_text = (metadata.get("ocr_text") or "").strip()
-    vision_summary = (metadata.get("vision_summary") or "").strip()
-    assistant_guidance = (metadata.get("assistant_guidance") or "").strip()
-    key_points = metadata.get("key_points") if isinstance(metadata.get("key_points"), list) else []
+        image_id = str(attachment.get("image_id") or "").strip()
+        image_name = str(attachment.get("image_name") or "").strip()
+        ocr_text = str(attachment.get("ocr_text") or "").strip()
+        vision_summary = str(attachment.get("vision_summary") or "").strip()
+        assistant_guidance = str(attachment.get("assistant_guidance") or "").strip()
+        key_points = attachment.get("key_points") if isinstance(attachment.get("key_points"), list) else []
+        has_vision = image_id or image_name or ocr_text or vision_summary or assistant_guidance or key_points
+        if has_vision:
+            vision_attachments.append(attachment)
 
-    has_vision = image_id or ocr_text or vision_summary or assistant_guidance or key_points
-    if not has_vision and not file_context_block:
+    if not file_context_blocks and not vision_attachments:
         return content
 
     parts = []
     if content:
         parts.append(content)
 
-    if file_context_block:
-        parts.append(file_context_block)
+    parts.extend(file_context_blocks)
 
-    if has_vision:
-        vision_parts = ["[Local Qwen2.5-VL-7B vision assistant analysis]"]
+    for index, attachment in enumerate(vision_attachments, start=1):
+        image_id = str(attachment.get("image_id") or "").strip()
+        image_name = str(attachment.get("image_name") or "").strip()
+        ocr_text = str(attachment.get("ocr_text") or "").strip()
+        vision_summary = str(attachment.get("vision_summary") or "").strip()
+        assistant_guidance = str(attachment.get("assistant_guidance") or "").strip()
+        key_points = attachment.get("key_points") if isinstance(attachment.get("key_points"), list) else []
+
+        heading = "[Local Qwen2.5-VL-7B vision assistant analysis]"
+        if len(vision_attachments) > 1:
+            heading = f"{heading} Attachment {index}"
+        vision_parts = [heading]
         if image_id:
             reference_label = f"Stored image reference: image_id={image_id}"
             if image_name:
                 reference_label += f", file={image_name}"
             vision_parts.append(reference_label)
+        elif image_name:
+            vision_parts.append(f"Uploaded image: {image_name}")
         if vision_summary:
             vision_parts.append(f"Visual summary: {vision_summary}")
         if key_points:

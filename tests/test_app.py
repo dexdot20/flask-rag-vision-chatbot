@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import requests as http_requests
+from werkzeug.datastructures import MultiDict
 
 import web_tools
 from agent import (
@@ -47,6 +48,7 @@ from db import (
     count_visible_message_tokens,
     create_image_asset,
     extract_message_usage,
+    get_file_asset,
     get_canvas_expand_max_lines,
     get_canvas_prompt_max_lines,
     get_canvas_scroll_window_lines,
@@ -623,6 +625,82 @@ class AppRoutesTestCase(unittest.TestCase):
             response.get_data(as_text=True)
 
         self.assertEqual(response.status_code, 200)
+
+    def test_chat_edit_restores_canvas_state_from_that_point(self):
+        captured = {}
+        conversation_id = self._create_conversation()
+
+        with get_db() as conn:
+            insert_message(conn, conversation_id, "user", "First prompt")
+            insert_message(
+                conn,
+                conversation_id,
+                "assistant",
+                "Initial canvas",
+                metadata=serialize_message_metadata(
+                    {
+                        "canvas_documents": [
+                            {
+                                "id": "canvas-a",
+                                "title": "draft-a.md",
+                                "format": "markdown",
+                                "content": "# Draft A",
+                            }
+                        ],
+                        "active_document_id": "canvas-a",
+                    }
+                ),
+            )
+            edited_message_id = insert_message(conn, conversation_id, "user", "Second prompt")
+            insert_message(
+                conn,
+                conversation_id,
+                "assistant",
+                "Updated canvas",
+                metadata=serialize_message_metadata(
+                    {
+                        "canvas_documents": [
+                            {
+                                "id": "canvas-b",
+                                "title": "draft-b.md",
+                                "format": "markdown",
+                                "content": "# Draft B",
+                            }
+                        ],
+                        "active_document_id": "canvas-b",
+                    }
+                ),
+            )
+
+        def fake_run_agent_stream(*args, **kwargs):
+            captured["initial_canvas_documents"] = kwargs.get("initial_canvas_documents") or []
+            captured["initial_canvas_active_document_id"] = kwargs.get("initial_canvas_active_document_id")
+            return iter([{"type": "done"}])
+
+        with patch("routes.chat.run_agent_stream", side_effect=fake_run_agent_stream), patch(
+            "routes.chat.sync_conversations_to_rag_safe"
+        ):
+            response = self.client.post(
+                "/chat",
+                json={
+                    "conversation_id": conversation_id,
+                    "model": "deepseek-chat",
+                    "edited_message_id": edited_message_id,
+                    "user_content": "Second prompt revised",
+                    "messages": [{"role": "user", "content": "Second prompt revised"}],
+                },
+            )
+            response.get_data(as_text=True)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([doc["title"] for doc in captured["initial_canvas_documents"]], ["draft-a.md"])
+        self.assertEqual(captured["initial_canvas_active_document_id"], "canvas-a")
+
+        conversation_response = self.client.get(f"/api/conversations/{conversation_id}")
+        self.assertEqual(conversation_response.status_code, 200)
+        messages = conversation_response.get_json()["messages"]
+        runtime_state = find_latest_canvas_state(messages)
+        self.assertEqual([doc["title"] for doc in runtime_state["documents"]], ["draft-a.md"])
 
     def test_chat_route_defers_postprocess_outside_testing(self):
         fake_events = iter(
@@ -1445,6 +1523,39 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn("Stored image reference: image_id=img_123, file=screen.png", content)
         self.assertIn("Visual summary: A pricing table is visible.", content)
 
+    def test_build_user_message_for_model_includes_multiple_attachments(self):
+        content = build_user_message_for_model(
+            "Compare these assets.",
+            {
+                "attachments": [
+                    {
+                        "kind": "image",
+                        "image_id": "img_123",
+                        "image_name": "screen-a.png",
+                        "vision_summary": "A dashboard is visible.",
+                    },
+                    {
+                        "kind": "image",
+                        "image_id": "img_456",
+                        "image_name": "screen-b.png",
+                        "vision_summary": "A settings page is visible.",
+                    },
+                    {
+                        "kind": "document",
+                        "file_id": "file_123",
+                        "file_name": "notes.txt",
+                        "file_context_block": "[Uploaded document: notes.txt]\n\nProject notes",
+                    },
+                ]
+            },
+        )
+
+        self.assertIn("Stored image reference: image_id=img_123, file=screen-a.png", content)
+        self.assertIn("Stored image reference: image_id=img_456, file=screen-b.png", content)
+        self.assertIn("[Uploaded document: notes.txt]", content)
+        self.assertIn("Visual summary: A dashboard is visible.", content)
+        self.assertIn("Visual summary: A settings page is visible.", content)
+
     def test_image_explain_tool_spec_requires_image_and_conversation_ids(self):
         spec = TOOL_SPEC_BY_NAME["image_explain"]
 
@@ -2042,6 +2153,79 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(asset["filename"], "screen.png")
         self.assertEqual(asset["message_id"], user_messages[0]["id"])
         self.assertTrue(Path(asset["storage_path"]).is_file())
+
+    def test_chat_mixed_multi_attachment_upload_persists_assets_and_canvas_documents(self):
+        conversation_id = self._create_conversation()
+        captured = {}
+
+        def fake_run_agent_stream(*args, **kwargs):
+            captured["initial_canvas_documents"] = kwargs.get("initial_canvas_documents") or []
+            return iter([{"type": "done"}])
+
+        with patch("db.IMAGE_STORAGE_DIR", self.image_storage_dir), patch(
+            "routes.chat.run_image_vision_analysis",
+            side_effect=[
+                {
+                    "ocr_text": "alpha",
+                    "vision_summary": "First screen.",
+                    "assistant_guidance": "Use alpha.",
+                    "key_points": ["A"],
+                },
+                {
+                    "ocr_text": "beta",
+                    "vision_summary": "Second screen.",
+                    "assistant_guidance": "Use beta.",
+                    "key_points": ["B"],
+                },
+            ],
+        ), patch("routes.chat.run_agent_stream", side_effect=fake_run_agent_stream):
+            response = self.client.post(
+                "/chat",
+                data=MultiDict(
+                    [
+                        ("messages", json.dumps([{"role": "user", "content": "Review everything"}])),
+                        ("model", "deepseek-chat"),
+                        ("conversation_id", str(conversation_id)),
+                        ("user_content", "Review everything"),
+                        ("image", (io.BytesIO(b"image-a"), "screen-a.png", "image/png")),
+                        ("image", (io.BytesIO(b"image-b"), "screen-b.png", "image/png")),
+                        ("document", (io.BytesIO(b"Doc A"), "notes-a.txt", "text/plain")),
+                        ("document", (io.BytesIO(b"Doc B"), "notes-b.txt", "text/plain")),
+                    ]
+                ),
+                content_type="multipart/form-data",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        events = [json.loads(line) for line in response.get_data(as_text=True).strip().splitlines()]
+        self.assertEqual(len([event for event in events if event["type"] == "vision_complete"]), 2)
+        self.assertEqual(len([event for event in events if event["type"] == "document_processed"]), 2)
+        canvas_event = next((event for event in events if event["type"] == "canvas_sync"), None)
+        self.assertIsNotNone(canvas_event)
+        self.assertEqual(len(canvas_event["documents"]), 2)
+        self.assertEqual([doc["title"] for doc in canvas_event["documents"]], ["notes-a.txt", "notes-b.txt"])
+
+        conversation_response = self.client.get(f"/api/conversations/{conversation_id}")
+        self.assertEqual(conversation_response.status_code, 200)
+        messages = conversation_response.get_json()["messages"]
+        user_messages = [message for message in messages if message["role"] == "user"]
+        self.assertEqual(len(user_messages), 1)
+
+        metadata = user_messages[0]["metadata"]
+        attachments = metadata.get("attachments") or []
+        self.assertEqual(len(attachments), 4)
+        self.assertEqual(len([entry for entry in attachments if entry["kind"] == "image"]), 2)
+        self.assertEqual(len([entry for entry in attachments if entry["kind"] == "document"]), 2)
+
+        for attachment in attachments:
+            if attachment["kind"] == "image":
+                asset = get_image_asset(attachment["image_id"], conversation_id=conversation_id)
+                self.assertIsNotNone(asset)
+                self.assertEqual(asset["message_id"], user_messages[0]["id"])
+                continue
+            asset = get_file_asset(attachment["file_id"], conversation_id=conversation_id)
+            self.assertIsNotNone(asset)
+            self.assertEqual(asset["message_id"], user_messages[0]["id"])
 
     def test_delete_conversation_removes_persisted_image_files(self):
         conversation_id = self._create_conversation()

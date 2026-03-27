@@ -781,6 +781,125 @@ def parse_message_metadata(raw_metadata) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _normalize_message_attachment(entry) -> dict | None:
+    if not isinstance(entry, dict):
+        return None
+
+    kind = str(entry.get("kind") or "").strip().lower()
+    if kind not in {"image", "document"}:
+        return None
+
+    cleaned = {"kind": kind}
+    if kind == "image":
+        image_id = str(entry.get("image_id") or "").strip()[:64]
+        image_name = str(entry.get("image_name") or "").strip()[:255]
+        image_mime_type = str(entry.get("image_mime_type") or "").strip()[:120]
+        ocr_text = str(entry.get("ocr_text") or "").strip()[:CONTENT_MAX_CHARS]
+        vision_summary = str(entry.get("vision_summary") or "").strip()[:CONTENT_MAX_CHARS]
+        assistant_guidance = str(entry.get("assistant_guidance") or "").strip()[:CONTENT_MAX_CHARS]
+        key_points = entry.get("key_points") if isinstance(entry.get("key_points"), list) else []
+
+        if image_id:
+            cleaned["image_id"] = image_id
+        if image_name:
+            cleaned["image_name"] = image_name
+        if image_mime_type:
+            cleaned["image_mime_type"] = image_mime_type
+        if ocr_text:
+            cleaned["ocr_text"] = ocr_text
+        if vision_summary:
+            cleaned["vision_summary"] = vision_summary
+        if assistant_guidance:
+            cleaned["assistant_guidance"] = assistant_guidance
+        if key_points:
+            normalized_points = []
+            for point in key_points[:8]:
+                point_text = str(point or "").strip()
+                if point_text and point_text not in normalized_points:
+                    normalized_points.append(point_text[:300])
+            if normalized_points:
+                cleaned["key_points"] = normalized_points
+
+        if not cleaned.get("image_id") and not cleaned.get("image_name"):
+            return None
+        return cleaned
+
+    file_id = str(entry.get("file_id") or "").strip()[:64]
+    file_name = str(entry.get("file_name") or "").strip()[:255]
+    file_mime_type = str(entry.get("file_mime_type") or "").strip()[:120]
+    file_context_block = str(entry.get("file_context_block") or "").strip()[:CONTENT_MAX_CHARS]
+
+    if file_id:
+        cleaned["file_id"] = file_id
+    if file_name:
+        cleaned["file_name"] = file_name
+    if file_mime_type:
+        cleaned["file_mime_type"] = file_mime_type
+    if entry.get("file_text_truncated") is True:
+        cleaned["file_text_truncated"] = True
+    if file_context_block:
+        cleaned["file_context_block"] = file_context_block
+
+    if not cleaned.get("file_id") and not cleaned.get("file_name"):
+        return None
+    return cleaned
+
+
+def extract_message_attachments(metadata: dict | None) -> list[dict]:
+    source = metadata if isinstance(metadata, dict) else {}
+    normalized = []
+    seen = set()
+
+    def append_attachment(raw_attachment) -> None:
+        cleaned = _normalize_message_attachment(raw_attachment)
+        if not cleaned:
+            return
+        if cleaned["kind"] == "image":
+            dedupe_key = (
+                "image",
+                cleaned.get("image_id") or "",
+                cleaned.get("image_name") or "",
+            )
+        else:
+            dedupe_key = (
+                "document",
+                cleaned.get("file_id") or "",
+                cleaned.get("file_name") or "",
+            )
+        if dedupe_key in seen:
+            return
+        seen.add(dedupe_key)
+        normalized.append(cleaned)
+
+    raw_attachments = source.get("attachments") if isinstance(source.get("attachments"), list) else []
+    for entry in raw_attachments[:24]:
+        append_attachment(entry)
+
+    legacy_image = {
+        "kind": "image",
+        "image_id": source.get("image_id"),
+        "image_name": source.get("image_name"),
+        "image_mime_type": source.get("image_mime_type"),
+        "ocr_text": source.get("ocr_text"),
+        "vision_summary": source.get("vision_summary"),
+        "assistant_guidance": source.get("assistant_guidance"),
+        "key_points": source.get("key_points"),
+    }
+    append_attachment(legacy_image)
+
+    legacy_document = {
+        "kind": "document",
+        "file_id": source.get("file_id"),
+        "file_name": source.get("file_name"),
+        "file_mime_type": source.get("file_mime_type"),
+        "file_text_truncated": source.get("file_text_truncated") is True,
+        "file_context_block": source.get("file_context_block"),
+    }
+    append_attachment(legacy_document)
+
+    return normalized
+
+
 def _normalize_message_tool_calls(raw_tool_calls) -> list[dict]:
     if isinstance(raw_tool_calls, str):
         try:
@@ -1266,16 +1385,25 @@ def serialize_message_metadata(metadata: dict | None) -> str | None:
     metadata = metadata if isinstance(metadata, dict) else {}
     cleaned = {}
 
-    ocr_text = (metadata.get("ocr_text") or "").strip()
-    vision_summary = (metadata.get("vision_summary") or "").strip()
-    assistant_guidance = (metadata.get("assistant_guidance") or "").strip()
-    image_name = (metadata.get("image_name") or "").strip()
-    image_mime_type = (metadata.get("image_mime_type") or "").strip()
-    image_id = (metadata.get("image_id") or "").strip()
-    key_points = metadata.get("key_points")
+    attachments = extract_message_attachments(metadata)
+    primary_image = next((entry for entry in attachments if entry.get("kind") == "image"), None)
+    primary_document = next((entry for entry in attachments if entry.get("kind") == "document"), None)
+
+    ocr_text = (metadata.get("ocr_text") or (primary_image or {}).get("ocr_text") or "").strip()
+    vision_summary = (metadata.get("vision_summary") or (primary_image or {}).get("vision_summary") or "").strip()
+    assistant_guidance = (
+        metadata.get("assistant_guidance") or (primary_image or {}).get("assistant_guidance") or ""
+    ).strip()
+    image_name = (metadata.get("image_name") or (primary_image or {}).get("image_name") or "").strip()
+    image_mime_type = (metadata.get("image_mime_type") or (primary_image or {}).get("image_mime_type") or "").strip()
+    image_id = (metadata.get("image_id") or (primary_image or {}).get("image_id") or "").strip()
+    key_points = metadata.get("key_points") if isinstance(metadata.get("key_points"), list) else (primary_image or {}).get("key_points")
     reasoning_content = (metadata.get("reasoning_content") or "").strip()
     summary_source = (metadata.get("summary_source") or "").strip()
     generated_at = (metadata.get("generated_at") or "").strip()
+
+    if attachments:
+        cleaned["attachments"] = attachments
 
     if ocr_text:
         cleaned["ocr_text"] = ocr_text
@@ -1473,10 +1601,16 @@ def serialize_message_metadata(metadata: dict | None) -> str | None:
         if cleaned_workflow:
             cleaned["project_workflow"] = cleaned_workflow
 
-    file_id = (metadata.get("file_id") or "").strip()
-    file_name = (metadata.get("file_name") or "").strip()
-    file_mime_type = (metadata.get("file_mime_type") or "").strip()
+    file_id = (metadata.get("file_id") or (primary_document or {}).get("file_id") or "").strip()
+    file_name = (metadata.get("file_name") or (primary_document or {}).get("file_name") or "").strip()
+    file_mime_type = (metadata.get("file_mime_type") or (primary_document or {}).get("file_mime_type") or "").strip()
     file_context_block = (metadata.get("file_context_block") or "").strip()
+    if not file_context_block and attachments:
+        file_context_block = "\n\n".join(
+            str(entry.get("file_context_block") or "").strip()
+            for entry in attachments
+            if entry.get("kind") == "document" and str(entry.get("file_context_block") or "").strip()
+        ).strip()
 
     if file_id:
         cleaned["file_id"] = file_id[:64]
@@ -1484,7 +1618,7 @@ def serialize_message_metadata(metadata: dict | None) -> str | None:
         cleaned["file_name"] = file_name[:255]
     if file_mime_type:
         cleaned["file_mime_type"] = file_mime_type[:120]
-    if metadata.get("file_text_truncated") is True:
+    if metadata.get("file_text_truncated") is True or (primary_document or {}).get("file_text_truncated") is True:
         cleaned["file_text_truncated"] = True
     if file_context_block:
         cleaned["file_context_block"] = file_context_block[:CONTENT_MAX_CHARS]

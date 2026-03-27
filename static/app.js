@@ -112,8 +112,8 @@ let isFixing = false;
 let currentConvId = null;
 let currentConvTitle = "New Chat";
 let activeAbortController = null;
-let selectedImageFile = null;
-let selectedDocumentFile = null;
+let selectedImageFiles = [];
+let selectedDocumentFiles = [];
 let pendingDocumentCanvasOpen = null;
 let editingMessageId = null;
 let activeCanvasDocumentId = null;
@@ -161,6 +161,200 @@ function isDocumentFile(file) {
   if (ALLOWED_DOCUMENT_TYPES.has(file.type)) return true;
   const ext = (file.name || "").toLowerCase().match(/\.[^.]+$/);
   return ext ? DOCUMENT_EXTENSIONS.has(ext[0]) : false;
+}
+
+function getAttachmentFileKey(file) {
+  return [file?.name || "", file?.size || 0, file?.type || "", file?.lastModified || 0].join("::");
+}
+
+function dedupeFiles(files) {
+  const deduped = [];
+  const seen = new Set();
+  (files || []).forEach((file) => {
+    if (!file) {
+      return;
+    }
+    const key = getAttachmentFileKey(file);
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    deduped.push(file);
+  });
+  return deduped;
+}
+
+function normalizeMessageAttachment(entry) {
+  if (!entry || typeof entry !== "object") {
+    return null;
+  }
+
+  const kind = String(entry.kind || "").trim().toLowerCase();
+  if (kind !== "image" && kind !== "document") {
+    return null;
+  }
+
+  if (kind === "image") {
+    const imageId = String(entry.image_id || "").trim();
+    const imageName = String(entry.image_name || "").trim();
+    if (!imageId && !imageName) {
+      return null;
+    }
+    return {
+      kind,
+      image_id: imageId,
+      image_name: imageName,
+      image_mime_type: String(entry.image_mime_type || "").trim(),
+      ocr_text: String(entry.ocr_text || "").trim(),
+      vision_summary: String(entry.vision_summary || "").trim(),
+      assistant_guidance: String(entry.assistant_guidance || "").trim(),
+      key_points: Array.isArray(entry.key_points) ? entry.key_points.filter(Boolean).map((value) => String(value)) : [],
+    };
+  }
+
+  const fileId = String(entry.file_id || "").trim();
+  const fileName = String(entry.file_name || "").trim();
+  if (!fileId && !fileName) {
+    return null;
+  }
+  return {
+    kind,
+    file_id: fileId,
+    file_name: fileName,
+    file_mime_type: String(entry.file_mime_type || "").trim(),
+    file_text_truncated: entry.file_text_truncated === true,
+    file_context_block: String(entry.file_context_block || "").trim(),
+  };
+}
+
+function getMessageAttachments(metadata) {
+  if (!metadata || typeof metadata !== "object") {
+    return [];
+  }
+
+  const attachments = [];
+  const seen = new Set();
+
+  const appendAttachment = (entry) => {
+    const normalized = normalizeMessageAttachment(entry);
+    if (!normalized) {
+      return;
+    }
+    const dedupeKey = normalized.kind === "image"
+      ? `image:${normalized.image_id || normalized.image_name}`
+      : `document:${normalized.file_id || normalized.file_name}`;
+    if (seen.has(dedupeKey)) {
+      return;
+    }
+    seen.add(dedupeKey);
+    attachments.push(normalized);
+  };
+
+  if (Array.isArray(metadata.attachments)) {
+    metadata.attachments.forEach((entry) => appendAttachment(entry));
+  }
+  appendAttachment({
+    kind: "image",
+    image_id: metadata.image_id,
+    image_name: metadata.image_name,
+    image_mime_type: metadata.image_mime_type,
+    ocr_text: metadata.ocr_text,
+    vision_summary: metadata.vision_summary,
+    assistant_guidance: metadata.assistant_guidance,
+    key_points: metadata.key_points,
+  });
+  appendAttachment({
+    kind: "document",
+    file_id: metadata.file_id,
+    file_name: metadata.file_name,
+    file_mime_type: metadata.file_mime_type,
+    file_text_truncated: metadata.file_text_truncated === true,
+    file_context_block: metadata.file_context_block,
+  });
+
+  return attachments;
+}
+
+function buildLegacyAttachmentMetadata(attachments) {
+  const legacy = {};
+  const primaryImage = (attachments || []).find((entry) => entry.kind === "image") || null;
+  const primaryDocument = (attachments || []).find((entry) => entry.kind === "document") || null;
+
+  if (primaryImage) {
+    if (primaryImage.image_id) legacy.image_id = primaryImage.image_id;
+    if (primaryImage.image_name) legacy.image_name = primaryImage.image_name;
+    if (primaryImage.image_mime_type) legacy.image_mime_type = primaryImage.image_mime_type;
+    if (primaryImage.ocr_text) legacy.ocr_text = primaryImage.ocr_text;
+    if (primaryImage.vision_summary) legacy.vision_summary = primaryImage.vision_summary;
+    if (primaryImage.assistant_guidance) legacy.assistant_guidance = primaryImage.assistant_guidance;
+    if (primaryImage.key_points?.length) legacy.key_points = [...primaryImage.key_points];
+  }
+
+  if (primaryDocument) {
+    if (primaryDocument.file_id) legacy.file_id = primaryDocument.file_id;
+    if (primaryDocument.file_name) legacy.file_name = primaryDocument.file_name;
+    if (primaryDocument.file_mime_type) legacy.file_mime_type = primaryDocument.file_mime_type;
+    if (primaryDocument.file_text_truncated) legacy.file_text_truncated = true;
+  }
+
+  const contextBlocks = (attachments || [])
+    .filter((entry) => entry.kind === "document" && entry.file_context_block)
+    .map((entry) => entry.file_context_block);
+  if (contextBlocks.length) {
+    legacy.file_context_block = contextBlocks.join("\n\n");
+  }
+
+  return legacy;
+}
+
+function mergeAttachmentMetadata(metadata, attachment) {
+  const base = metadata && typeof metadata === "object" ? { ...metadata } : {};
+  const blockedKeys = [
+    "attachments",
+    "image_id",
+    "image_name",
+    "image_mime_type",
+    "ocr_text",
+    "vision_summary",
+    "assistant_guidance",
+    "key_points",
+    "file_id",
+    "file_name",
+    "file_mime_type",
+    "file_text_truncated",
+    "file_context_block",
+  ];
+  blockedKeys.forEach((key) => delete base[key]);
+
+  const attachments = getMessageAttachments(metadata);
+  const normalized = normalizeMessageAttachment(attachment);
+  const nextAttachments = normalized
+    ? [...attachments.filter((entry) => {
+        if (normalized.kind === "image") {
+          return !(entry.kind === "image" && (entry.image_id || entry.image_name) === (normalized.image_id || normalized.image_name));
+        }
+        return !(entry.kind === "document" && (entry.file_id || entry.file_name) === (normalized.file_id || normalized.file_name));
+      }), normalized]
+    : attachments;
+
+  return {
+    ...base,
+    ...(nextAttachments.length ? { attachments: nextAttachments } : {}),
+    ...buildLegacyAttachmentMetadata(nextAttachments),
+  };
+}
+
+function buildPendingAttachmentMetadata(imageFiles, documentFiles) {
+  const attachments = [
+    ...(imageFiles || []).map((file) => ({ kind: "image", image_name: file.name })),
+    ...(documentFiles || []).map((file) => ({ kind: "document", file_name: file.name })),
+  ];
+  return attachments.length
+    ? {
+        attachments,
+        ...buildLegacyAttachmentMetadata(getMessageAttachments({ attachments })),
+      }
+    : null;
 }
 const ragDisabledNoteEl = document.getElementById("rag-disabled-note");
 const visionDisabledNoteEl = document.getElementById("vision-disabled-note");
@@ -813,14 +1007,15 @@ function setCanvasHint(message, tone = "muted") {
   canvasHint.dataset.tone = tone;
 }
 
-function setPendingDocumentCanvasOpen(file) {
-  if (!file) {
+function setPendingDocumentCanvasOpen(files) {
+  if (!files || !files.length) {
     pendingDocumentCanvasOpen = null;
     return;
   }
 
   pendingDocumentCanvasOpen = {
-    fileName: String(file.name || "Document").trim() || "Document",
+    fileCount: files.length,
+    fileName: String(files[0]?.name || "Document").trim() || "Document",
   };
 }
 
@@ -888,11 +1083,13 @@ function openCanvasConfirmModal(options = {}) {
 }
 
 function confirmCanvasOpenForDocument(pendingRequest, documentCount, callbacks = {}) {
+  const fileCount = Number(pendingRequest?.fileCount || 1);
   const fileName = String(pendingRequest?.fileName || "document").trim() || "document";
+  const requestLabel = fileCount > 1 ? `${fileCount} uploaded documents` : fileName;
   const documentLabel = documentCount === 1 ? "canvas document" : `${documentCount} canvas documents`;
   openCanvasConfirmModal({
     title: "Open document in Canvas?",
-    message: `${fileName} is ready in Canvas. ${documentLabel.charAt(0).toUpperCase()}${documentLabel.slice(1)} ${documentCount === 1 ? "is" : "are"} available now.`,
+    message: `${requestLabel} ${fileCount === 1 ? "is" : "are"} ready in Canvas. ${documentLabel.charAt(0).toUpperCase()}${documentLabel.slice(1)} ${documentCount === 1 ? "is" : "are"} available now.`,
     onConfirm: callbacks.onConfirm,
     onCancel: callbacks.onCancel,
   });
@@ -3805,54 +4002,59 @@ attachBtn.addEventListener("contextmenu", (e) => {
 kbSyncBtn?.addEventListener("click", syncKnowledgeBaseConversations);
 
 imageInputEl.addEventListener("change", () => {
-  const file = imageInputEl.files && imageInputEl.files[0];
-  if (!file) {
+  const files = Array.from(imageInputEl.files || []);
+  imageInputEl.value = "";
+  if (!files.length) {
     return;
   }
-  if (isDocumentFile(file)) {
-    imageInputEl.value = "";
-    handleDocumentSelection(file);
-    return;
-  }
-  if (!featureFlags.vision_enabled) {
-    showError("Image uploads are disabled. Only documents can be attached.");
-    clearSelectedImage();
-    return;
-  }
-  if (!ALLOWED_IMAGE_TYPES.has(file.type)) {
-    showError("Unsupported file type. Upload PNG, JPG, WEBP images or DOCX, PDF, TXT, CSV, MD documents.");
-    clearSelectedImage();
-    return;
-  }
-  if (file.size > MAX_IMAGE_BYTES) {
-    showError("Image is too large. Upload a maximum of 10 MB.");
-    clearSelectedImage();
-    return;
-  }
-  selectedImageFile = file;
-  clearSelectedDocument();
-  renderAttachmentPreview();
+  handleSelectedFiles(files);
 });
 
 docInputEl.addEventListener("change", () => {
-  const file = docInputEl.files && docInputEl.files[0];
-  if (!file) return;
-  handleDocumentSelection(file);
+  const files = Array.from(docInputEl.files || []);
+  docInputEl.value = "";
+  if (!files.length) return;
+  handleSelectedFiles(files, { documentsOnly: true });
 });
 
-function handleDocumentSelection(file) {
-  if (!isDocumentFile(file)) {
-    showError("Unsupported document type. Upload DOCX, PDF, TXT, CSV or MD.");
-    clearSelectedDocument();
-    return;
+function handleSelectedFiles(files, options = {}) {
+  const documentsOnly = options.documentsOnly === true;
+  const nextImages = [...selectedImageFiles];
+  const nextDocuments = [...selectedDocumentFiles];
+
+  for (const file of files || []) {
+    if (!file) {
+      continue;
+    }
+    if (isDocumentFile(file)) {
+      if (file.size > MAX_DOCUMENT_BYTES) {
+        showError(`Document ${file.name} is too large. Upload a maximum of 20 MB.`);
+        continue;
+      }
+      nextDocuments.push(file);
+      continue;
+    }
+    if (documentsOnly) {
+      showError(`Unsupported document type: ${file.name}`);
+      continue;
+    }
+    if (!featureFlags.vision_enabled) {
+      showError("Image uploads are disabled. Only documents can be attached.");
+      continue;
+    }
+    if (!ALLOWED_IMAGE_TYPES.has(file.type)) {
+      showError(`Unsupported file type: ${file.name}`);
+      continue;
+    }
+    if (file.size > MAX_IMAGE_BYTES) {
+      showError(`Image ${file.name} is too large. Upload a maximum of 10 MB.`);
+      continue;
+    }
+    nextImages.push(file);
   }
-  if (file.size > MAX_DOCUMENT_BYTES) {
-    showError("Document is too large. Upload a maximum of 20 MB.");
-    clearSelectedDocument();
-    return;
-  }
-  selectedDocumentFile = file;
-  clearSelectedImage();
+
+  selectedImageFiles = dedupeFiles(nextImages);
+  selectedDocumentFiles = dedupeFiles(nextDocuments);
   renderAttachmentPreview();
 }
 
@@ -4032,27 +4234,41 @@ function formatFileSize(size) {
 }
 
 function clearSelectedImage() {
-  selectedImageFile = null;
+  selectedImageFiles = [];
   imageInputEl.value = "";
   renderAttachmentPreview();
 }
 
 function clearSelectedDocument() {
-  selectedDocumentFile = null;
+  selectedDocumentFiles = [];
   docInputEl.value = "";
   renderAttachmentPreview();
 }
 
+function removeSelectedAttachment(kind, fileKey) {
+  if (kind === "image") {
+    selectedImageFiles = selectedImageFiles.filter((file) => getAttachmentFileKey(file) !== fileKey);
+  } else {
+    selectedDocumentFiles = selectedDocumentFiles.filter((file) => getAttachmentFileKey(file) !== fileKey);
+  }
+  renderAttachmentPreview();
+}
+
 function clearAllAttachments() {
-  selectedImageFile = null;
-  selectedDocumentFile = null;
+  selectedImageFiles = [];
+  selectedDocumentFiles = [];
   imageInputEl.value = "";
   docInputEl.value = "";
   renderAttachmentPreview();
 }
 
 function renderAttachmentPreview() {
-  if (!selectedImageFile && !selectedDocumentFile) {
+  const attachments = [
+    ...selectedImageFiles.map((file) => ({ kind: "image", file })),
+    ...selectedDocumentFiles.map((file) => ({ kind: "document", file })),
+  ];
+
+  if (!attachments.length) {
     attachmentPreviewEl.hidden = true;
     attachmentPreviewEl.innerHTML = "";
     return;
@@ -4060,113 +4276,112 @@ function renderAttachmentPreview() {
 
   attachmentPreviewEl.hidden = false;
 
-  if (selectedImageFile) {
-    attachmentPreviewEl.innerHTML =
+  attachmentPreviewEl.innerHTML = attachments.map(({ kind, file }) => {
+    const fileKey = getAttachmentFileKey(file);
+    const icon = kind === "image" ? "🖼️" : "📄";
+    const description = kind === "image"
+      ? `Ready for Qwen vision analysis · ${formatFileSize(file.size)}`
+      : `${((file.name || "").split(".").pop() || "FILE").toUpperCase()} document · ${formatFileSize(file.size)}`;
+    const removeLabel = kind === "image" ? "Remove image" : "Remove document";
+    return (
       `<div class="attachment-chip">` +
-        `<span class="attachment-chip__icon">🖼️</span>` +
+        `<span class="attachment-chip__icon">${icon}</span>` +
         `<span class="attachment-chip__meta">` +
-          `<strong>${escHtml(selectedImageFile.name)}</strong>` +
-          `<small>Ready for Qwen vision analysis · ${formatFileSize(selectedImageFile.size)}</small>` +
+          `<strong>${escHtml(file.name)}</strong>` +
+          `<small>${escHtml(description)}</small>` +
         `</span>` +
-        `<button type="button" class="attachment-chip__remove" title="Remove image">×</button>` +
-      `</div>`;
-    attachmentPreviewEl.querySelector(".attachment-chip__remove").addEventListener("click", clearAllAttachments);
-  } else if (selectedDocumentFile) {
-    const ext = (selectedDocumentFile.name || "").split(".").pop().toUpperCase() || "FILE";
-    attachmentPreviewEl.innerHTML =
-      `<div class="attachment-chip">` +
-        `<span class="attachment-chip__icon">📄</span>` +
-        `<span class="attachment-chip__meta">` +
-          `<strong>${escHtml(selectedDocumentFile.name)}</strong>` +
-          `<small>${ext} document · ${formatFileSize(selectedDocumentFile.size)}</small>` +
-        `</span>` +
-        `<button type="button" class="attachment-chip__remove" title="Remove document">×</button>` +
-      `</div>`;
-    attachmentPreviewEl.querySelector(".attachment-chip__remove").addEventListener("click", clearAllAttachments);
-  }
+        `<button type="button" class="attachment-chip__remove" data-kind="${escHtml(kind)}" data-file-key="${escHtml(fileKey)}" title="${removeLabel}">×</button>` +
+      `</div>`
+    );
+  }).join("");
+
+  attachmentPreviewEl.querySelectorAll(".attachment-chip__remove").forEach((button) => {
+    button.addEventListener("click", () => {
+      removeSelectedAttachment(button.dataset.kind, button.dataset.fileKey);
+    });
+  });
 }
 
 function appendAttachmentBadge(group, metadata) {
-  const imageName = metadata && metadata.image_name;
-  const fileName = metadata && metadata.file_name;
-  if (!imageName && !fileName) {
+  const attachments = getMessageAttachments(metadata);
+  if (!attachments.length) {
     return;
   }
 
-  if (fileName) {
-    const fileId = metadata.file_id ? String(metadata.file_id).trim() : "";
-    const label = fileId ? `${fileName} · ${fileId}` : fileName;
+  group.querySelectorAll(".message-attachment").forEach((node) => node.remove());
+
+  attachments.forEach((attachment) => {
     const badge = document.createElement("div");
     badge.className = "message-attachment";
+    if (attachment.kind === "document") {
+      const fileId = attachment.file_id ? String(attachment.file_id).trim() : "";
+      const fileName = String(attachment.file_name || "Document").trim() || "Document";
+      const label = fileId ? `${fileName} · ${fileId}` : fileName;
+      badge.innerHTML =
+        `<span class="message-attachment__icon">📄</span>` +
+        `<span class="message-attachment__name">${escHtml(label)}</span>` +
+        `<span class="message-attachment__state">Document uploaded · Canvas</span>`;
+      group.appendChild(badge);
+      return;
+    }
+
+    const imageName = String(attachment.image_name || "Image").trim() || "Image";
+    const imageId = attachment.image_id ? String(attachment.image_id).trim() : "";
+    const hasVisionContext = attachment.ocr_text || attachment.vision_summary || attachment.assistant_guidance;
+    const stateLabel = hasVisionContext ? "Qwen vision context added" : "Image to be processed";
+    const label = imageId ? `${imageName} · ${imageId}` : imageName;
     badge.innerHTML =
-      `<span class="message-attachment__icon">📄</span>` +
+      `<span class="message-attachment__icon">🖼️</span>` +
       `<span class="message-attachment__name">${escHtml(label)}</span>` +
-      `<span class="message-attachment__state">Document uploaded · Canvas</span>`;
+      `<span class="message-attachment__state">${stateLabel}</span>`;
     group.appendChild(badge);
-    return;
-  }
-
-  const imageId = metadata && metadata.image_id ? String(metadata.image_id).trim() : "";
-  const hasVisionContext = metadata && (metadata.ocr_text || metadata.vision_summary || metadata.assistant_guidance);
-  const stateLabel = hasVisionContext ? "Qwen vision context added" : "Image to be processed";
-  const label = imageId ? `${imageName} · ${imageId}` : imageName;
-
-  const badge = document.createElement("div");
-  badge.className = "message-attachment";
-  badge.innerHTML =
-    `<span class="message-attachment__icon">🖼️</span>` +
-    `<span class="message-attachment__name">${escHtml(label)}</span>` +
-    `<span class="message-attachment__state">${stateLabel}</span>`;
-  group.appendChild(badge);
+  });
 }
 
 function updateAttachmentBadge(group, metadata) {
-  const nameEl = group.querySelector(".message-attachment__name");
-  const stateEl = group.querySelector(".message-attachment__state");
-  if (!stateEl || !nameEl) {
-    return;
-  }
-  const imageName = metadata && metadata.image_name ? String(metadata.image_name) : "";
-  const imageId = metadata && metadata.image_id ? String(metadata.image_id).trim() : "";
-  nameEl.textContent = imageId ? `${imageName} · ${imageId}` : imageName;
-  stateEl.textContent = metadata && (metadata.ocr_text || metadata.vision_summary || metadata.assistant_guidance)
-    ? "Qwen vision context added"
-    : "Image to be processed";
+  appendAttachmentBadge(group, metadata);
 }
 
 function buildVisionNoteHtml(metadata) {
-  if (!metadata) {
+  const imageAttachments = getMessageAttachments(metadata).filter((attachment) => attachment.kind === "image");
+  if (!imageAttachments.length) {
     return "";
   }
 
-  const summary = String(metadata.vision_summary || "").trim();
-  const guidance = String(metadata.assistant_guidance || "").trim();
-  const keyPoints = Array.isArray(metadata.key_points) ? metadata.key_points.filter(Boolean) : [];
-  const ocrText = String(metadata.ocr_text || "").trim();
-  const imageId = String(metadata.image_id || "").trim();
-  const parts = [];
+  return imageAttachments.map((attachment, index) => {
+    const summary = String(attachment.vision_summary || "").trim();
+    const guidance = String(attachment.assistant_guidance || "").trim();
+    const keyPoints = Array.isArray(attachment.key_points) ? attachment.key_points.filter(Boolean) : [];
+    const ocrText = String(attachment.ocr_text || "").trim();
+    const imageId = String(attachment.image_id || "").trim();
+    const imageName = String(attachment.image_name || "Image").trim() || "Image";
+    const parts = [];
 
-  if (imageId) {
-    parts.push(`<div><strong>Image ID:</strong> ${escHtml(imageId)}</div>`);
-  }
-  if (summary) {
-    parts.push(`<div><strong>Summary:</strong> ${escHtml(summary)}</div>`);
-  }
-  if (keyPoints.length) {
-    parts.push(
-      `<div><strong>Highlights:</strong><ul>` +
-        keyPoints.slice(0, 4).map((point) => `<li>${escHtml(String(point))}</li>`).join("") +
-      `</ul></div>`
-    );
-  }
-  if (guidance) {
-    parts.push(`<div><strong>Guidance note:</strong> ${escHtml(guidance)}</div>`);
-  }
-  if (ocrText) {
-    parts.push(`<div><strong>OCR:</strong> ${escHtml(ocrText.slice(0, 240))}${ocrText.length > 240 ? "…" : ""}</div>`);
-  }
+    if (imageAttachments.length > 1 || imageName) {
+      parts.push(`<div><strong>Image:</strong> ${escHtml(imageName)}</div>`);
+    }
+    if (imageId) {
+      parts.push(`<div><strong>Image ID:</strong> ${escHtml(imageId)}</div>`);
+    }
+    if (summary) {
+      parts.push(`<div><strong>Summary:</strong> ${escHtml(summary)}</div>`);
+    }
+    if (keyPoints.length) {
+      parts.push(
+        `<div><strong>Highlights:</strong><ul>` +
+          keyPoints.slice(0, 4).map((point) => `<li>${escHtml(String(point))}</li>`).join("") +
+        `</ul></div>`
+      );
+    }
+    if (guidance) {
+      parts.push(`<div><strong>Guidance note:</strong> ${escHtml(guidance)}</div>`);
+    }
+    if (ocrText) {
+      parts.push(`<div><strong>OCR:</strong> ${escHtml(ocrText.slice(0, 240))}${ocrText.length > 240 ? "…" : ""}</div>`);
+    }
 
-  return parts.join("");
+    return `<div class="message-vision-note__item" data-index="${index}">${parts.join("")}</div>`;
+  }).join("");
 }
 
 function appendVisionDetails(group, metadata) {
@@ -4572,9 +4787,10 @@ function createMessageGroup(role, text, metadata = null, options = {}) {
 
   const bubble = document.createElement("div");
   bubble.className = "bubble";
-  const hasImage = Boolean(metadata && metadata.image_name);
-  const hasDocument = Boolean(metadata && metadata.file_name);
-  const displayText = text || (hasImage ? "Image uploaded." : hasDocument ? "Document uploaded." : "");
+  const attachments = getMessageAttachments(metadata);
+  const hasImage = attachments.some((attachment) => attachment.kind === "image");
+  const hasDocument = attachments.some((attachment) => attachment.kind === "document");
+  const displayText = text || (attachments.length ? "Attachments uploaded." : hasImage ? "Image uploaded." : hasDocument ? "Document uploaded." : "");
 
   if ((role === "assistant" || role === "summary") && text !== "Working…") {
     bubble.innerHTML = renderMarkdown(text);
@@ -4592,9 +4808,11 @@ function createMessageGroup(role, text, metadata = null, options = {}) {
   if (role === "assistant") {
     appendClarificationPanel(group, metadata, options);
   }
-  if (role === "user" && hasImage) {
+  if (role === "user" && attachments.length) {
     appendAttachmentBadge(group, metadata);
-    appendVisionDetails(group, metadata);
+    if (hasImage) {
+      appendVisionDetails(group, metadata);
+    }
   }
   return group;
 }
@@ -4667,15 +4885,15 @@ async function sendMessage(options = {}) {
     ? options.forcedMetadata
     : null;
   const text = forcedText || inputEl.value.trim();
-  const pendingImage = selectedImageFile;
-  const pendingDocument = selectedDocumentFile;
-  if (!text && !pendingImage && !pendingDocument) {
+  const pendingImages = [...selectedImageFiles];
+  const pendingDocuments = [...selectedDocumentFiles];
+  if (!text && !pendingImages.length && !pendingDocuments.length) {
     return;
   }
 
-  setPendingDocumentCanvasOpen(pendingDocument);
+  setPendingDocumentCanvasOpen(pendingDocuments);
 
-  if (pendingImage && !Boolean(featureFlags.vision_enabled)) {
+  if (pendingImages.length && !Boolean(featureFlags.vision_enabled)) {
     clearSelectedImage();
     showError("Image uploads are disabled in .env.");
     return;
@@ -4703,11 +4921,7 @@ async function sendMessage(options = {}) {
     updateExportPanel();
   }
 
-  let userMetadata = pendingImage
-    ? { image_name: pendingImage.name }
-    : pendingDocument
-      ? { file_name: pendingDocument.name }
-      : null;
+  let userMetadata = buildPendingAttachmentMetadata(pendingImages, pendingDocuments);
   if (forcedMetadata) {
     userMetadata = {
       ...(userMetadata || {}),
@@ -4727,7 +4941,7 @@ async function sendMessage(options = {}) {
       return;
     }
 
-    if (!pendingImage && !pendingDocument) {
+    if (!pendingImages.length && !pendingDocuments.length) {
       userMetadata = editingEntry.metadata || null;
     }
 
@@ -4740,8 +4954,15 @@ async function sendMessage(options = {}) {
       content: text,
       metadata: userMetadata,
     };
+    streamingCanvasDocuments = [];
+    resetStreamingCanvasPreview();
+    pendingCanvasDiff = null;
+    isCanvasEditing = false;
+    editingCanvasDocumentId = null;
+    activeCanvasDocumentId = getActiveCanvasDocument(history)?.id || null;
     rebuildTokenStatsFromHistory();
     renderConversationHistory();
+    renderCanvasPanel();
     userGroup = messagesEl.querySelector(".msg-group.user:last-of-type");
     clearEditTarget();
   } else {
@@ -4823,7 +5044,7 @@ async function sendMessage(options = {}) {
     const requestMessages = buildRequestMessagesFromHistory();
 
     let response;
-    if (pendingImage || pendingDocument) {
+    if (pendingImages.length || pendingDocuments.length) {
       const formData = new FormData();
       formData.append("messages", JSON.stringify(requestMessages));
       formData.append("model", modelSel.value);
@@ -4832,12 +5053,8 @@ async function sendMessage(options = {}) {
       if (editedMessageId !== null) {
         formData.append("edited_message_id", String(editedMessageId));
       }
-      if (pendingImage) {
-        formData.append("image", pendingImage);
-      }
-      if (pendingDocument) {
-        formData.append("document", pendingDocument);
-      }
+      pendingImages.forEach((file) => formData.append("image", file));
+      pendingDocuments.forEach((file) => formData.append("document", file));
 
       response = await fetch("/chat", {
         method: "POST",
@@ -4873,8 +5090,8 @@ async function sendMessage(options = {}) {
       } else if (event.type === "vision_complete" || event.type === "ocr_complete") {
         const lastMessage = history[history.length - 1];
         if (lastMessage && lastMessage.role === "user") {
-          lastMessage.metadata = {
-            ...(lastMessage.metadata || {}),
+          const attachment = event.attachment || {
+            kind: "image",
             image_id: event.image_id,
             image_name: event.image_name,
             ocr_text: event.ocr_text,
@@ -4882,6 +5099,7 @@ async function sendMessage(options = {}) {
             assistant_guidance: event.assistant_guidance,
             key_points: Array.isArray(event.key_points) ? event.key_points : [],
           };
+          lastMessage.metadata = mergeAttachmentMetadata(lastMessage.metadata, attachment);
           updateAttachmentBadge(userGroup, lastMessage.metadata);
           updateVisionDetails(userGroup, lastMessage.metadata);
         }
@@ -4889,25 +5107,30 @@ async function sendMessage(options = {}) {
       } else if (event.type === "document_processed") {
         const lastMessage = history[history.length - 1];
         if (lastMessage && lastMessage.role === "user") {
-          lastMessage.metadata = {
-            ...(lastMessage.metadata || {}),
+          const attachment = event.attachment || {
+            kind: "document",
             file_id: event.file_id,
             file_name: event.file_name,
             file_mime_type: event.file_mime_type,
           };
+          lastMessage.metadata = mergeAttachmentMetadata(lastMessage.metadata, attachment);
           appendAttachmentBadge(userGroup, lastMessage.metadata);
         }
 
         const pendingCanvasRequest = consumePendingDocumentCanvasOpen();
         if (event.canvas_document && pendingCanvasRequest && !isCanvasOpen()) {
-          confirmCanvasOpenForDocument(pendingCanvasRequest, 1, {
+          const documentCount = Number(pendingCanvasRequest.fileCount || 1);
+          const requestLabel = Number(pendingCanvasRequest.fileCount || 1) > 1
+            ? `${pendingCanvasRequest.fileCount} documents`
+            : pendingCanvasRequest.fileName;
+          confirmCanvasOpenForDocument(pendingCanvasRequest, documentCount, {
             onConfirm: () => {
               openCanvas();
-              setCanvasStatus(`${pendingCanvasRequest.fileName} opened in Canvas.`, "success");
+              setCanvasStatus(`${requestLabel} opened in Canvas.`, "success");
             },
             onCancel: () => {
               setCanvasAttention(true);
-              setCanvasStatus(`${pendingCanvasRequest.fileName} is ready in Canvas. Open the panel when needed.`, "muted");
+              setCanvasStatus(`${requestLabel} ${Number(pendingCanvasRequest.fileCount || 1) > 1 ? "are" : "is"} ready in Canvas. Open the panel when needed.`, "muted");
             },
           });
         }
@@ -5150,14 +5373,17 @@ async function sendMessage(options = {}) {
           }
 
           if (pendingCanvasRequest && event.auto_open && !isCanvasOpen()) {
+            const requestLabel = Number(pendingCanvasRequest.fileCount || 1) > 1
+              ? `${pendingCanvasRequest.fileCount} documents`
+              : pendingCanvasRequest.fileName;
             confirmCanvasOpenForDocument(pendingCanvasRequest, streamingCanvasDocuments.length, {
               onConfirm: () => {
                 openCanvas();
-                setCanvasStatus(`${pendingCanvasRequest.fileName} opened in Canvas.`, "success");
+                setCanvasStatus(`${requestLabel} opened in Canvas.`, "success");
               },
               onCancel: () => {
                 setCanvasAttention(true);
-                setCanvasStatus(`${pendingCanvasRequest.fileName} is ready in Canvas. Open the panel when needed.`, "muted");
+                setCanvasStatus(`${requestLabel} ${Number(pendingCanvasRequest.fileCount || 1) > 1 ? "are" : "is"} ready in Canvas. Open the panel when needed.`, "muted");
               },
             });
           } else if (event.auto_open && !isCanvasOpen()) {
