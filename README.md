@@ -263,6 +263,17 @@ Some settings come from environment variables, and some are stored in SQLite thr
 | `DOCUMENT_STORAGE_DIR` | `./data/documents` | Directory used for uploaded document assets |
 | `SCRATCHPAD_ADMIN_EDITING_ENABLED` | `false` | Shows scratchpad editing in the UI |
 
+### Login and session protection
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `FLASK_SECRET_KEY` | `dev-only-change-me` | Secret key used for Flask sessions; override in production |
+| `LOGIN_PIN` | empty | Enables the login gate when set |
+| `LOGIN_SESSION_TIMEOUT_MINUTES` | `30` | Inactivity timeout for normal sessions |
+| `LOGIN_MAX_FAILED_ATTEMPTS` | `3` | Failed PIN attempts before temporary lockout |
+| `LOGIN_LOCKOUT_SECONDS` | `300` | Lockout duration after repeated failures |
+| `LOGIN_REMEMBER_SESSION_DAYS` | `3650` | Lifetime used for remembered devices |
+
 ### RAG and embedding
 
 | Variable | Default | Description |
@@ -821,6 +832,7 @@ A sample `.pre-commit-config.yaml` is not included in the repository.
 - local vision requires a local model download and enough hardware to run it
 - scratchpad admin editing is disabled by default; enable it only if you trust the UI users
 - pruning rewrites message content in place and stores the original text in message metadata
+- when `LOGIN_PIN` is set, the app requires a PIN before any page or API route is accessible
 
 ## Troubleshooting
 

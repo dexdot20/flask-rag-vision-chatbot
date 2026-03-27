@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Unlock ChatBot</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body class="login-page-body">
+  <main class="login-shell">
+    <section class="login-card" aria-labelledby="login-title">
+      <div class="login-brand">
+        <div class="login-brand__icon">✦</div>
+        <div>
+          <p class="login-brand__eyebrow">Protected workspace</p>
+          <h1 id="login-title">Enter PIN</h1>
+        </div>
+      </div>
+      <p class="login-copy">This workspace is locked with a PIN. Use the code from your environment settings to continue.</p>
+
+      {% if error %}
+      <div class="login-error" role="alert">{{ error }}</div>
+      {% endif %}
+
+      <form class="login-form" method="post" action="/login">
+        <input type="hidden" name="next" value="{{ next_url or '' }}" />
+        <label class="login-field" for="pin-input">
+          <span class="settings-label">PIN</span>
+          <input id="pin-input" name="pin" type="password" inputmode="numeric" autocomplete="one-time-code" autofocus required />
+        </label>
+
+        <label class="login-remember" for="remember-input">
+          <input id="remember-input" name="remember" type="checkbox" />
+          <span>
+            <strong>Remember this device</strong>
+            <small>Removes the login timeout and keeps the session active longer.</small>
+          </span>
+        </label>
+
+        <button class="btn-primary login-submit" type="submit">Unlock</button>
+      </form>
+
+      <p class="login-footnote">Timeout: {{ timeout_minutes }} minutes. Remembered devices keep access up to {{ remember_days }} days.</p>
+      {% if lockout_seconds and lockout_seconds > 0 %}
+      <p class="login-footnote login-footnote--warn">Too many attempts temporarily lock PIN entry for {{ lockout_seconds }} seconds.</p>
+      {% endif %}
+    </section>
+  </main>
+</body>
+</html>

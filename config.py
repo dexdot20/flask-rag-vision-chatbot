@@ -15,6 +15,8 @@ IMAGE_STORAGE_DIR = (os.getenv("IMAGE_STORAGE_DIR") or os.path.join(BASE_DIR, "d
 PROJECT_WORKSPACE_ROOT = (os.getenv("PROJECT_WORKSPACE_ROOT") or os.path.join(BASE_DIR, "data", "workspaces")).strip()
 PROXIES_PATH = os.path.join(BASE_DIR, "proxies.txt")
 AGENT_TRACE_LOG_PATH = (os.getenv("AGENT_TRACE_LOG_PATH") or os.path.join(BASE_DIR, "logs", "agent-trace.log")).strip()
+SECRET_KEY = (os.getenv("FLASK_SECRET_KEY") or os.getenv("SECRET_KEY") or "dev-only-change-me").strip()
+LOGIN_PIN = (os.getenv("LOGIN_PIN") or "").strip()
 
 client = OpenAI(
     api_key=os.getenv("DEEPSEEK_API_KEY"),
@@ -53,6 +55,12 @@ def _parse_float_env(name: str, default: float) -> float:
         return float(raw_value)
     except (TypeError, ValueError):
         return default
+
+
+LOGIN_SESSION_TIMEOUT_MINUTES = max(1, _parse_int_env("LOGIN_SESSION_TIMEOUT_MINUTES", 30))
+LOGIN_MAX_FAILED_ATTEMPTS = max(1, _parse_int_env("LOGIN_MAX_FAILED_ATTEMPTS", 3))
+LOGIN_LOCKOUT_SECONDS = max(1, _parse_int_env("LOGIN_LOCKOUT_SECONDS", 300))
+LOGIN_REMEMBER_SESSION_DAYS = max(1, _parse_int_env("LOGIN_REMEMBER_SESSION_DAYS", 3650))
 
 
 def _get_torch_dtype_name() -> str:
@@ -273,4 +281,5 @@ def get_feature_flags() -> dict:
         "rag_enabled": RAG_ENABLED,
         "vision_enabled": VISION_ENABLED,
         "scratchpad_admin_editing": SCRATCHPAD_ADMIN_EDITING_ENABLED,
+        "login_pin_enabled": bool(LOGIN_PIN),
     }

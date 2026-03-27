@@ -196,6 +196,12 @@ select:focus  { border-color: var(--border-focus); }
   background: rgba(224, 85, 85, 0.08);
 }
 
+.btn-auth-link:hover {
+  border-color: rgba(224, 85, 85, 0.28);
+  color: #ff9f9f;
+  background: rgba(224, 85, 85, 0.08);
+}
+
 .btn-primary {
   background: var(--accent);
   border: 1px solid var(--accent);
@@ -3891,6 +3897,155 @@ kbd {
 
 .settings-back-btn {
   text-decoration: none;
+}
+
+/* ── Login Page ─────────────────────────────────────────── */
+body.login-page-body {
+  min-height: 100dvh;
+  height: auto;
+  overflow: auto;
+  align-items: center;
+  justify-content: center;
+  background:
+    radial-gradient(circle at top left, rgba(79, 110, 247, 0.22), transparent 26%),
+    radial-gradient(circle at bottom right, rgba(160, 102, 245, 0.18), transparent 28%),
+    var(--bg);
+}
+
+.login-shell {
+  width: min(460px, calc(100vw - 32px));
+  padding: 24px 0;
+}
+
+.login-card {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 28px;
+  border: 1px solid var(--border);
+  border-radius: 24px;
+  background: rgba(21, 21, 26, 0.92);
+  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.38);
+  backdrop-filter: blur(12px);
+}
+
+.login-brand {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.login-brand__icon {
+  width: 44px;
+  height: 44px;
+  border-radius: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(135deg, #4f6ef7, #a066f5);
+  font-size: 20px;
+  flex-shrink: 0;
+}
+
+.login-brand__eyebrow {
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin-bottom: 4px;
+}
+
+.login-brand h1 {
+  font-size: 1.6rem;
+  line-height: 1.15;
+  letter-spacing: -0.03em;
+}
+
+.login-copy,
+.login-footnote {
+  color: var(--text-secondary);
+  line-height: 1.6;
+  font-size: 0.9rem;
+}
+
+.login-error {
+  padding: 11px 13px;
+  border-radius: 14px;
+  border: 1px solid rgba(224, 85, 85, 0.26);
+  background: rgba(224, 85, 85, 0.1);
+  color: #ffb2b2;
+  font-size: 0.88rem;
+  line-height: 1.5;
+}
+
+.login-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.login-field {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.login-field input[type="password"] {
+  width: 100%;
+  background: var(--surface-hi);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 12px 13px;
+  color: var(--text-primary);
+  font: inherit;
+  letter-spacing: 0.28em;
+  font-size: 1.05rem;
+  outline: none;
+}
+
+.login-field input[type="password"]:focus {
+  border-color: var(--border-focus);
+  box-shadow: 0 0 0 3px rgba(79, 110, 247, 0.12);
+}
+
+.login-remember {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 13px;
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.02);
+  cursor: pointer;
+}
+
+.login-remember input {
+  margin-top: 3px;
+}
+
+.login-remember span {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.login-remember strong {
+  color: var(--text-primary);
+  font-size: 0.92rem;
+}
+
+.login-remember small {
+  color: var(--text-secondary);
+  line-height: 1.45;
+}
+
+.login-submit {
+  width: 100%;
+  min-height: 42px;
+}
+
+.login-footnote--warn {
+  color: #f0cc7a;
 }
 
 @media (max-width: 1080px) {

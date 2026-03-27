@@ -76,6 +76,7 @@ from messages import (
 from rag import Chunk
 from rag.store import query_chunks, upsert_chunks
 from rag_service import build_rag_auto_context, get_conversation_records_for_rag, get_exact_tool_memory_match, search_knowledge_base_tool, upsert_tool_memory_result
+from routes.auth import AUTH_LAST_SEEN_KEY, AUTH_REMEMBER_KEY, AUTH_SESSION_KEY
 from routes.chat import (
     OMITTED_TOOL_OUTPUT_TEXT,
     _count_prunable_message_tokens,
@@ -275,6 +276,72 @@ class AppRoutesTestCase(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertIn("canvas_scroll_window_lines", response.get_json()["error"])
+
+    def test_login_pin_protects_page_and_api_routes(self):
+        with patch("config.LOGIN_PIN", "2468"):
+            response = self.client.get("/login")
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("Enter PIN", response.get_data(as_text=True))
+
+            response = self.client.get("/")
+            self.assertEqual(response.status_code, 302)
+            self.assertIn("/login", response.headers["Location"])
+
+            response = self.client.get("/api/settings")
+            self.assertEqual(response.status_code, 401)
+            self.assertEqual(response.get_json()["error"], "Login PIN required.")
+
+            response = self.client.post("/login", data={"pin": "0000"})
+            self.assertEqual(response.status_code, 401)
+            self.assertIn("Invalid PIN.", response.get_data(as_text=True))
+
+            response = self.client.post("/login", data={"pin": "2468"})
+            self.assertEqual(response.status_code, 302)
+            self.assertEqual(response.headers["Location"], "/")
+
+            response = self.client.get("/")
+            self.assertEqual(response.status_code, 200)
+
+    def test_login_pin_times_out_without_remember(self):
+        with patch("config.LOGIN_PIN", "2468"), patch("config.LOGIN_SESSION_TIMEOUT_MINUTES", 1):
+            response = self.client.post("/login", data={"pin": "2468"})
+            self.assertEqual(response.status_code, 302)
+
+            with self.client.session_transaction() as session_data:
+                session_data[AUTH_SESSION_KEY] = True
+                session_data[AUTH_REMEMBER_KEY] = False
+                session_data[AUTH_LAST_SEEN_KEY] = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+
+            response = self.client.get("/settings")
+            self.assertEqual(response.status_code, 302)
+            self.assertIn("/login", response.headers["Location"])
+
+    def test_login_pin_remember_me_skips_timeout(self):
+        with patch("config.LOGIN_PIN", "2468"), patch("config.LOGIN_SESSION_TIMEOUT_MINUTES", 1):
+            response = self.client.post("/login", data={"pin": "2468", "remember": "on"})
+            self.assertEqual(response.status_code, 302)
+
+            with self.client.session_transaction() as session_data:
+                session_data[AUTH_SESSION_KEY] = True
+                session_data[AUTH_REMEMBER_KEY] = True
+                session_data[AUTH_LAST_SEEN_KEY] = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
+
+            response = self.client.get("/settings")
+            self.assertEqual(response.status_code, 200)
+
+    def test_login_pin_locks_out_after_failed_attempts(self):
+        with patch("config.LOGIN_PIN", "2468"), patch("config.LOGIN_MAX_FAILED_ATTEMPTS", 2), patch(
+            "config.LOGIN_LOCKOUT_SECONDS", 60
+        ):
+            response = self.client.post("/login", data={"pin": "0000"})
+            self.assertEqual(response.status_code, 401)
+
+            response = self.client.post("/login", data={"pin": "1111"})
+            self.assertEqual(response.status_code, 429)
+            self.assertIn("Too many failed attempts.", response.get_data(as_text=True))
+
+            response = self.client.post("/login", data={"pin": "2468"})
+            self.assertEqual(response.status_code, 429)
 
     def test_canvas_limit_getters_clamp_values(self):
         settings = get_app_settings()

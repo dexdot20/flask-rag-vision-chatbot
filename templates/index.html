@@ -41,6 +41,9 @@
     <button class="btn-ghost" id="export-btn" type="button">Export</button>
     <button class="btn-ghost" id="prune-history-btn" type="button">Prune history</button>
     <a class="btn-ghost" id="settings-btn" href="/settings">Settings</a>
+    {% if auth_enabled %}
+    <a class="btn-ghost btn-auth-link" href="/logout">Sign out</a>
+    {% endif %}
     <button class="btn-tokens" id="tokens-btn" title="Usage & cost">
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>
@@ -76,6 +79,9 @@
     <button class="mobile-tools-action" id="mobile-export-btn" type="button">Export chat</button>
     <button class="mobile-tools-action" id="mobile-prune-btn" type="button">Prune history</button>
     <a class="mobile-tools-action" id="mobile-settings-btn" href="/settings">Settings</a>
+    {% if auth_enabled %}
+    <a class="mobile-tools-action" id="mobile-logout-btn" href="/logout">Sign out</a>
+    {% endif %}
     <button class="mobile-tools-action" id="mobile-tokens-btn" type="button">Usage &amp; cost</button>
   </div>
 </div>

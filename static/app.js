@@ -4849,7 +4849,7 @@ async function sendMessage(options = {}) {
         } else {
           renderCanvasPanel();
         }
-        setCanvasStatus("Canvas hazırlanıyor...", "muted");
+        setCanvasStatus("Preparing canvas...", "muted");
       } else if (event.type === "canvas_content_delta") {
         const previewDocument = ensureStreamingCanvasPreview(event.tool, event.snapshot);
         if (previewDocument) {
@@ -4858,7 +4858,7 @@ async function sendMessage(options = {}) {
           if (!isCanvasOpen()) {
             openCanvas();
           }
-          setCanvasStatus("Canvas canlı oluşturuluyor...", "muted");
+          setCanvasStatus("Generating live canvas...", "muted");
           scheduleCanvasPreviewRender();
         }
       } else if (event.type === "canvas_sync") {

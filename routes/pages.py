@@ -14,6 +14,7 @@ from config import (
     RAG_SENSITIVITY_PRESETS,
     get_feature_flags,
 )
+from routes.auth import is_login_pin_enabled
 from db import (
     get_active_tool_names,
     get_app_settings,
@@ -74,12 +75,13 @@ def register_page_routes(app) -> None:
             "index.html",
             models=AVAILABLE_MODELS,
             settings=settings,
+            auth_enabled=is_login_pin_enabled(),
         )
 
     @app.route("/settings")
     def settings_page():
         settings = build_settings_payload()
-        return render_template("settings.html", settings=settings)
+        return render_template("settings.html", settings=settings, auth_enabled=is_login_pin_enabled())
 
     @app.route("/api/settings", methods=["GET"])
     def get_settings():
