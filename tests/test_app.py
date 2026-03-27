@@ -20,6 +20,7 @@ from agent import (
     _build_compact_tool_message_content,
     _build_streaming_canvas_tool_preview,
     _execute_tool,
+    _estimate_message_breakdown,
     _extract_partial_json_string_value,
     _is_context_overflow_error,
     _iter_agent_exchange_blocks,
@@ -45,6 +46,7 @@ from db import (
     append_to_scratchpad,
     count_visible_message_tokens,
     create_image_asset,
+    extract_message_usage,
     get_canvas_expand_max_lines,
     get_canvas_prompt_max_lines,
     get_canvas_scroll_window_lines,
@@ -93,6 +95,7 @@ from web_tools import (
     search_news_google_tool,
     search_web_tool,
 )
+from token_utils import estimate_text_tokens
 
 
 class AppRoutesTestCase(unittest.TestCase):
@@ -2020,6 +2023,50 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn(".reasoning-body code", style_text)
         self.assertIn(".reasoning-body ul", style_text)
 
+    def test_estimate_message_breakdown_splits_runtime_system_sections(self):
+        message = build_runtime_system_message(
+            active_tool_names=["search_web", "search_tool_memory", "append_scratchpad"],
+            retrieved_context="Alpha knowledge block",
+            tool_trace_context="search_web -> returned 3 results",
+            tool_memory_context="Stored page snapshot",
+            scratchpad="Remember the preferred deployment region.",
+            canvas_documents=[
+                {
+                    "id": "doc-1",
+                    "title": "spec.md",
+                    "content": "line one\nline two",
+                    "format": "markdown",
+                    "language": "markdown",
+                }
+            ],
+        )
+
+        breakdown = _estimate_message_breakdown(message)
+
+        self.assertGreater(breakdown["core_instructions"], 0)
+        self.assertGreater(breakdown["tool_specs"], 0)
+        self.assertGreater(breakdown["canvas"], 0)
+        self.assertGreater(breakdown["scratchpad"], 0)
+        self.assertGreater(breakdown["tool_trace"], 0)
+        self.assertGreater(breakdown["tool_memory"], 0)
+        self.assertGreater(breakdown["rag_context"], 0)
+        self.assertEqual(sum(breakdown.values()), estimate_text_tokens(message["content"]))
+
+    def test_extract_message_usage_maps_legacy_system_prompt_breakdown(self):
+        usage = extract_message_usage(
+            {
+                "usage": {
+                    "estimated_input_tokens": 4,
+                    "input_breakdown": {
+                        "system_prompt": 4,
+                    },
+                }
+            }
+        )
+
+        self.assertEqual(usage["input_breakdown"]["core_instructions"], 4)
+        self.assertNotIn("system_prompt", usage["input_breakdown"])
+
     def test_frontend_restores_persistent_tool_trace_panel(self):
         script_path = Path(__file__).resolve().parent.parent / "static" / "app.js"
         script_text = script_path.read_text(encoding="utf-8")
@@ -2351,7 +2398,7 @@ class AppRoutesTestCase(unittest.TestCase):
                     "total_tokens": 18,
                     "estimated_input_tokens": 14,
                     "input_breakdown": {
-                        "system_prompt": 4,
+                        "core_instructions": 4,
                         "user_messages": 6,
                         "assistant_history": 0,
                         "tool_results": 0,
@@ -2405,6 +2452,7 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(assistant_metadata["tool_trace"][0]["state"], "done")
         self.assertEqual(assistant_metadata["usage"]["estimated_input_tokens"], 14)
         self.assertEqual(assistant_metadata["usage"]["input_breakdown"]["user_messages"], 6)
+        self.assertEqual(assistant_metadata["usage"]["input_breakdown"]["core_instructions"], 4)
         self.assertEqual(rows[1]["prompt_tokens"], 11)
         self.assertEqual(rows[1]["completion_tokens"], 7)
         self.assertEqual(rows[1]["total_tokens"], 18)
@@ -2413,7 +2461,7 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(conversation_response.status_code, 200)
         assistant_message = conversation_response.get_json()["messages"][1]
         self.assertEqual(assistant_message["usage"]["estimated_input_tokens"], 14)
-        self.assertEqual(assistant_message["usage"]["input_breakdown"]["system_prompt"], 4)
+        self.assertEqual(assistant_message["usage"]["input_breakdown"]["core_instructions"], 4)
         self.assertEqual(assistant_message["metadata"]["tool_trace"][0]["tool_name"], "search_web")
 
     def test_failed_tool_summary_detection_marks_fetch_failures(self):

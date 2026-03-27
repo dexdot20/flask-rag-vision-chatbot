@@ -49,13 +49,21 @@ from token_utils import estimate_text_tokens
 
 _db_path = DB_PATH
 MESSAGE_USAGE_BREAKDOWN_KEYS = (
-    "system_prompt",
+    "core_instructions",
+    "tool_specs",
+    "canvas",
+    "scratchpad",
+    "tool_trace",
+    "tool_memory",
+    "rag_context",
     "user_messages",
     "assistant_history",
     "tool_results",
-    "rag_context",
     "final_instruction",
 )
+LEGACY_MESSAGE_USAGE_BREAKDOWN_KEYS = {
+    "core_instructions": ("system_prompt",),
+}
 MESSAGE_TOOL_TRACE_STATES = {"running", "done", "error"}
 VISIBLE_CHAT_ROLES = {"user", "assistant", "summary"}
 SUMMARY_TRIGGER_TOKEN_ROLES = {"user", "assistant", "tool"}
@@ -845,7 +853,13 @@ def _normalize_message_usage(value: dict | None) -> dict | None:
     if isinstance(breakdown, dict):
         normalized_breakdown = {}
         for key in MESSAGE_USAGE_BREAKDOWN_KEYS:
-            normalized = _coerce_non_negative_int(breakdown.get(key))
+            raw_value = breakdown.get(key)
+            if raw_value is None:
+                for legacy_key in LEGACY_MESSAGE_USAGE_BREAKDOWN_KEYS.get(key, ()):
+                    if legacy_key in breakdown:
+                        raw_value = breakdown.get(legacy_key)
+                        break
+            normalized = _coerce_non_negative_int(raw_value)
             if normalized is not None:
                 normalized_breakdown[key] = normalized
         if normalized_breakdown:

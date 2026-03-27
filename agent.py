@@ -119,12 +119,37 @@ WEB_TOOL_NAMES = {
     "search_news_google",
 }
 INPUT_BREAKDOWN_KEYS = (
-    "system_prompt",
+    "core_instructions",
+    "tool_specs",
+    "canvas",
+    "scratchpad",
+    "tool_trace",
+    "tool_memory",
+    "rag_context",
     "user_messages",
     "assistant_history",
     "tool_results",
-    "rag_context",
     "final_instruction",
+)
+SYSTEM_BREAKDOWN_SECTION_KEY_BY_HEADING = {
+    "## Scratchpad (AI Persistent Memory)": "scratchpad",
+    "## Tool Execution History": "tool_trace",
+    "## Tool Memory": "tool_memory",
+    "## Knowledge Base": "rag_context",
+    "## Canvas Project Manifest": "canvas",
+    "## Canvas Relationship Map": "canvas",
+    "## Active Canvas Document": "canvas",
+    "## Other Canvas Documents": "canvas",
+    "## Available Tools": "tool_specs",
+}
+SYSTEM_BREAKDOWN_REDUCTION_ORDER = (
+    "core_instructions",
+    "tool_specs",
+    "canvas",
+    "scratchpad",
+    "tool_trace",
+    "tool_memory",
+    "rag_context",
 )
 _AGENT_TRACE_LOGGER = None
 
@@ -164,6 +189,67 @@ def _estimate_text_tokens(text: str) -> int:
     return estimate_text_tokens(text)
 
 
+def _rebalance_breakdown_to_total(breakdown: dict[str, int], total_tokens: int) -> dict[str, int]:
+    adjusted = {key: max(0, int(value)) for key, value in breakdown.items() if value and value > 0}
+    current_total = sum(adjusted.values())
+    if current_total < total_tokens:
+        adjusted["core_instructions"] = adjusted.get("core_instructions", 0) + (total_tokens - current_total)
+        return adjusted
+
+    overflow = current_total - total_tokens
+    if overflow <= 0:
+        return adjusted
+
+    for key in SYSTEM_BREAKDOWN_REDUCTION_ORDER:
+        if overflow <= 0:
+            break
+        available = adjusted.get(key, 0)
+        if available <= 0:
+            continue
+        reduction = min(available, overflow)
+        adjusted[key] = available - reduction
+        overflow -= reduction
+
+    if overflow > 0:
+        for key, available in sorted(adjusted.items(), key=lambda item: item[1], reverse=True):
+            if overflow <= 0:
+                break
+            if available <= 0:
+                continue
+            reduction = min(available, overflow)
+            adjusted[key] = available - reduction
+            overflow -= reduction
+
+    return {key: value for key, value in adjusted.items() if value > 0}
+
+
+def _estimate_system_message_breakdown(content: str, total_tokens: int) -> dict[str, int]:
+    section_matches = list(re.finditer(r"^## [^\n]+", content, flags=re.MULTILINE))
+    if not section_matches:
+        return {"core_instructions": total_tokens}
+
+    breakdown: dict[str, int] = {}
+    cursor = 0
+    for index, match in enumerate(section_matches):
+        start = match.start()
+        end = section_matches[index + 1].start() if index + 1 < len(section_matches) else len(content)
+        if start > cursor:
+            prefix = content[cursor:start]
+            prefix_tokens = _estimate_text_tokens(prefix)
+            if prefix_tokens > 0:
+                breakdown["core_instructions"] = breakdown.get("core_instructions", 0) + prefix_tokens
+
+        section_text = content[start:end]
+        section_tokens = _estimate_text_tokens(section_text)
+        if section_tokens > 0:
+            section_heading = match.group(0).strip()
+            section_key = SYSTEM_BREAKDOWN_SECTION_KEY_BY_HEADING.get(section_heading, "core_instructions")
+            breakdown[section_key] = breakdown.get(section_key, 0) + section_tokens
+        cursor = end
+
+    return _rebalance_breakdown_to_total(breakdown, total_tokens)
+
+
 def _estimate_message_breakdown(message: dict) -> dict[str, int]:
     role = str(message.get("role") or "").strip()
     content = str(message.get("content") or "")
@@ -178,7 +264,7 @@ def _estimate_message_breakdown(message: dict) -> dict[str, int]:
     if role == "tool":
         return {"tool_results": total_tokens}
     if role != "system":
-        return {"system_prompt": total_tokens}
+        return {"core_instructions": total_tokens}
 
     # Classify system messages by their distinctive markers
     if content.startswith(TOOL_EXECUTION_RESULTS_MARKER):
@@ -188,25 +274,8 @@ def _estimate_message_breakdown(message: dict) -> dict[str, int]:
     if content.startswith("[INSTRUCTION: MISSING FINAL ANSWER"):
         return {"final_instruction": total_tokens}
 
-    # Extract RAG context token count by identifying the knowledge base section in markdown
-    rag_tokens = 0
-    if "## Knowledge Base" in content:
-        match = re.search(r"## Knowledge Base(.*?)(?:\n## |\Z)", content, flags=re.DOTALL)
-        if match:
-            rag_context_text = match.group(1)
-            rag_tokens = min(total_tokens, _estimate_text_tokens(rag_context_text))
-
-    system_tokens = max(total_tokens - rag_tokens, 0)
-    if rag_tokens > 0 and system_tokens == 0 and total_tokens > 0:
-        system_tokens = 1
-        rag_tokens = max(total_tokens - 1, 0)
-
-    breakdown = {}
-    if system_tokens:
-        breakdown["system_prompt"] = system_tokens
-    if rag_tokens:
-        breakdown["rag_context"] = rag_tokens
-    return breakdown or {"system_prompt": total_tokens}
+    breakdown = _estimate_system_message_breakdown(content, total_tokens)
+    return breakdown or {"core_instructions": total_tokens}
 
 
 def _estimate_input_breakdown(messages_to_send: list[dict]) -> tuple[dict[str, int], int]:

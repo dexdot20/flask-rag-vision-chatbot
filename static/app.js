@@ -1501,20 +1501,30 @@ function renderBubbleMarkdown(bubbleEl, text) {
 }
 
 const INPUT_BREAKDOWN_ORDER = [
-  "system_prompt",
+  "core_instructions",
+  "tool_specs",
+  "canvas",
+  "scratchpad",
+  "tool_trace",
+  "tool_memory",
+  "rag_context",
   "user_messages",
   "assistant_history",
   "tool_results",
-  "rag_context",
   "final_instruction",
 ];
 
 const INPUT_BREAKDOWN_LABELS = {
-  system_prompt: "System prompt",
+  core_instructions: "Core instructions",
+  tool_specs: "Tool specs",
+  canvas: "Canvas",
+  scratchpad: "Scratchpad",
+  tool_trace: "Tool trace",
+  tool_memory: "Tool memory",
+  rag_context: "RAG context",
   user_messages: "User messages",
   assistant_history: "Assistant history",
   tool_results: "Tool results",
-  rag_context: "RAG context",
   final_instruction: "Final instruction",
 };
 
@@ -1534,7 +1544,12 @@ function toFiniteNumber(value, fallback = 0) {
 function normalizeBreakdown(rawBreakdown) {
   const normalized = createEmptyBreakdown();
   const source = rawBreakdown && typeof rawBreakdown === "object" ? rawBreakdown : {};
+  const legacyCoreInstructions = source.core_instructions ?? source.system_prompt;
   INPUT_BREAKDOWN_ORDER.forEach((key) => {
+    if (key === "core_instructions") {
+      normalized[key] = Math.max(0, Math.round(toFiniteNumber(legacyCoreInstructions, 0)));
+      return;
+    }
     normalized[key] = Math.max(0, Math.round(toFiniteNumber(source[key], 0)));
   });
   return normalized;
