@@ -20,6 +20,7 @@ from agent import (
     FINAL_ANSWER_MISSING_TEXT,
     _build_compact_tool_message_content,
     _build_streaming_canvas_tool_preview,
+    _estimate_input_breakdown,
     _execute_tool,
     _estimate_message_breakdown,
     _extract_partial_json_string_value,
@@ -948,7 +949,7 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn("The user is 22 years old.", content)
         self.assertIn("Only durable, high-signal facts", content)
         self.assertIn("Web findings", content)
-        self.assertIn("If the information would not change future responses or behavior, do not store it.", content)
+        self.assertIn("Ask whether this information will still matter in a future conversation", content)
         self.assertIn("Never save them just because they were requested.", content)
         self.assertNotIn("Err on the side of saving if in doubt.", content)
         self.assertIn("Clarification**: If a good answer depends", content)
@@ -1217,11 +1218,10 @@ class AppRoutesTestCase(unittest.TestCase):
         )
 
         content = message["content"]
-        self.assertIn('"name": "create_canvas_document"', content)
-        self.assertNotIn('"name": "expand_canvas_document"', content)
-        self.assertNotIn('"name": "rewrite_canvas_document"', content)
-        self.assertNotIn('"name": "replace_canvas_lines"', content)
-        self.assertNotIn('"name": "clear_canvas"', content)
+        self.assertIn("## Tool Calling", content)
+        self.assertIn("Native function calling is enabled for this turn.", content)
+        self.assertNotIn("## Active Canvas Document", content)
+        self.assertNotIn("Available Tools", content)
 
     def test_runtime_system_message_includes_active_canvas_document_context(self):
         message = build_runtime_system_message(
@@ -1246,7 +1246,8 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn("- Language: python", content)
         self.assertIn("1: print('hello')", content)
         self.assertIn("2: print('world')", content)
-        self.assertIn('"name": "replace_canvas_lines"', content)
+        self.assertIn("## Tool Calling", content)
+        self.assertIn("Use only the tools exposed by the API for this turn", content)
 
     def test_runtime_system_message_includes_canvas_project_manifest(self):
         message = build_runtime_system_message(
@@ -1555,6 +1556,34 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn("[Uploaded document: notes.txt]", content)
         self.assertIn("Visual summary: A dashboard is visible.", content)
         self.assertIn("Visual summary: A settings page is visible.", content)
+
+    def test_build_user_message_for_model_omits_document_context_already_in_canvas(self):
+        content = build_user_message_for_model(
+            "Use the document in canvas.",
+            {
+                "attachments": [
+                    {
+                        "kind": "document",
+                        "file_id": "file_123",
+                        "file_name": "notes.txt",
+                        "file_context_block": "[Uploaded document: notes.txt]\n\nProject notes\nLine two",
+                    }
+                ]
+            },
+            canvas_documents=[
+                {
+                    "id": "doc-1",
+                    "title": "notes.txt",
+                    "content": "# notes.txt\n\nProject notes\nLine two",
+                    "format": "markdown",
+                    "language": "markdown",
+                }
+            ],
+        )
+
+        self.assertIn("Use the document in canvas.", content)
+        self.assertNotIn("[Uploaded document: notes.txt]", content)
+        self.assertNotIn("Project notes", content)
 
     def test_image_explain_tool_spec_requires_image_and_conversation_ids(self):
         spec = TOOL_SPEC_BY_NAME["image_explain"]
@@ -2298,13 +2327,27 @@ class AppRoutesTestCase(unittest.TestCase):
         breakdown = _estimate_message_breakdown(message)
 
         self.assertGreater(breakdown["core_instructions"], 0)
-        self.assertGreater(breakdown["tool_specs"], 0)
         self.assertGreater(breakdown["canvas"], 0)
         self.assertGreater(breakdown["scratchpad"], 0)
         self.assertGreater(breakdown["tool_trace"], 0)
         self.assertGreater(breakdown["tool_memory"], 0)
         self.assertGreater(breakdown["rag_context"], 0)
+        self.assertNotIn("tool_specs", breakdown)
+        self.assertNotIn("Available Tools", message["content"])
         self.assertEqual(sum(breakdown.values()), estimate_text_tokens(message["content"]))
+
+    def test_estimate_input_breakdown_counts_native_tool_schemas(self):
+        message = build_runtime_system_message(active_tool_names=["search_web"])
+        request_tools = get_openai_tool_specs(["search_web"])
+
+        breakdown, _total_tokens, tool_schema_tokens = _estimate_input_breakdown(
+            [message, {"role": "user", "content": "Find the release notes."}],
+            request_tools=request_tools,
+        )
+
+        self.assertNotIn("Available Tools", message["content"])
+        self.assertGreater(tool_schema_tokens, 0)
+        self.assertEqual(breakdown["tool_specs"], tool_schema_tokens)
 
     def test_extract_message_usage_maps_legacy_system_prompt_breakdown(self):
         usage = extract_message_usage(

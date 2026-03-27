@@ -876,7 +876,13 @@ def _redact_old_tool_messages(block_messages: list[dict], current_turn_start_key
     return redacted_messages
 
 
-def _select_recent_prompt_window(messages: list[dict], max_tokens: int, min_user_messages: int = 2) -> list[dict]:
+def _select_recent_prompt_window(
+    messages: list[dict],
+    max_tokens: int,
+    min_user_messages: int = 2,
+    *,
+    canvas_documents: list[dict] | None = None,
+) -> list[dict]:
     if max_tokens <= 0:
         return []
     current_turn_start_key = _get_last_user_message_key(messages)
@@ -888,7 +894,7 @@ def _select_recent_prompt_window(messages: list[dict], max_tokens: int, min_user
         prompt_block_messages = _redact_old_tool_messages(block_messages, current_turn_start_key)
         candidate_blocks = [prompt_block_messages, *reversed(selected_blocks_reversed)]
         candidate = [message for candidate_block in candidate_blocks for message in candidate_block]
-        if _estimate_prompt_tokens(build_api_messages(candidate)) > max_tokens:
+        if _estimate_prompt_tokens(build_api_messages(candidate, canvas_documents=canvas_documents)) > max_tokens:
             break
         selected_blocks_reversed.append(prompt_block_messages)
 
@@ -939,6 +945,7 @@ def _build_budgeted_prompt_messages(
     selected_recent = _select_recent_prompt_window(
         recent_messages,
         min(get_prompt_recent_history_max_tokens(settings), history_budget),
+        canvas_documents=canvas_documents,
     )
     recent_tokens = count_visible_message_tokens(selected_recent)
     remaining_for_summaries = max(0, history_budget - recent_tokens)
@@ -948,7 +955,7 @@ def _build_budgeted_prompt_messages(
     )
 
     prompt_history = [*selected_summaries, *selected_recent]
-    prompt_history_api = build_api_messages(prompt_history)
+    prompt_history_api = build_api_messages(prompt_history, canvas_documents=canvas_documents)
     history_tokens = _estimate_prompt_tokens(prompt_history_api)
     remaining_context_budget = max(0, prompt_budget - base_system_tokens - history_tokens)
 

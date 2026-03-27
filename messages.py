@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime
 
 from canvas_service import build_canvas_project_manifest, extract_canvas_documents, scale_canvas_char_limit
@@ -9,7 +10,7 @@ from config import (
     RAG_ENABLED,
 )
 from db import extract_message_attachments, parse_message_metadata, parse_message_tool_calls
-from tool_registry import get_prompt_tool_context, resolve_runtime_tool_names
+from tool_registry import resolve_runtime_tool_names
 
 SUMMARY_LABEL = "Conversation summary (generated from deleted messages):"
 CANVAS_PROMPT_MAX_CHARS = 12_000
@@ -100,16 +101,78 @@ def normalize_chat_messages(messages) -> list[dict]:
     return normalized
 
 
-def build_user_message_for_model(content: str, metadata: dict | None = None) -> str:
+def _normalize_canvas_document_name(value: str | None) -> str:
+    return os.path.basename(str(value or "").strip()).casefold()
+
+
+def _extract_document_context_body(context_block: str | None) -> str:
+    normalized = str(context_block or "").strip()
+    if not normalized:
+        return ""
+
+    lines = normalized.splitlines()
+    if lines and lines[0].startswith("[Uploaded document:"):
+        lines = lines[1:]
+        while lines and not lines[0].strip():
+            lines = lines[1:]
+    return "\n".join(lines).strip()
+
+
+def _build_canvas_document_lookup(canvas_documents) -> dict[str, list[str]]:
+    documents = extract_canvas_documents({"canvas_documents": canvas_documents or []})
+    lookup: dict[str, list[str]] = {}
+    for document in documents:
+        normalized_content = str(document.get("content") or "").strip().casefold()
+        if not normalized_content:
+            continue
+        for candidate in (
+            _normalize_canvas_document_name(document.get("title")),
+            _normalize_canvas_document_name(document.get("path")),
+        ):
+            if not candidate:
+                continue
+            lookup.setdefault(candidate, []).append(normalized_content)
+    return lookup
+
+
+def _document_attachment_is_represented_in_canvas(attachment: dict, canvas_document_lookup: dict[str, list[str]]) -> bool:
+    if not canvas_document_lookup:
+        return False
+
+    normalized_name = _normalize_canvas_document_name(attachment.get("file_name"))
+    if not normalized_name:
+        return False
+
+    candidate_contents = canvas_document_lookup.get(normalized_name) or []
+    if not candidate_contents:
+        return False
+
+    body_excerpt = _extract_document_context_body(attachment.get("file_context_block"))
+    if not body_excerpt:
+        return True
+
+    normalized_excerpt = body_excerpt[:500].casefold()
+    return any(normalized_excerpt in content for content in candidate_contents)
+
+
+def build_user_message_for_model(
+    content: str,
+    metadata: dict | None = None,
+    *,
+    canvas_documents: list[dict] | None = None,
+) -> str:
     content = (content or "").strip()
     metadata = metadata if isinstance(metadata, dict) else {}
 
     attachments = extract_message_attachments(metadata)
+    canvas_document_lookup = _build_canvas_document_lookup(canvas_documents)
     file_context_blocks = []
     vision_attachments = []
     for attachment in attachments:
         if attachment.get("kind") == "document":
             context_block = str(attachment.get("file_context_block") or "").strip()
+            if _document_attachment_is_represented_in_canvas(attachment, canvas_document_lookup):
+                continue
             if context_block and context_block not in file_context_blocks:
                 file_context_blocks.append(context_block)
             continue
@@ -165,14 +228,14 @@ def build_user_message_for_model(content: str, metadata: dict | None = None) -> 
     return "\n\n".join(parts)
 
 
-def build_api_messages(messages: list[dict]) -> list[dict]:
+def build_api_messages(messages: list[dict], *, canvas_documents: list[dict] | None = None) -> list[dict]:
     api_messages = []
     for message in messages:
         content = message["content"]
         role = message["role"]
         metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
         if role == "user":
-            content = build_user_message_for_model(content, metadata)
+            content = build_user_message_for_model(content, metadata, canvas_documents=canvas_documents)
         elif role == "summary":
             role = "assistant"
             if not content.strip().lower().startswith(SUMMARY_LABEL.lower()):
@@ -259,14 +322,14 @@ def _build_canvas_prompt_payload(
 
 
 def build_tool_call_contract(active_tool_names: list[str], canvas_documents=None) -> dict | None:
-    tools = get_prompt_tool_context(active_tool_names, canvas_documents=canvas_documents)
-    if not tools:
+    runtime_tool_names = resolve_runtime_tool_names(active_tool_names or [], canvas_documents=canvas_documents)
+    if not runtime_tool_names:
         return None
     return {
         "rules": [
             "If you need a tool, call it via native function calling instead of writing tool JSON in assistant content.",
             "If you do not need a tool, answer normally in assistant content.",
-            "Use only the enabled tools listed above, and provide arguments matching the documented types.",
+            "Use only the tools exposed by the API for this turn, and provide arguments matching the documented types.",
         ],
     }
 
@@ -436,18 +499,13 @@ def build_runtime_system_message(
             parts.append("## Other Canvas Documents")
             parts.append("```json\n" + json.dumps(other_documents, ensure_ascii=False, indent=2) + "\n```\n")
 
-    # Tool capabilities
-    tools = get_prompt_tool_context(active_tool_names, canvas_documents=canvas_documents) if active_tool_names else None
-    if tools:
-        parts.append("## Available Tools")
-        parts.append("You have access to the following tools:\n```json\n" + json.dumps(tools, ensure_ascii=False, indent=2) + "\n```\n")
-        
-        contract = build_tool_call_contract(active_tool_names, canvas_documents=canvas_documents)
-        if contract:
-            parts.append("### How to Call Tools")
-            for rule in contract["rules"]:
-                parts.append(f"- {rule}")
-            parts.append("")
+    contract = build_tool_call_contract(active_tool_names, canvas_documents=canvas_documents)
+    if contract:
+        parts.append("## Tool Calling")
+        parts.append("Native function calling is enabled for this turn. Do not restate tool schemas or invent unavailable tools.\n")
+        for rule in contract["rules"]:
+            parts.append(f"- {rule}")
+        parts.append("")
 
     return {
         "role": "system",
