@@ -1017,6 +1017,40 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(result["matches"][0]["id"], "new-hit")
         self.assertGreater(result["matches"][0]["similarity"], result["matches"][1]["similarity"])
 
+    def test_build_rag_auto_context_excludes_current_conversation_sources(self):
+        fake_hits = [
+            {
+                "id": "conversation-hit",
+                "text": "conversation memory",
+                "metadata": {"source_key": "conversation-1", "source_name": "Conversation", "source_type": "conversation", "category": "conversation", "chunk_index": 0},
+                "similarity": 0.98,
+            },
+            {
+                "id": "tool-hit",
+                "text": "tool memory",
+                "metadata": {"source_key": "tool-1", "source_name": "Tool result", "source_type": "tool_result", "category": "tool_result", "chunk_index": 0},
+                "similarity": 0.95,
+            },
+            {
+                "id": "other-hit",
+                "text": "other memory",
+                "metadata": {"source_key": "other-1", "source_name": "Other", "source_type": "tool_memory", "category": "tool_memory", "chunk_index": 0},
+                "similarity": 0.90,
+            },
+        ]
+
+        with patch("rag_service.ensure_supported_rag_sources"), patch("rag_service.rag_query_chunks", return_value=fake_hits):
+            result = build_rag_auto_context(
+                "recent memory",
+                True,
+                threshold=0.1,
+                top_k=5,
+                exclude_source_keys={"conversation-1", "tool-1"},
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual([match["id"] for match in result["matches"]], ["other-hit"])
+
     def test_runtime_system_message_hides_canvas_edit_tools_without_canvas_document(self):
         message = build_runtime_system_message(
             active_tool_names=[

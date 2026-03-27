@@ -19,7 +19,15 @@ from canvas_service import (
     find_latest_canvas_state,
     get_canvas_runtime_documents,
 )
-from config import CHAT_SUMMARY_MODEL, RAG_ENABLED, RAG_SENSITIVITY_PRESETS, VISION_DISABLED_FEATURE_ERROR, VISION_ENABLED
+from config import (
+    CHAT_SUMMARY_MODEL,
+    RAG_ENABLED,
+    RAG_SENSITIVITY_PRESETS,
+    RAG_SOURCE_CONVERSATION,
+    RAG_SOURCE_TOOL_RESULT,
+    VISION_DISABLED_FEATURE_ERROR,
+    VISION_ENABLED,
+)
 from db import (
     build_user_profile_system_context,
     get_canvas_expand_max_lines,
@@ -1822,7 +1830,12 @@ def register_chat_routes(app) -> None:
                 canonical_messages = preflight_summary_outcome.get("messages") or get_conversation_messages(conv_id)
 
         rag_exclude_source_keys = (
-            {conversation_rag_source_key("conversation", conv_id)} if conv_id else None
+            {
+                conversation_rag_source_key(RAG_SOURCE_CONVERSATION, conv_id),
+                conversation_rag_source_key(RAG_SOURCE_TOOL_RESULT, conv_id),
+            }
+            if conv_id
+            else None
         )
         retrieved_context = build_rag_auto_context(
             rag_query_text,
