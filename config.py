@@ -216,13 +216,6 @@ FETCH_RAW_TOOL_RESULT_MAX_TEXT_CHARS = max(
 TOOL_MEMORY_TTL_DEFAULT_SECONDS = max(3_600, _parse_int_env("TOOL_MEMORY_TTL_DEFAULT_SECONDS", 604_800))
 TOOL_MEMORY_TTL_WEB_SECONDS = max(3_600, _parse_int_env("TOOL_MEMORY_TTL_WEB_SECONDS", 86_400))
 TOOL_MEMORY_TTL_NEWS_SECONDS = max(1_800, _parse_int_env("TOOL_MEMORY_TTL_NEWS_SECONDS", 7_200))
-TOOL_STEP_LIMITS = {
-    "search_web": max(1, _parse_int_env("TOOL_STEP_LIMIT_SEARCH_WEB", 3)),
-    "fetch_url": max(1, _parse_int_env("TOOL_STEP_LIMIT_FETCH_URL", 2)),
-    "search_news_ddgs": max(1, _parse_int_env("TOOL_STEP_LIMIT_SEARCH_NEWS_DDGS", 2)),
-    "search_news_google": max(1, _parse_int_env("TOOL_STEP_LIMIT_SEARCH_NEWS_GOOGLE", 2)),
-    "default": max(1, _parse_int_env("TOOL_STEP_LIMIT_DEFAULT", 5)),
-}
 RAG_DISABLED_INGEST_ERROR = (
     "Manual RAG ingestion is disabled. RAG now only indexes conversation history and successful text-like tool results."
 )

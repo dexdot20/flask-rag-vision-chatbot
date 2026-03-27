@@ -2207,6 +2207,8 @@ class AppRoutesTestCase(unittest.TestCase):
 
     def test_settings_ui_exposes_fetch_threshold_input(self):
         html = self.client.get("/settings").get_data(as_text=True)
+        self.assertIn("Tool step budget", html)
+        self.assertIn("Tool step limit (1-10)", html)
         self.assertIn('value="append_scratchpad"', html)
         self.assertIn('value="ask_clarifying_question"', html)
         self.assertIn('id="scratchpad-list"', html)
@@ -3952,19 +3954,9 @@ class AppRoutesTestCase(unittest.TestCase):
         responses = [
             iter(
                 [
-                    self._tool_call_chunk("fetch_url", {"url": "https://example.com/1"}),
-                    self._stream_chunk(usage=SimpleNamespace(prompt_tokens=2, completion_tokens=3, total_tokens=5)),
-                ]
-            ),
-            iter(
-                [
-                    self._tool_call_chunk("fetch_url", {"url": "https://example.com/2"}),
-                    self._stream_chunk(usage=SimpleNamespace(prompt_tokens=2, completion_tokens=3, total_tokens=5)),
-                ]
-            ),
-            iter(
-                [
-                    self._tool_call_chunk("fetch_url", {"url": "https://example.com/3"}),
+                    self._tool_call_chunk("fetch_url", {"url": "https://example.com/1"}, call_id="tool-call-1", index=0),
+                    self._tool_call_chunk("fetch_url", {"url": "https://example.com/2"}, call_id="tool-call-2", index=1),
+                    self._tool_call_chunk("fetch_url", {"url": "https://example.com/3"}, call_id="tool-call-3", index=2),
                     self._stream_chunk(usage=SimpleNamespace(prompt_tokens=2, completion_tokens=3, total_tokens=5)),
                 ]
             ),
@@ -3980,7 +3972,7 @@ class AppRoutesTestCase(unittest.TestCase):
             "agent.fetch_url_tool",
             return_value={"url": "https://example.com", "title": "Example", "content": "Body"},
         ) as mocked_fetch:
-            events = list(run_agent_stream([{"role": "user", "content": "Fetch several pages"}], "deepseek-chat", 4, ["fetch_url"]))
+            events = list(run_agent_stream([{"role": "user", "content": "Fetch several pages"}], "deepseek-chat", 2, ["fetch_url"]))
 
         self.assertEqual(mocked_fetch.call_count, 2)
         per_tool_errors = [
@@ -3988,6 +3980,81 @@ class AppRoutesTestCase(unittest.TestCase):
             if event["type"] == "tool_error" and event["tool"] == "fetch_url" and "Per-tool step limit reached" in event["error"]
         ]
         self.assertEqual(len(per_tool_errors), 1)
+        self.assertIn({"type": "answer_delta", "text": "Final answer."}, events)
+
+    def test_run_agent_stream_uses_max_steps_as_default_per_tool_budget(self):
+        responses = [
+            iter(
+                [
+                    self._tool_call_chunk("append_scratchpad", {"notes": ["note 1"]}, call_id="tool-call-1"),
+                    self._stream_chunk(usage=SimpleNamespace(prompt_tokens=2, completion_tokens=3, total_tokens=5)),
+                ]
+            ),
+            iter(
+                [
+                    self._tool_call_chunk("append_scratchpad", {"notes": ["note 2"]}, call_id="tool-call-2"),
+                    self._stream_chunk(usage=SimpleNamespace(prompt_tokens=2, completion_tokens=3, total_tokens=5)),
+                ]
+            ),
+            iter(
+                [
+                    self._tool_call_chunk("append_scratchpad", {"notes": ["note 3"]}, call_id="tool-call-3"),
+                    self._stream_chunk(usage=SimpleNamespace(prompt_tokens=2, completion_tokens=3, total_tokens=5)),
+                ]
+            ),
+            iter(
+                [
+                    self._tool_call_chunk("append_scratchpad", {"notes": ["note 4"]}, call_id="tool-call-4"),
+                    self._stream_chunk(usage=SimpleNamespace(prompt_tokens=2, completion_tokens=3, total_tokens=5)),
+                ]
+            ),
+            iter(
+                [
+                    self._tool_call_chunk("append_scratchpad", {"notes": ["note 5"]}, call_id="tool-call-5"),
+                    self._stream_chunk(usage=SimpleNamespace(prompt_tokens=2, completion_tokens=3, total_tokens=5)),
+                ]
+            ),
+            iter(
+                [
+                    self._tool_call_chunk("append_scratchpad", {"notes": ["note 6"]}, call_id="tool-call-6"),
+                    self._stream_chunk(usage=SimpleNamespace(prompt_tokens=2, completion_tokens=3, total_tokens=5)),
+                ]
+            ),
+            iter(
+                [
+                    self._stream_chunk(content="Final answer."),
+                    self._stream_chunk(usage=SimpleNamespace(prompt_tokens=2, completion_tokens=4, total_tokens=6)),
+                ]
+            ),
+        ]
+
+        with patch("agent.client.chat.completions.create", side_effect=responses), patch(
+            "agent.append_to_scratchpad",
+            side_effect=[
+                ({"status": "appended", "scratchpad": "note 1"}, "Scratchpad updated"),
+                ({"status": "appended", "scratchpad": "note 1\nnote 2"}, "Scratchpad updated"),
+                ({"status": "appended", "scratchpad": "note 1\nnote 2\nnote 3"}, "Scratchpad updated"),
+                ({"status": "appended", "scratchpad": "note 1\nnote 2\nnote 3\nnote 4"}, "Scratchpad updated"),
+                ({"status": "appended", "scratchpad": "note 1\nnote 2\nnote 3\nnote 4\nnote 5"}, "Scratchpad updated"),
+                ({"status": "appended", "scratchpad": "note 1\nnote 2\nnote 3\nnote 4\nnote 5\nnote 6"}, "Scratchpad updated"),
+            ],
+        ) as mocked_append:
+            events = list(
+                run_agent_stream(
+                    [{"role": "user", "content": "Remember these notes"}],
+                    "deepseek-chat",
+                    6,
+                    ["append_scratchpad"],
+                )
+            )
+
+        self.assertEqual(mocked_append.call_count, 6)
+        per_tool_errors = [
+            event
+            for event in events
+            if event["type"] == "tool_error" and event["tool"] == "append_scratchpad" and "Per-tool step limit reached" in event["error"]
+        ]
+        self.assertEqual(per_tool_errors, [])
         self.assertIn({"type": "answer_delta", "text": "Final answer."}, events)
 
     def test_run_agent_stream_stops_after_api_error_without_duplicate_retry(self):

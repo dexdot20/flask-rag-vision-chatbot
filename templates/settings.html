@@ -94,12 +94,12 @@
             <div class="settings-page-section-card">
               <div class="settings-page-section-card__header">
                 <div>
-                  <span class="settings-section-kicker">Search execution</span>
-                  <h3>Web step budget</h3>
+                  <span class="settings-section-kicker">Tool execution</span>
+                  <h3>Tool step budget</h3>
                 </div>
-                <p>Limit how many search/tool rounds the assistant can spend on one request.</p>
+                <p>Limit how many tool rounds the assistant can spend on one request. This also sets the default per-tool retry budget for tools without a dedicated cap.</p>
               </div>
-              <label class="settings-label" for="max-steps-input">Web search step limit (1-10)</label>
+              <label class="settings-label" for="max-steps-input">Tool step limit (1-10)</label>
               <input type="number" class="settings-number" id="max-steps-input" min="1" max="10" value="5" />
             </div>
 

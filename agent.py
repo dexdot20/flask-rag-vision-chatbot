@@ -61,7 +61,6 @@ from config import (
     RAG_SEARCH_DEFAULT_TOP_K,
     RAG_TOOL_RESULT_MAX_TEXT_CHARS,
     RAG_TOOL_RESULT_SUMMARY_MAX_CHARS,
-    TOOL_STEP_LIMITS,
     client,
 )
 from db import append_to_scratchpad, read_image_asset_bytes, replace_scratchpad
@@ -2214,11 +2213,9 @@ def _build_working_state_instruction(working_state: dict) -> dict | None:
 
 
 def _get_tool_step_limit(tool_name: str, max_steps: int = 5) -> int:
-    normalized_name = str(tool_name or "").strip()
-    default = int(TOOL_STEP_LIMITS.get("default", max_steps))
-    value = TOOL_STEP_LIMITS.get(normalized_name, default)
+    del tool_name
     try:
-        limit = int(value)
+        limit = int(max_steps)
     except (TypeError, ValueError):
         limit = max_steps
     return max(1, limit)
