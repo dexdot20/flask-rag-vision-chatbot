@@ -1509,24 +1509,56 @@ const INPUT_BREAKDOWN_ORDER = [
   "tool_trace",
   "tool_memory",
   "rag_context",
+  "internal_state",
   "user_messages",
   "assistant_history",
+  "assistant_tool_calls",
   "tool_results",
-  "final_instruction",
+  "unknown_provider_overhead",
 ];
 
 const INPUT_BREAKDOWN_LABELS = {
   core_instructions: "Core instructions",
-  tool_specs: "Tool specs",
+  tool_specs: "Tool definitions",
   canvas: "Canvas",
   scratchpad: "Scratchpad",
   tool_trace: "Tool trace",
   tool_memory: "Tool memory",
   rag_context: "RAG context",
+  internal_state: "Agent working state",
   user_messages: "User messages",
   assistant_history: "Assistant history",
+  assistant_tool_calls: "Assistant tool calls",
   tool_results: "Tool results",
-  final_instruction: "Final instruction",
+  unknown_provider_overhead: "Unknown/Provider overhead",
+};
+
+const INPUT_BREAKDOWN_HELP_TEXT = {
+  tool_specs: "Prompt tool list plus API function schema sent with the request.",
+  internal_state: "Short internal working-memory instructions added during blocker handling or recovery.",
+  unknown_provider_overhead: "The remaining billed prompt tokens that could not be attributed confidently to a measured source.",
+};
+
+const BREAKDOWN_WARNING_RATIO = 0.03;
+
+const BREAKDOWN_REDUCTION_ORDER = [
+  "tool_specs",
+  "internal_state",
+  "assistant_tool_calls",
+  "tool_results",
+  "canvas",
+  "scratchpad",
+  "tool_trace",
+  "tool_memory",
+  "rag_context",
+  "assistant_history",
+  "user_messages",
+  "core_instructions",
+];
+
+const MODEL_CALL_TYPE_LABELS = {
+  agent_step: "Agent step",
+  final_answer: "Final answer",
 };
 
 const tokenTurns = [];
@@ -1542,10 +1574,80 @@ function toFiniteNumber(value, fallback = 0) {
   return Number.isFinite(Number(value)) ? Number(value) : fallback;
 }
 
-function normalizeBreakdown(rawBreakdown) {
+function toNonNegativeIntOrNull(value) {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+  const normalized = Number(value);
+  if (!Number.isFinite(normalized)) {
+    return null;
+  }
+  return Math.max(0, Math.round(normalized));
+}
+
+function alignBreakdownToTotal(breakdown, targetTotal) {
+  const normalized = createEmptyBreakdown();
+  INPUT_BREAKDOWN_ORDER.forEach((key) => {
+    normalized[key] = Math.max(0, Math.round(toFiniteNumber(breakdown[key], 0)));
+  });
+
+  const parsedTarget = toNonNegativeIntOrNull(targetTotal);
+  if (parsedTarget === null) {
+    return normalized;
+  }
+
+  let currentTotal = sumBreakdown(normalized);
+  if (currentTotal < parsedTarget) {
+    normalized.unknown_provider_overhead += parsedTarget - currentTotal;
+    return normalized;
+  }
+
+  let overflow = currentTotal - parsedTarget;
+  if (overflow <= 0) {
+    return normalized;
+  }
+
+  BREAKDOWN_REDUCTION_ORDER.forEach((key) => {
+    if (overflow <= 0) {
+      return;
+    }
+    const available = normalized[key] || 0;
+    if (available <= 0) {
+      return;
+    }
+    const reduction = Math.min(available, overflow);
+    normalized[key] -= reduction;
+    overflow -= reduction;
+  });
+
+  if (overflow > 0) {
+    INPUT_BREAKDOWN_ORDER
+      .slice()
+      .sort((left, right) => (normalized[right] || 0) - (normalized[left] || 0))
+      .forEach((key) => {
+        if (overflow <= 0) {
+          return;
+        }
+        const available = normalized[key] || 0;
+        if (available <= 0) {
+          return;
+        }
+        const reduction = Math.min(available, overflow);
+        normalized[key] -= reduction;
+        overflow -= reduction;
+      });
+  }
+
+  return normalized;
+}
+
+function normalizeBreakdown(rawBreakdown, targetTotal = null) {
   const normalized = createEmptyBreakdown();
   const source = rawBreakdown && typeof rawBreakdown === "object" ? rawBreakdown : {};
-  const legacyCoreInstructions = source.core_instructions ?? source.system_prompt;
+  const legacyCoreInstructions =
+    toFiniteNumber(source.core_instructions, 0) +
+    toFiniteNumber(source.system_prompt, 0) +
+    toFiniteNumber(source.final_instruction, 0);
   INPUT_BREAKDOWN_ORDER.forEach((key) => {
     if (key === "core_instructions") {
       normalized[key] = Math.max(0, Math.round(toFiniteNumber(legacyCoreInstructions, 0)));
@@ -1553,27 +1655,60 @@ function normalizeBreakdown(rawBreakdown) {
     }
     normalized[key] = Math.max(0, Math.round(toFiniteNumber(source[key], 0)));
   });
-  return normalized;
+  return alignBreakdownToTotal(normalized, targetTotal);
 }
 
 function sumBreakdown(breakdown) {
   return INPUT_BREAKDOWN_ORDER.reduce((sum, key) => sum + toFiniteNumber(breakdown[key], 0), 0);
 }
 
-function normalizeUsagePayload(usage) {
-  const source = usage && typeof usage === "object" ? usage : {};
-  const inputBreakdown = normalizeBreakdown(source.input_breakdown);
-  const estimatedInputTokens = Math.max(
-    sumBreakdown(inputBreakdown),
-    Math.round(toFiniteNumber(source.estimated_input_tokens, 0)),
-  );
+function normalizeModelCallPayload(callEntry) {
+  const source = callEntry && typeof callEntry === "object" ? callEntry : {};
+  const promptTokens = toNonNegativeIntOrNull(source.prompt_tokens);
+  const completionTokens = toNonNegativeIntOrNull(source.completion_tokens);
+  const totalTokens = toNonNegativeIntOrNull(source.total_tokens);
+  const estimatedTarget = promptTokens ?? toNonNegativeIntOrNull(source.estimated_input_tokens);
+  const inputBreakdown = normalizeBreakdown(source.input_breakdown, estimatedTarget);
 
   return {
-    prompt_tokens: Math.max(0, Math.round(toFiniteNumber(source.prompt_tokens, 0))),
+    index: toNonNegativeIntOrNull(source.index),
+    step: toNonNegativeIntOrNull(source.step),
+    call_type: String(source.call_type || "agent_step") || "agent_step",
+    is_retry: source.is_retry === true,
+    retry_reason: String(source.retry_reason || "").trim(),
+    message_count: toNonNegativeIntOrNull(source.message_count),
+    tool_schema_tokens: toNonNegativeIntOrNull(source.tool_schema_tokens),
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    total_tokens: totalTokens,
+    estimated_input_tokens: estimatedTarget ?? sumBreakdown(inputBreakdown),
+    input_breakdown: inputBreakdown,
+    missing_provider_usage: source.missing_provider_usage === true,
+  };
+}
+
+function normalizeUsagePayload(usage) {
+  const source = usage && typeof usage === "object" ? usage : {};
+  const promptTokens = Math.max(0, Math.round(toFiniteNumber(source.prompt_tokens, 0)));
+  const estimatedSourceTokens = Math.max(0, Math.round(toFiniteNumber(source.estimated_input_tokens, 0)));
+  const inputBreakdown = normalizeBreakdown(source.input_breakdown, promptTokens || estimatedSourceTokens || null);
+  const modelCalls = Array.isArray(source.model_calls)
+    ? source.model_calls.map(normalizeModelCallPayload)
+    : [];
+  const modelCallCount = Math.max(
+    modelCalls.length,
+    Math.round(toFiniteNumber(source.model_call_count, 0)),
+  );
+  const estimatedInputTokens = promptTokens || sumBreakdown(inputBreakdown) || estimatedSourceTokens;
+
+  return {
+    prompt_tokens: promptTokens,
     completion_tokens: Math.max(0, Math.round(toFiniteNumber(source.completion_tokens, 0))),
     total_tokens: Math.max(0, Math.round(toFiniteNumber(source.total_tokens, 0))),
     estimated_input_tokens: estimatedInputTokens,
     input_breakdown: inputBreakdown,
+    model_call_count: modelCallCount,
+    model_calls: modelCalls,
     cost: Math.max(0, toFiniteNumber(source.cost, 0)),
     currency: String(source.currency || "USD") || "USD",
     model: String(source.model || "—") || "—",
@@ -1590,7 +1725,28 @@ function aggregateBreakdown(turns) {
   return aggregate;
 }
 
-function renderBreakdownList(containerId, breakdown) {
+function getBreakdownWarningRatio(breakdown, totalTokens) {
+  const total = Math.max(0, Math.round(toFiniteNumber(totalTokens, 0)));
+  if (!total) {
+    return 0;
+  }
+  return toFiniteNumber(breakdown.unknown_provider_overhead, 0) / total;
+}
+
+function renderBreakdownWarning(breakdown, totalTokens) {
+  const ratio = getBreakdownWarningRatio(breakdown, totalTokens);
+  if (ratio < BREAKDOWN_WARNING_RATIO) {
+    return "";
+  }
+
+  return (
+    `<div class="breakdown-warning">` +
+      `Unknown/Provider overhead is ${Math.round(ratio * 1000) / 10}% of the billed prompt total.` +
+    `</div>`
+  );
+}
+
+function renderBreakdownList(containerId, breakdown, options = {}) {
   const container = document.getElementById(containerId);
   if (!container) {
     return;
@@ -1604,11 +1760,26 @@ function renderBreakdownList(containerId, breakdown) {
 
   container.innerHTML = entries
     .map(
-      (key) =>
+      (key) => {
+        const helpText = INPUT_BREAKDOWN_HELP_TEXT[key];
+        const labelAttrs = helpText ? ` title="${escHtml(helpText)}"` : "";
+        return (
         `<div class="breakdown-row">` +
-          `<span class="breakdown-label">${escHtml(INPUT_BREAKDOWN_LABELS[key] || key)}</span>` +
+          `<span class="breakdown-label"${labelAttrs}>${escHtml(INPUT_BREAKDOWN_LABELS[key] || key)}</span>` +
           `<span class="breakdown-value">${fmt(breakdown[key])}</span>` +
-        `</div>`,
+        `</div>`
+        );
+      },
+    )
+    .join("") + renderBreakdownWarning(breakdown, options.totalTokens);
+}
+
+function renderBreakdownChips(breakdown, className = "turn-breakdown-chip") {
+  const entries = INPUT_BREAKDOWN_ORDER.filter((key) => toFiniteNumber(breakdown[key], 0) > 0);
+  return entries
+    .map(
+      (key) =>
+        `<span class="${className}">${escHtml(INPUT_BREAKDOWN_LABELS[key] || key)}: ${fmt(breakdown[key])}</span>`,
     )
     .join("");
 }
@@ -1621,13 +1792,81 @@ function renderTurnBreakdownInline(breakdown) {
 
   return (
     `<div class="turn-breakdown">` +
-      entries
-        .map(
-          (key) =>
-            `<span class="turn-breakdown-chip">${escHtml(INPUT_BREAKDOWN_LABELS[key] || key)}: ${fmt(breakdown[key])}</span>`,
-        )
-        .join("") +
+      renderBreakdownChips(breakdown) +
     `</div>`
+  );
+}
+
+function renderUnknownWarningBadge(breakdown, totalTokens) {
+  const ratio = getBreakdownWarningRatio(breakdown, totalTokens);
+  if (ratio < BREAKDOWN_WARNING_RATIO) {
+    return "";
+  }
+  return `<span class="turn-warning-badge">Unknown ${Math.round(ratio * 1000) / 10}%</span>`;
+}
+
+function renderModelCallItem(call) {
+  const callTypeLabel = MODEL_CALL_TYPE_LABELS[call.call_type] || "Model call";
+  const stepLabel = call.step ? ` · step ${call.step}` : "";
+  const retryReason = call.retry_reason ? ` · ${call.retry_reason.replaceAll("_", " ")}` : "";
+  const promptStat = call.prompt_tokens !== null
+    ? `<span class="turn-call-stat">${fmt(call.prompt_tokens)} prompt</span>`
+    : `<span class="turn-call-stat">${fmt(call.estimated_input_tokens)} estimated prompt</span>`;
+  const completionStat = call.completion_tokens !== null
+    ? `<span class="turn-call-stat">${fmt(call.completion_tokens)} completion</span>`
+    : "";
+  const messageCountStat = call.message_count !== null
+    ? `<span class="turn-call-stat">${fmt(call.message_count)} messages</span>`
+    : "";
+  const schemaStat = call.tool_schema_tokens !== null && call.tool_schema_tokens > 0
+    ? `<span class="turn-call-stat">${fmt(call.tool_schema_tokens)} tool schema</span>`
+    : "";
+  const missingBadge = call.missing_provider_usage
+    ? `<span class="turn-call-badge">Missing provider usage</span>`
+    : "";
+
+  return (
+    `<div class="turn-call-item">` +
+      `<div class="turn-call-title-row">` +
+        `<span class="turn-call-title">Call ${fmt(call.index || 0)} · ${escHtml(callTypeLabel)}${escHtml(stepLabel)}${escHtml(retryReason)}</span>` +
+        missingBadge +
+      `</div>` +
+      `<div class="turn-call-meta">` +
+        promptStat + completionStat + messageCountStat + schemaStat +
+      `</div>` +
+      `<div class="turn-call-breakdown">${renderBreakdownChips(call.input_breakdown, "turn-call-breakdown-chip")}</div>` +
+    `</div>`
+  );
+}
+
+function renderModelCallSection(title, calls) {
+  if (!calls.length) {
+    return "";
+  }
+  return (
+    `<div class="turn-call-section">` +
+      `<div class="turn-call-section-title">${escHtml(title)}</div>` +
+      `<div class="turn-call-list">${calls.map(renderModelCallItem).join("")}</div>` +
+    `</div>`
+  );
+}
+
+function renderModelCallDrawer(turn) {
+  const calls = Array.isArray(turn.model_calls) ? turn.model_calls : [];
+  if (!calls.length) {
+    return "";
+  }
+
+  const primaryCalls = calls.filter((call) => !call.is_retry);
+  const retryCalls = calls.filter((call) => call.is_retry);
+  return (
+    `<details class="turn-call-drawer">` +
+      `<summary class="turn-call-summary">View ${fmt(calls.length)} model calls</summary>` +
+      `<div class="turn-call-sections">` +
+        renderModelCallSection("Primary calls", primaryCalls) +
+        renderModelCallSection("Retry and recovery calls", retryCalls) +
+      `</div>` +
+    `</details>`
   );
 }
 
@@ -1653,8 +1892,10 @@ function renderTokenStats() {
     : "—";
   tokensBadge.textContent = fmt(grandTotal);
 
-  renderBreakdownList("session-breakdown-list", sessionBreakdown);
-  renderBreakdownList("latest-breakdown-list", lastTurn ? lastTurn.input_breakdown : createEmptyBreakdown());
+  renderBreakdownList("session-breakdown-list", sessionBreakdown, { totalTokens: totalUser });
+  renderBreakdownList("latest-breakdown-list", lastTurn ? lastTurn.input_breakdown : createEmptyBreakdown(), {
+    totalTokens: lastTurn ? lastTurn.prompt_tokens : 0,
+  });
 
   const list = document.getElementById("turns-list");
   if (!tokenTurns.length) {
@@ -1664,9 +1905,18 @@ function renderTokenStats() {
 
   list.innerHTML = tokenTurns
     .map(
-      (turn, index) =>
+      (turn, index) => {
+        const callCount = Math.max(turn.model_call_count || 0, Array.isArray(turn.model_calls) ? turn.model_calls.length : 0);
+        return (
         `<div class="turn-item">` +
-          `<div class="turn-header"><span class="turn-label">Assistant turn ${index + 1}</span> <span class="turn-model">${escHtml(turn.model || "—")}</span></div>` +
+          `<div class="turn-header">` +
+            `<span class="turn-label">Assistant turn ${index + 1}</span>` +
+            `<div class="turn-header-meta">` +
+              (callCount ? `<span class="turn-call-count">${fmt(callCount)} calls</span>` : "") +
+              renderUnknownWarningBadge(turn.input_breakdown, turn.prompt_tokens) +
+              `<span class="turn-model">${escHtml(turn.model || "—")}</span>` +
+            `</div>` +
+          `</div>` +
           `<div class="turn-details">` +
             `<span class="turn-stat"><span class="stats-dot dot-user"></span>${fmt(turn.prompt_tokens)} in</span>` +
             `<span class="turn-stat"><span class="stats-dot dot-asst"></span>${fmt(turn.completion_tokens)} out</span>` +
@@ -1674,7 +1924,10 @@ function renderTokenStats() {
             (turn.cost ? `<span class="turn-stat cost-stat">$${turn.cost.toFixed(6)}</span>` : "") +
           `</div>` +
           renderTurnBreakdownInline(turn.input_breakdown) +
-        `</div>`,
+          renderModelCallDrawer(turn) +
+        `</div>`
+        );
+      },
     )
     .join("");
 }

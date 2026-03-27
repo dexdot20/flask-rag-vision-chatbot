@@ -2137,6 +2137,25 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(usage["input_breakdown"]["core_instructions"], 4)
         self.assertNotIn("system_prompt", usage["input_breakdown"])
 
+    def test_extract_message_usage_adds_unknown_overhead_to_match_prompt_tokens(self):
+        usage = extract_message_usage(
+            {
+                "usage": {
+                    "prompt_tokens": 12,
+                    "estimated_input_tokens": 6,
+                    "input_breakdown": {
+                        "system_prompt": 4,
+                        "user_messages": 2,
+                    },
+                }
+            }
+        )
+
+        self.assertEqual(usage["estimated_input_tokens"], 12)
+        self.assertEqual(usage["input_breakdown"]["core_instructions"], 4)
+        self.assertEqual(usage["input_breakdown"]["user_messages"], 2)
+        self.assertEqual(usage["input_breakdown"]["unknown_provider_overhead"], 6)
+
     def test_frontend_restores_persistent_tool_trace_panel(self):
         script_path = Path(__file__).resolve().parent.parent / "static" / "app.js"
         script_text = script_path.read_text(encoding="utf-8")
@@ -2522,9 +2541,9 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(assistant_metadata["reasoning_content"], "Analyzing request")
         self.assertEqual(assistant_metadata["tool_trace"][0]["tool_name"], "search_web")
         self.assertEqual(assistant_metadata["tool_trace"][0]["state"], "done")
-        self.assertEqual(assistant_metadata["usage"]["estimated_input_tokens"], 14)
+        self.assertEqual(assistant_metadata["usage"]["estimated_input_tokens"], 11)
         self.assertEqual(assistant_metadata["usage"]["input_breakdown"]["user_messages"], 6)
-        self.assertEqual(assistant_metadata["usage"]["input_breakdown"]["core_instructions"], 4)
+        self.assertEqual(assistant_metadata["usage"]["input_breakdown"]["core_instructions"], 5)
         self.assertEqual(rows[1]["prompt_tokens"], 11)
         self.assertEqual(rows[1]["completion_tokens"], 7)
         self.assertEqual(rows[1]["total_tokens"], 18)
@@ -2532,8 +2551,8 @@ class AppRoutesTestCase(unittest.TestCase):
         conversation_response = self.client.get(f"/api/conversations/{conversation_id}")
         self.assertEqual(conversation_response.status_code, 200)
         assistant_message = conversation_response.get_json()["messages"][1]
-        self.assertEqual(assistant_message["usage"]["estimated_input_tokens"], 14)
-        self.assertEqual(assistant_message["usage"]["input_breakdown"]["core_instructions"], 4)
+        self.assertEqual(assistant_message["usage"]["estimated_input_tokens"], 11)
+        self.assertEqual(assistant_message["usage"]["input_breakdown"]["core_instructions"], 5)
         self.assertEqual(assistant_message["metadata"]["tool_trace"][0]["tool_name"], "search_web")
 
     def test_failed_tool_summary_detection_marks_fetch_failures(self):
@@ -3538,6 +3557,17 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertGreater(usage_event["input_breakdown"]["user_messages"], 0)
         self.assertGreater(usage_event["input_breakdown"]["tool_results"], 0)
         self.assertEqual(usage_event["input_breakdown"]["assistant_history"], 0)
+        self.assertEqual(usage_event["model_call_count"], 2)
+        self.assertEqual(len(usage_event["model_calls"]), 2)
+        self.assertEqual(usage_event["model_calls"][0]["call_type"], "agent_step")
+        self.assertEqual(usage_event["model_calls"][0]["step"], 1)
+        self.assertFalse(usage_event["model_calls"][0]["missing_provider_usage"])
+        self.assertEqual(usage_event["model_calls"][1]["call_type"], "agent_step")
+        self.assertEqual(usage_event["model_calls"][1]["prompt_tokens"], 3)
+        self.assertEqual(
+            usage_event["model_calls"][1]["estimated_input_tokens"],
+            usage_event["model_calls"][1]["prompt_tokens"],
+        )
 
         second_call_messages = mocked_create.call_args_list[1].kwargs["messages"]
         self.assertEqual([message["role"] for message in second_call_messages], ["user", "assistant", "tool"])
@@ -3620,6 +3650,11 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn({"type": "answer_delta", "text": "Final answer."}, events)
         leaked_reasoning = [event for event in events if event["type"] == "answer_delta" and "Thinking" in event["text"]]
         self.assertEqual(leaked_reasoning, [])
+
+        usage_event = next(event for event in events if event["type"] == "usage")
+        self.assertEqual(usage_event["model_call_count"], 2)
+        self.assertTrue(usage_event["model_calls"][1]["is_retry"])
+        self.assertEqual(usage_event["model_calls"][1]["retry_reason"], "missing_final_answer")
 
         second_call_messages = mocked_create.call_args_list[1].kwargs["messages"]
         retry_content = second_call_messages[-1]["content"]

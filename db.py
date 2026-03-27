@@ -55,13 +55,15 @@ MESSAGE_USAGE_BREAKDOWN_KEYS = (
     "tool_trace",
     "tool_memory",
     "rag_context",
+    "internal_state",
     "user_messages",
     "assistant_history",
+    "assistant_tool_calls",
     "tool_results",
-    "final_instruction",
+    "unknown_provider_overhead",
 )
 LEGACY_MESSAGE_USAGE_BREAKDOWN_KEYS = {
-    "core_instructions": ("system_prompt",),
+    "core_instructions": ("system_prompt", "final_instruction"),
 }
 MESSAGE_TOOL_TRACE_STATES = {"running", "done", "error"}
 VISIBLE_CHAT_ROLES = {"user", "assistant", "summary"}
@@ -838,6 +840,135 @@ def _coerce_non_negative_int(value) -> int | None:
     return max(0, normalized)
 
 
+def _normalize_usage_breakdown(breakdown: dict | None, target_total: int | None = None) -> dict | None:
+    if not isinstance(breakdown, dict):
+        return None
+
+    normalized_breakdown = {}
+    for key in MESSAGE_USAGE_BREAKDOWN_KEYS:
+        if key == "core_instructions":
+            has_core_source = "core_instructions" in breakdown or any(
+                legacy_key in breakdown for legacy_key in LEGACY_MESSAGE_USAGE_BREAKDOWN_KEYS.get(key, ())
+            )
+            if not has_core_source:
+                normalized = None
+            else:
+                raw_total = breakdown.get("core_instructions")
+                normalized = _coerce_non_negative_int(raw_total) or 0
+                for legacy_key in LEGACY_MESSAGE_USAGE_BREAKDOWN_KEYS.get(key, ()):
+                    normalized += _coerce_non_negative_int(breakdown.get(legacy_key)) or 0
+        else:
+            raw_value = breakdown.get(key)
+            if raw_value is None:
+                for legacy_key in LEGACY_MESSAGE_USAGE_BREAKDOWN_KEYS.get(key, ()): 
+                    if legacy_key in breakdown:
+                        raw_value = breakdown.get(legacy_key)
+                        break
+            normalized = _coerce_non_negative_int(raw_value)
+        if normalized is not None:
+            normalized_breakdown[key] = normalized
+
+    if not normalized_breakdown:
+        return None
+
+    if target_total is None:
+        return normalized_breakdown
+
+    adjusted = {key: max(0, int(value)) for key, value in normalized_breakdown.items() if value and value > 0}
+    current_total = sum(adjusted.values())
+    if current_total < target_total:
+        adjusted["unknown_provider_overhead"] = adjusted.get("unknown_provider_overhead", 0) + (target_total - current_total)
+        return adjusted
+
+    overflow = current_total - target_total
+    if overflow <= 0:
+        return adjusted
+
+    reduction_order = (
+        "tool_specs",
+        "internal_state",
+        "assistant_tool_calls",
+        "tool_results",
+        "canvas",
+        "scratchpad",
+        "tool_trace",
+        "tool_memory",
+        "rag_context",
+        "assistant_history",
+        "user_messages",
+        "core_instructions",
+    )
+    for key in reduction_order:
+        if overflow <= 0:
+            break
+        available = adjusted.get(key, 0)
+        if available <= 0:
+            continue
+        reduction = min(available, overflow)
+        adjusted[key] = available - reduction
+        overflow -= reduction
+
+    if overflow > 0:
+        for key, available in sorted(adjusted.items(), key=lambda item: item[1], reverse=True):
+            if overflow <= 0:
+                break
+            if available <= 0:
+                continue
+            reduction = min(available, overflow)
+            adjusted[key] = available - reduction
+            overflow -= reduction
+
+    return {key: value for key, value in adjusted.items() if value > 0}
+
+
+def _normalize_message_usage_call(value: dict | None) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+
+    cleaned = {}
+    for key in (
+        "index",
+        "step",
+        "message_count",
+        "tool_schema_tokens",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "estimated_input_tokens",
+    ):
+        normalized = _coerce_non_negative_int(value.get(key))
+        if normalized is not None:
+            cleaned[key] = normalized
+
+    call_type = str(value.get("call_type") or "").strip()[:40]
+    if call_type:
+        cleaned["call_type"] = call_type
+
+    retry_reason = str(value.get("retry_reason") or "").strip()[:80]
+    if retry_reason:
+        cleaned["retry_reason"] = retry_reason
+
+    if value.get("is_retry") is True:
+        cleaned["is_retry"] = True
+    if value.get("missing_provider_usage") is True:
+        cleaned["missing_provider_usage"] = True
+
+    target_total = cleaned.get("prompt_tokens")
+    normalized_breakdown = _normalize_usage_breakdown(
+        value.get("input_breakdown"),
+        target_total=target_total or cleaned.get("estimated_input_tokens"),
+    )
+    if normalized_breakdown:
+        cleaned["input_breakdown"] = normalized_breakdown
+
+    if target_total is not None:
+        cleaned["estimated_input_tokens"] = target_total
+    elif normalized_breakdown:
+        cleaned["estimated_input_tokens"] = sum(normalized_breakdown.values())
+
+    return cleaned or None
+
+
 def _normalize_message_usage(value: dict | None) -> dict | None:
     if not isinstance(value, dict):
         return None
@@ -848,21 +979,29 @@ def _normalize_message_usage(value: dict | None) -> dict | None:
         if normalized is not None:
             cleaned[key] = normalized
 
-    breakdown = value.get("input_breakdown")
-    if isinstance(breakdown, dict):
-        normalized_breakdown = {}
-        for key in MESSAGE_USAGE_BREAKDOWN_KEYS:
-            raw_value = breakdown.get(key)
-            if raw_value is None:
-                for legacy_key in LEGACY_MESSAGE_USAGE_BREAKDOWN_KEYS.get(key, ()):
-                    if legacy_key in breakdown:
-                        raw_value = breakdown.get(legacy_key)
-                        break
-            normalized = _coerce_non_negative_int(raw_value)
-            if normalized is not None:
-                normalized_breakdown[key] = normalized
-        if normalized_breakdown:
-            cleaned["input_breakdown"] = normalized_breakdown
+    normalized_breakdown = _normalize_usage_breakdown(
+        value.get("input_breakdown"),
+        target_total=cleaned.get("prompt_tokens") or cleaned.get("estimated_input_tokens"),
+    )
+    if normalized_breakdown:
+        cleaned["input_breakdown"] = normalized_breakdown
+
+    model_calls = []
+    raw_model_calls = value.get("model_calls") if isinstance(value.get("model_calls"), list) else []
+    for entry in raw_model_calls[:32]:
+        normalized_call = _normalize_message_usage_call(entry)
+        if normalized_call:
+            model_calls.append(normalized_call)
+    if model_calls:
+        cleaned["model_calls"] = model_calls
+
+    model_call_count = _coerce_non_negative_int(value.get("model_call_count"))
+    if model_call_count is None and model_calls:
+        model_call_count = len(model_calls)
+    elif model_call_count is not None and model_calls:
+        model_call_count = max(model_call_count, len(model_calls))
+    if model_call_count is not None:
+        cleaned["model_call_count"] = model_call_count
 
     cost = value.get("cost")
     if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost >= 0:
@@ -875,6 +1014,11 @@ def _normalize_message_usage(value: dict | None) -> dict | None:
     model = str(value.get("model") or "").strip()[:80]
     if model:
         cleaned["model"] = model
+
+    if cleaned.get("prompt_tokens") is not None:
+        cleaned["estimated_input_tokens"] = cleaned["prompt_tokens"]
+    elif normalized_breakdown:
+        cleaned["estimated_input_tokens"] = sum(normalized_breakdown.values())
 
     return cleaned or None
 
@@ -1002,6 +1146,18 @@ def extract_message_usage(
         usage["completion_tokens"] = fallback_completion
     if fallback_total is not None and "total_tokens" not in usage:
         usage["total_tokens"] = fallback_total
+
+    target_total = usage.get("prompt_tokens")
+    normalized_breakdown = _normalize_usage_breakdown(
+        usage.get("input_breakdown"),
+        target_total=target_total or usage.get("estimated_input_tokens"),
+    )
+    if normalized_breakdown:
+        usage["input_breakdown"] = normalized_breakdown
+    if target_total is not None:
+        usage["estimated_input_tokens"] = target_total
+    elif normalized_breakdown:
+        usage["estimated_input_tokens"] = sum(normalized_breakdown.values())
 
     return usage or None
 

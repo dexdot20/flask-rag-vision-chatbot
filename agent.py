@@ -129,10 +129,12 @@ INPUT_BREAKDOWN_KEYS = (
     "tool_trace",
     "tool_memory",
     "rag_context",
+    "internal_state",
     "user_messages",
     "assistant_history",
+    "assistant_tool_calls",
     "tool_results",
-    "final_instruction",
+    "unknown_provider_overhead",
 )
 SYSTEM_BREAKDOWN_SECTION_KEY_BY_HEADING = {
     "## Scratchpad (AI Persistent Memory)": "scratchpad",
@@ -146,13 +148,18 @@ SYSTEM_BREAKDOWN_SECTION_KEY_BY_HEADING = {
     "## Available Tools": "tool_specs",
 }
 SYSTEM_BREAKDOWN_REDUCTION_ORDER = (
-    "core_instructions",
     "tool_specs",
+    "internal_state",
     "canvas",
     "scratchpad",
     "tool_trace",
     "tool_memory",
     "rag_context",
+    "assistant_tool_calls",
+    "tool_results",
+    "assistant_history",
+    "user_messages",
+    "core_instructions",
 )
 _AGENT_TRACE_LOGGER = None
 
@@ -192,6 +199,16 @@ def _estimate_text_tokens(text: str) -> int:
     return estimate_text_tokens(text)
 
 
+def _estimate_serialized_tokens(value) -> int:
+    if value in (None, "", [], {}):
+        return 0
+    try:
+        serialized = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        serialized = str(value)
+    return _estimate_text_tokens(serialized)
+
+
 def _rebalance_breakdown_to_total(breakdown: dict[str, int], total_tokens: int) -> dict[str, int]:
     adjusted = {key: max(0, int(value)) for key, value in breakdown.items() if value and value > 0}
     current_total = sum(adjusted.values())
@@ -200,6 +217,41 @@ def _rebalance_breakdown_to_total(breakdown: dict[str, int], total_tokens: int) 
         return adjusted
 
     overflow = current_total - total_tokens
+    if overflow <= 0:
+        return adjusted
+
+    for key in SYSTEM_BREAKDOWN_REDUCTION_ORDER:
+        if overflow <= 0:
+            break
+        available = adjusted.get(key, 0)
+        if available <= 0:
+            continue
+        reduction = min(available, overflow)
+        adjusted[key] = available - reduction
+        overflow -= reduction
+
+    if overflow > 0:
+        for key, available in sorted(adjusted.items(), key=lambda item: item[1], reverse=True):
+            if overflow <= 0:
+                break
+            if available <= 0:
+                continue
+            reduction = min(available, overflow)
+            adjusted[key] = available - reduction
+            overflow -= reduction
+
+    return {key: value for key, value in adjusted.items() if value > 0}
+
+
+def _align_breakdown_to_provider_total(breakdown: dict[str, int], total_tokens: int) -> dict[str, int]:
+    adjusted = {key: max(0, int(value)) for key, value in breakdown.items() if key in INPUT_BREAKDOWN_KEYS and value and value > 0}
+    target_total = max(0, int(total_tokens or 0))
+    current_total = sum(adjusted.values())
+    if current_total < target_total:
+        adjusted["unknown_provider_overhead"] = adjusted.get("unknown_provider_overhead", 0) + (target_total - current_total)
+        return adjusted
+
+    overflow = current_total - target_total
     if overflow <= 0:
         return adjusted
 
@@ -257,37 +309,65 @@ def _estimate_message_breakdown(message: dict) -> dict[str, int]:
     role = str(message.get("role") or "").strip()
     content = str(message.get("content") or "")
     total_tokens = _estimate_text_tokens(content)
-    if total_tokens <= 0:
+    if total_tokens <= 0 and role != "assistant":
         return {}
 
     if role == "user":
         return {"user_messages": total_tokens}
     if role == "assistant":
-        return {"assistant_history": total_tokens}
+        breakdown = {}
+        if total_tokens > 0:
+            breakdown["assistant_history"] = total_tokens
+        tool_calls = message.get("tool_calls") if isinstance(message.get("tool_calls"), list) else []
+        tool_call_tokens = _estimate_serialized_tokens(tool_calls)
+        if tool_call_tokens > 0:
+            breakdown["assistant_tool_calls"] = tool_call_tokens
+        return breakdown
     if role == "tool":
-        return {"tool_results": total_tokens}
+        tool_call_id = str(message.get("tool_call_id") or "").strip()
+        payload_tokens = total_tokens
+        if tool_call_id:
+            payload_tokens += _estimate_serialized_tokens({"tool_call_id": tool_call_id})
+        return {"tool_results": payload_tokens} if payload_tokens > 0 else {}
     if role != "system":
         return {"core_instructions": total_tokens}
 
     # Classify system messages by their distinctive markers
     if content.startswith(TOOL_EXECUTION_RESULTS_MARKER):
         return {"tool_results": total_tokens}
+    if content.startswith("[AGENT WORKING MEMORY]"):
+        return {"internal_state": total_tokens}
     if content.startswith("[INSTRUCTION: FINAL ANSWER REQUIRED]"):
-        return {"final_instruction": total_tokens}
+        return {"core_instructions": total_tokens}
     if content.startswith("[INSTRUCTION: MISSING FINAL ANSWER"):
-        return {"final_instruction": total_tokens}
+        return {"core_instructions": total_tokens}
 
     breakdown = _estimate_system_message_breakdown(content, total_tokens)
     return breakdown or {"core_instructions": total_tokens}
 
 
-def _estimate_input_breakdown(messages_to_send: list[dict]) -> tuple[dict[str, int], int]:
+def _estimate_input_breakdown(
+    messages_to_send: list[dict],
+    *,
+    provider_prompt_tokens: int | None = None,
+    request_tools: list[dict] | None = None,
+) -> tuple[dict[str, int], int, int]:
     breakdown = _empty_input_breakdown()
     for message in messages_to_send:
         for key, value in _estimate_message_breakdown(message).items():
             if key in breakdown and value > 0:
                 breakdown[key] += value
-    return breakdown, sum(breakdown.values())
+
+    tool_schema_tokens = _estimate_serialized_tokens(request_tools)
+    if tool_schema_tokens > 0:
+        breakdown["tool_specs"] += tool_schema_tokens
+
+    measured_total = sum(breakdown.values())
+    if provider_prompt_tokens is None:
+        return breakdown, measured_total, tool_schema_tokens
+
+    aligned_breakdown = _align_breakdown_to_provider_total(breakdown, provider_prompt_tokens)
+    return aligned_breakdown, max(0, int(provider_prompt_tokens or 0)), tool_schema_tokens
 
 
 def _estimate_messages_tokens(messages_to_send: list[dict]) -> int:
@@ -2255,6 +2335,8 @@ def run_agent_stream(
         "total_tokens": 0,
         "estimated_input_tokens": 0,
         "input_breakdown": _empty_input_breakdown(),
+        "model_call_count": 0,
+        "model_calls": [],
     }
     runtime_state = {
         "canvas": create_canvas_runtime_state(
@@ -2300,10 +2382,21 @@ def run_agent_stream(
 
     def add_usage(usage):
         if not usage:
-            return
-        usage_totals["prompt_tokens"] += usage.prompt_tokens or 0
-        usage_totals["completion_tokens"] += usage.completion_tokens or 0
-        usage_totals["total_tokens"] += usage.total_tokens or 0
+            return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "received": False}
+
+        prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+        completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+        total_tokens = int(getattr(usage, "total_tokens", 0) or 0)
+
+        usage_totals["prompt_tokens"] += prompt_tokens
+        usage_totals["completion_tokens"] += completion_tokens
+        usage_totals["total_tokens"] += total_tokens
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "received": any(value > 0 for value in (prompt_tokens, completion_tokens, total_tokens)),
+        }
 
     def calculate_cost(prompt_tokens, completion_tokens):
         input_cost = (prompt_tokens / 1_000_000) * pricing["input"]
@@ -2360,6 +2453,8 @@ def run_agent_stream(
             "total_tokens": usage_totals["total_tokens"],
             "estimated_input_tokens": usage_totals["estimated_input_tokens"],
             "input_breakdown": dict(usage_totals["input_breakdown"]),
+            "model_call_count": usage_totals["model_call_count"],
+            "model_calls": list(usage_totals["model_calls"]),
             "cost": total_cost,
             "currency": "USD",
             "model": model,
@@ -2398,9 +2493,16 @@ def run_agent_stream(
             answer_started = True
         yield {"type": "answer_delta", "text": answer_text}
 
-    def stream_model_turn(messages_to_send: list[dict], allow_tools: bool = True) -> dict:
+    def stream_model_turn(
+        messages_to_send: list[dict],
+        allow_tools: bool = True,
+        *,
+        call_type: str = "agent_step",
+        retry_reason: str | None = None,
+    ) -> dict:
         turn_reasoning_emitted = False
         turn_tools = []
+        provider_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "received": False}
         _trace_agent_event(
             "model_turn_started",
             trace_id=trace_id,
@@ -2433,13 +2535,41 @@ def run_agent_stream(
                 request_kwargs["tools"] = turn_tools
                 request_kwargs["tool_choice"] = "auto"
         response = client.chat.completions.create(**request_kwargs)
-        estimated_breakdown, estimated_input_tokens = _estimate_input_breakdown(messages_to_send)
-        usage_totals["estimated_input_tokens"] += estimated_input_tokens
-        for key, value in estimated_breakdown.items():
-            usage_totals["input_breakdown"][key] += value
+
+        def finalize_call_usage() -> tuple[dict[str, int], int, int]:
+            nonlocal provider_usage
+            estimated_breakdown, estimated_input_tokens, tool_schema_tokens = _estimate_input_breakdown(
+                messages_to_send,
+                provider_prompt_tokens=provider_usage["prompt_tokens"] if provider_usage["received"] else None,
+                request_tools=turn_tools,
+            )
+            usage_totals["model_call_count"] += 1
+            usage_totals["model_calls"].append(
+                {
+                    "index": usage_totals["model_call_count"],
+                    "call_type": call_type,
+                    "step": step,
+                    "is_retry": bool(retry_reason),
+                    "retry_reason": str(retry_reason or "").strip() or None,
+                    "message_count": len(messages_to_send),
+                    "tool_schema_tokens": tool_schema_tokens,
+                    "prompt_tokens": provider_usage["prompt_tokens"] if provider_usage["received"] else None,
+                    "completion_tokens": provider_usage["completion_tokens"] if provider_usage["received"] else None,
+                    "total_tokens": provider_usage["total_tokens"] if provider_usage["received"] else None,
+                    "estimated_input_tokens": estimated_input_tokens,
+                    "input_breakdown": dict(estimated_breakdown),
+                    "missing_provider_usage": not provider_usage["received"],
+                }
+            )
+            if provider_usage["received"]:
+                usage_totals["estimated_input_tokens"] += estimated_input_tokens
+                for key, value in estimated_breakdown.items():
+                    usage_totals["input_breakdown"][key] += value
+            return estimated_breakdown, estimated_input_tokens, tool_schema_tokens
 
         if getattr(response, "choices", None):
-            add_usage(getattr(response, "usage", None))
+            provider_usage = add_usage(getattr(response, "usage", None))
+            finalize_call_usage()
             message = response.choices[0].message
             reasoning_text, content_text = _extract_reasoning_and_content(message)
             tool_calls, tool_call_error = _extract_native_tool_calls(message)
@@ -2518,7 +2648,11 @@ def run_agent_stream(
                         for event in emit_answer(content_delta):
                             yield event
                 if getattr(chunk, "usage", None):
-                    add_usage(chunk.usage)
+                    usage_snapshot = add_usage(chunk.usage)
+                    provider_usage["prompt_tokens"] += usage_snapshot["prompt_tokens"]
+                    provider_usage["completion_tokens"] += usage_snapshot["completion_tokens"]
+                    provider_usage["total_tokens"] += usage_snapshot["total_tokens"]
+                    provider_usage["received"] = provider_usage["received"] or usage_snapshot["received"]
         except Exception as exc:
             stream_error = str(exc)
             _trace_agent_event(
@@ -2532,6 +2666,7 @@ def run_agent_stream(
         final_reasoning = "".join(reasoning_parts).strip()
         final_content = "".join(content_parts).strip()
         tool_calls, tool_call_error = _finalize_stream_tool_calls(tool_call_parts)
+        finalize_call_usage()
         if buffered_content_deltas and not tool_calls and not tool_call_error:
             for pending_delta in buffered_content_deltas:
                 for event in emit_answer(pending_delta):
@@ -2554,18 +2689,25 @@ def run_agent_stream(
             "stream_error": stream_error,
         }
 
+    pending_step_retry_reason: str | None = None
     while step < max_steps:
         step += 1
         yield {"type": "step_started", "step": step, "max_steps": max_steps}
         _trace_agent_event("agent_step_started", trace_id=trace_id, step=step, max_steps=max_steps)
         context_compacted_this_step = False
         needs_separator_for_sync = pending_answer_separator
+        step_retry_reason = pending_step_retry_reason
+        pending_step_retry_reason = None
         working_memory_instruction = _build_working_state_instruction(working_state)
         extra_messages = [working_memory_instruction] if working_memory_instruction else []
         turn_messages, _ = apply_context_compaction(extra_messages, reason="pre_model_turn")
 
         try:
-            turn_result = yield from stream_model_turn(turn_messages)
+            turn_result = yield from stream_model_turn(
+                turn_messages,
+                call_type="agent_step",
+                retry_reason=step_retry_reason,
+            )
         except Exception as exc:
             fatal_api_error = str(exc)
             if _is_context_overflow_error(fatal_api_error) and not context_compacted_this_step:
@@ -2579,6 +2721,7 @@ def run_agent_stream(
                         phase="main_loop",
                         source="model_turn_exception",
                     )
+                    pending_step_retry_reason = "context_overflow_recovery"
                     step -= 1
                     continue
                 _trace_agent_event(
@@ -2659,6 +2802,7 @@ def run_agent_stream(
                             phase="main_loop",
                             source="stream_error",
                         )
+                        pending_step_retry_reason = "context_overflow_recovery"
                         step -= 1
                         continue
                     _trace_agent_event(
@@ -2686,6 +2830,7 @@ def run_agent_stream(
             }
             if not _has_missing_final_answer_instruction(messages):
                 messages.append(_build_missing_final_answer_instruction())
+            pending_step_retry_reason = "missing_final_answer"
             continue
 
         assistant_tool_call_message = _build_assistant_tool_call_message(content_text, tool_calls)
@@ -3139,15 +3284,23 @@ def run_agent_stream(
 
     final_phase_compaction_used = False
     final_instruction_builder = _build_final_answer_instruction
+    pending_final_retry_reason: str | None = None
     while True:
         final_extra_messages = []
         try:
             _trace_agent_event("final_answer_phase_started", trace_id=trace_id, step=step)
+            final_retry_reason = pending_final_retry_reason
+            pending_final_retry_reason = None
             working_memory_instruction = _build_working_state_instruction(working_state)
             final_extra_messages = [working_memory_instruction] if working_memory_instruction is not None else []
             final_messages, _ = apply_context_compaction(final_extra_messages, reason="pre_final_answer")
             final_messages = [*final_messages, final_instruction_builder()]
-            turn_result = yield from stream_model_turn(final_messages, allow_tools=False)
+            turn_result = yield from stream_model_turn(
+                final_messages,
+                allow_tools=False,
+                call_type="final_answer",
+                retry_reason=final_retry_reason,
+            )
             content_text = turn_result.get("content_text") or ""
             tool_calls = turn_result.get("tool_calls")
             stream_error = turn_result.get("stream_error")
@@ -3162,6 +3315,7 @@ def run_agent_stream(
                         phase="final_answer",
                         source="stream_error",
                     )
+                    pending_final_retry_reason = "context_overflow_recovery"
                     continue
                 if final_instruction_builder is _build_final_answer_instruction:
                     _trace_agent_event(
@@ -3173,6 +3327,7 @@ def run_agent_stream(
                     )
                     final_phase_compaction_used = True
                     final_instruction_builder = _build_minimal_final_answer_instruction
+                    pending_final_retry_reason = "minimal_final_instruction"
                     continue
                 _trace_agent_event(
                     "context_overflow_unrecoverable",
@@ -3220,6 +3375,7 @@ def run_agent_stream(
                         phase="final_answer",
                         source="exception",
                     )
+                    pending_final_retry_reason = "context_overflow_recovery"
                     continue
                 if final_instruction_builder is _build_final_answer_instruction:
                     _trace_agent_event(
@@ -3231,6 +3387,7 @@ def run_agent_stream(
                     )
                     final_phase_compaction_used = True
                     final_instruction_builder = _build_minimal_final_answer_instruction
+                    pending_final_retry_reason = "minimal_final_instruction"
                     continue
                 _trace_agent_event(
                     "context_overflow_unrecoverable",

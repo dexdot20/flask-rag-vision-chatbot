@@ -176,31 +176,32 @@
   </div>
 
   <div class="stats-section">
-    <div class="stats-section-title">Estimated input sources (session)</div>
+    <div class="stats-section-title">Estimated billed input sources (session)</div>
     <div class="stats-section-card">
     <div class="stats-row">
-      <span class="stats-label">Estimated input total</span>
+      <span class="stats-label">Aligned billed input total</span>
       <span class="stats-value" id="stat-breakdown-session-total">0</span>
     </div>
     <div id="session-breakdown-list" class="breakdown-list"></div>
     </div>
-    <p class="stats-note">This is a cumulative session estimate across completed assistant turns. It is inferred locally from the prompt sources sent to the model, including core instructions, tool specs, canvas state, scratchpad, tool memory, RAG context, chat history, and final-answer instructions, so it can differ from billed input tokens.</p>
+    <p class="stats-note">This is a cumulative session estimate across completed assistant turns. Source categories are inferred locally, then aligned to the provider billed prompt total; anything not attributed confidently appears under Unknown/Provider overhead.</p>
   </div>
 
   <div class="stats-section">
-    <div class="stats-section-title">Estimated input sources (latest assistant turn)</div>
+    <div class="stats-section-title">Estimated billed input sources (latest assistant turn)</div>
     <div class="stats-section-card">
     <div class="stats-row">
-      <span class="stats-label">Estimated input total</span>
+      <span class="stats-label">Aligned billed input total</span>
       <span class="stats-value" id="stat-breakdown-latest-total">—</span>
     </div>
     <div id="latest-breakdown-list" class="breakdown-list"></div>
     </div>
+    <p class="stats-note">This breakdown tracks the latest assistant reply as a billed multi-call run, not just the visible final message.</p>
   </div>
 
   <div class="stats-section" id="turns-section">
     <div class="stats-section-title">Completed assistant turns</div>
-    <p class="stats-note">Each row is one completed assistant reply with provider totals and the local input-source estimate for that turn.</p>
+    <p class="stats-note">Each row is one completed assistant reply with provider totals, provider-aligned source estimates, and a per-call drawer for the internal model calls that produced it.</p>
     <div id="turns-list" class="stats-turns-list"></div>
   </div>
 </div>
