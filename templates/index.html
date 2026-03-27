@@ -34,22 +34,6 @@
         {% endfor %}
       </select>
     </div>
-    <button class="btn-ghost btn-canvas" id="canvas-btn" type="button">
-      <span>Canvas</span>
-      <span id="canvas-btn-indicator" class="canvas-btn-indicator" hidden aria-hidden="true"></span>
-    </button>
-    <button class="btn-ghost" id="export-btn" type="button">Export</button>
-    <button class="btn-ghost" id="prune-history-btn" type="button">Prune history</button>
-    <a class="btn-ghost" id="settings-btn" href="/settings">Settings</a>
-    {% if auth_enabled %}
-    <a class="btn-ghost btn-auth-link" href="/logout">Sign out</a>
-    {% endif %}
-    <button class="btn-tokens" id="tokens-btn" title="Usage & cost">
-      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>
-      </svg>
-      <span><span id="tokens-badge">0</span> tokens</span>
-    </button>
     <button class="btn-ghost mobile-tools-toggle" id="mobile-tools-btn" type="button" aria-controls="mobile-tools-panel" aria-expanded="false" title="More options">
       <span aria-hidden="true">⋯</span>
     </button>
@@ -58,14 +42,14 @@
 
 <div id="mobile-tools-panel" class="mobile-tools-panel" aria-hidden="true">
   <div class="mobile-tools-panel__header">
-    <span>More</span>
+    <span>Menu</span>
     <button id="mobile-tools-close" type="button" title="Close">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
         <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
       </svg>
     </button>
   </div>
-  <div class="mobile-tools-panel__section">
+  <div class="mobile-tools-panel__section mobile-tools-panel__section--model">
     <div class="settings-label">Model</div>
     <div class="model-select-wrapper model-select-wrapper--mobile">
       <select id="mobile-model-select" title="Select model">
@@ -83,7 +67,10 @@
     {% if auth_enabled %}
     <a class="mobile-tools-action" id="mobile-logout-btn" href="/logout">Sign out</a>
     {% endif %}
-    <button class="mobile-tools-action" id="mobile-tokens-btn" type="button">Usage &amp; cost</button>
+    <button class="mobile-tools-action mobile-tools-action--stats" id="mobile-tokens-btn" type="button">
+      <span>Usage &amp; cost</span>
+      <span class="mobile-tools-action__badge" id="tokens-badge">0</span>
+    </button>
   </div>
 </div>
 <div id="mobile-tools-overlay" class="mobile-tools-overlay"></div>

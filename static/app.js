@@ -18,12 +18,10 @@ const attachBtn = document.getElementById("attach-btn");
 const attachmentPreviewEl = document.getElementById("attachment-preview");
 const summaryNowBtn = document.getElementById("summary-now-btn");
 const summaryUndoBtn = document.getElementById("summary-undo-btn");
-const pruneHistoryBtn = document.getElementById("prune-history-btn");
 const kbSyncBtn = document.getElementById("kb-sync-btn");
 const kbStatusEl = document.getElementById("kb-status");
 const kbDocumentsListEl = document.getElementById("kb-documents-list");
 const cancelBtn = document.getElementById("cancel-btn");
-const exportBtn = document.getElementById("export-btn");
 const fixBtn = document.getElementById("fix-btn");
 const sendBtn = document.getElementById("send-btn");
 const modelSel = document.getElementById("model-select");
@@ -42,7 +40,6 @@ const summaryInspectorDetail = document.getElementById("summary-inspector-detail
 const summaryInspectorToolMessages = document.getElementById("summary-inspector-tool-messages");
 const summaryInspectorReason = document.getElementById("summary-inspector-reason");
 const summaryInspectorLast = document.getElementById("summary-inspector-last");
-const canvasBtn = document.getElementById("canvas-btn");
 const canvasPanel = document.getElementById("canvas-panel");
 const canvasOverlay = document.getElementById("canvas-overlay");
 const canvasClose = document.getElementById("canvas-close");
@@ -79,7 +76,6 @@ const canvasConfirmMessage = document.getElementById("canvas-confirm-message");
 const canvasConfirmOpenBtn = document.getElementById("canvas-confirm-open");
 const canvasConfirmLaterBtn = document.getElementById("canvas-confirm-later");
 const canvasConfirmCloseBtn = document.getElementById("canvas-confirm-close");
-const tokensBtn = document.getElementById("tokens-btn");
 const tokensBadge = document.getElementById("tokens-badge");
 const statsPanel = document.getElementById("stats-panel");
 const statsOverlay = document.getElementById("stats-overlay");
@@ -96,6 +92,8 @@ const mobileToolsClose = document.getElementById("mobile-tools-close");
 const mobileCanvasBtn = document.getElementById("mobile-canvas-btn");
 const mobileExportBtn = document.getElementById("mobile-export-btn");
 const mobilePruneBtn = document.getElementById("mobile-prune-btn");
+const mobileSettingsBtn = document.getElementById("mobile-settings-btn");
+const mobileLogoutBtn = document.getElementById("mobile-logout-btn");
 const mobileTokensBtn = document.getElementById("mobile-tokens-btn");
 const exportPanel = document.getElementById("export-panel");
 const exportOverlay = document.getElementById("export-overlay");
@@ -1444,7 +1442,7 @@ function renderCanvasPanel() {
   }
 }
 
-function openCanvas() {
+function openCanvas(triggerEl = null) {
   closeMobileTools();
   closeCanvasConfirmModal("cancel", false);
   closeStats();
@@ -1452,7 +1450,9 @@ function openCanvas() {
   canvasPanel?.classList.add("open");
   canvasOverlay?.classList.add("open");
   canvasPanel?.setAttribute("aria-hidden", "false");
-  lastCanvasTriggerEl = document.activeElement instanceof HTMLElement ? document.activeElement : canvasBtn;
+  lastCanvasTriggerEl = triggerEl instanceof HTMLElement
+    ? triggerEl
+    : (document.activeElement instanceof HTMLElement ? document.activeElement : mobileToolsBtn);
   setCanvasAttention(false);
   applyCanvasPanelWidth(readCanvasWidthPreference(), false);
   renderCanvasPanel();
@@ -1473,7 +1473,7 @@ function closeCanvas() {
   }
 }
 
-function openExportPanel() {
+function openExportPanel(triggerEl = null) {
   closeMobileTools();
   closeStats();
   closeCanvas();
@@ -1481,8 +1481,58 @@ function openExportPanel() {
   exportPanel?.classList.add("open");
   exportOverlay?.classList.add("open");
   exportPanel?.setAttribute("aria-hidden", "false");
-  lastExportTriggerEl = document.activeElement instanceof HTMLElement ? document.activeElement : exportBtn;
+  lastExportTriggerEl = triggerEl instanceof HTMLElement
+    ? triggerEl
+    : (document.activeElement instanceof HTMLElement ? document.activeElement : mobileToolsBtn);
   exportClose?.focus();
+}
+
+async function pruneConversationHistory() {
+  if (!currentConvId) {
+    showToast("No active conversation.", "warning");
+    return;
+  }
+  const raw = window.prompt("How many of the first unpruned messages should be pruned?", "5");
+  if (raw === null) {
+    return;
+  }
+  const count = parseInt(raw, 10);
+  if (!Number.isInteger(count) || count < 1 || count > 50) {
+    showToast("Please enter a number between 1 and 50.", "warning");
+    return;
+  }
+  if (mobilePruneBtn) {
+    mobilePruneBtn.disabled = true;
+  }
+  try {
+    const response = await fetch(`/api/conversations/${currentConvId}/prune-batch`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ count }),
+    });
+    const data = await response.json().catch(() => null);
+    if (!response.ok) {
+      throw new Error(data?.error || "Pruning failed.");
+    }
+    if (Array.isArray(data.messages)) {
+      history = data.messages.map(normalizeHistoryEntry);
+      rebuildTokenStatsFromHistory();
+      renderConversationHistory();
+    }
+    loadSidebar();
+    showToast(
+      data.pruned_count > 0
+        ? `${data.pruned_count} message${data.pruned_count === 1 ? " was" : "s were"} pruned.`
+        : "No eligible messages found.",
+      "success",
+    );
+  } catch (error) {
+    showError(error.message || "Pruning failed.");
+  } finally {
+    if (mobilePruneBtn) {
+      mobilePruneBtn.disabled = false;
+    }
+  }
 }
 
 function closeExportPanel() {
@@ -3083,12 +3133,8 @@ function closeSidebarOnMobile() {
   }
 }
 
-tokensBtn.addEventListener("click", openStats);
 statsClose.addEventListener("click", closeStats);
 statsOverlay.addEventListener("click", closeStats);
-if (canvasBtn) {
-  canvasBtn.addEventListener("click", openCanvas);
-}
 if (canvasClose) {
   canvasClose.addEventListener("click", closeCanvas);
 }
@@ -3111,20 +3157,16 @@ if (canvasCancelBtn) {
     setCanvasStatus("Canvas edit cancelled.", "muted");
   });
 }
-if (exportBtn) {
-  exportBtn.addEventListener("click", openExportPanel);
-}
 if (mobileCanvasBtn) {
-  mobileCanvasBtn.addEventListener("click", openCanvas);
+  mobileCanvasBtn.addEventListener("click", () => openCanvas(mobileToolsBtn || mobileCanvasBtn));
 }
 if (mobileExportBtn) {
-  mobileExportBtn.addEventListener("click", openExportPanel);
+  mobileExportBtn.addEventListener("click", () => openExportPanel(mobileToolsBtn || mobileExportBtn));
 }
 if (mobilePruneBtn) {
   mobilePruneBtn.addEventListener("click", () => {
-    if (pruneHistoryBtn) {
-      pruneHistoryBtn.click();
-    }
+    closeMobileTools();
+    void pruneConversationHistory();
   });
 }
 if (exportClose) {
@@ -3231,6 +3273,12 @@ if (mobileTokensBtn) {
     openStats();
     closeMobileTools();
   });
+}
+if (mobileSettingsBtn) {
+  mobileSettingsBtn.addEventListener("click", closeMobileTools);
+}
+if (mobileLogoutBtn) {
+  mobileLogoutBtn.addEventListener("click", closeMobileTools);
 }
 if (modelSel) {
   modelSel.addEventListener("change", () => syncModelSelectors(modelSel.value));
@@ -3912,52 +3960,6 @@ if (summaryUndoBtn) {
   });
 }
 
-if (pruneHistoryBtn) {
-  pruneHistoryBtn.addEventListener("click", async () => {
-    if (!currentConvId) {
-      showToast("No active conversation.", "warning");
-      return;
-    }
-    const raw = window.prompt("How many of the first unpruned messages should be pruned?", "5");
-    if (raw === null) {
-      return;
-    }
-    const count = parseInt(raw, 10);
-    if (!Number.isInteger(count) || count < 1 || count > 50) {
-      showToast("Please enter a number between 1 and 50.", "warning");
-      return;
-    }
-    pruneHistoryBtn.disabled = true;
-    try {
-      const response = await fetch(`/api/conversations/${currentConvId}/prune-batch`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ count }),
-      });
-      const data = await response.json().catch(() => null);
-      if (!response.ok) {
-        throw new Error(data?.error || "Pruning failed.");
-      }
-      if (Array.isArray(data.messages)) {
-        history = data.messages.map(normalizeHistoryEntry);
-        rebuildTokenStatsFromHistory();
-        renderConversationHistory();
-      }
-      loadSidebar();
-      showToast(
-        data.pruned_count > 0
-          ? `${data.pruned_count} message${data.pruned_count === 1 ? " was" : "s were"} pruned.`
-          : "No eligible messages found.",
-        "success",
-      );
-    } catch (error) {
-      showError(error.message || "Pruning failed.");
-    } finally {
-      pruneHistoryBtn.disabled = false;
-    }
-  });
-}
-
 inputEl.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey) {
     if ("ontouchstart" in window || navigator.maxTouchPoints > 0) return;
@@ -4073,9 +4075,6 @@ function setStreaming(active) {
   fixBtn.disabled = active;
   inputEl.disabled = active;
   attachBtn.disabled = active;
-  if (pruneHistoryBtn) {
-    pruneHistoryBtn.disabled = active;
-  }
   if (mobilePruneBtn) {
     mobilePruneBtn.disabled = active;
   }
