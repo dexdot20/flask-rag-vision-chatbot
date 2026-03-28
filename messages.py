@@ -327,8 +327,9 @@ def build_tool_call_contract(active_tool_names: list[str], canvas_documents=None
         return None
     return {
         "rules": [
-            "If you need a tool, call it via native function calling instead of writing tool JSON in assistant content.",
-            "If you do not need a tool, answer normally in assistant content.",
+            "Call a tool only when it is required or when it will materially improve correctness, completeness, or safety. If you can answer reliably from the current context, do not call a tool.",
+            "Unnecessary tool calls waste tokens and context, so do not use tools for convenience, repetition, or curiosity.",
+            "If you do need a tool, call it via native function calling instead of writing tool JSON in assistant content.",
             "Use only the tools exposed by the API for this turn, and provide arguments matching the documented types.",
         ],
     }
@@ -502,7 +503,10 @@ def build_runtime_system_message(
     contract = build_tool_call_contract(active_tool_names, canvas_documents=canvas_documents)
     if contract:
         parts.append("## Tool Calling")
-        parts.append("Native function calling is enabled for this turn. Do not restate tool schemas or invent unavailable tools.\n")
+        parts.append(
+            "Native function calling is enabled for this turn. Do not restate tool schemas or invent unavailable tools. "
+            "Only call tools when they are truly needed; unnecessary calls waste tokens and context.\n"
+        )
         for rule in contract["rules"]:
             parts.append(f"- {rule}")
         parts.append("")

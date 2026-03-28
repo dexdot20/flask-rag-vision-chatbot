@@ -202,8 +202,8 @@ TOOL_SPECS = [
         "name": "search_knowledge_base",
         "description": (
             "Search the internal knowledge base indexed with RAG. "
-            "Use this when the answer may exist in synced conversation history or stored tool outputs. "
-            "Optionally filter by category. Avoid repeating semantically overlapping searches when one good result set already answers the question."
+            "Use this when the answer may exist in synced conversation history or stored tool outputs and you cannot answer reliably from the current context. "
+            "Optionally filter by category. Avoid repeating semantically overlapping searches when one good result set already answers the question; unnecessary searches waste tokens."
         ),
         "parameters": {
             "type": "object",
@@ -228,15 +228,15 @@ TOOL_SPECS = [
         "prompt": {
             "purpose": "Searches the internal RAG knowledge base built from files, URLs, notes, and conversations.",
             "inputs": {"query": "semantic search query", "category": "optional category", "top_k": "1-12 results"},
-            "guidance": "Use at most a few focused searches and synthesize from returned chunks instead of retrying near-duplicate queries.",
+            "guidance": "Use at most a few focused searches and synthesize from returned chunks instead of retrying near-duplicate queries. If the current context is already sufficient, do not search again; unnecessary searches waste tokens.",
         },
     },
     {
         "name": "search_tool_memory",
         "description": (
             "Search past web tool results stored from previous conversations. "
-            "Use this before making a new web request when you suspect the topic was already researched. "
-            "This searches remembered results from fetch_url, search_web, and news tools."
+            "Use this before making a new web request when you suspect the topic was already researched and the current context is not enough. "
+            "This searches remembered results from fetch_url, search_web, and news tools; unnecessary lookups waste tokens."
         ),
         "parameters": {
             "type": "object",
@@ -258,8 +258,8 @@ TOOL_SPECS = [
             "purpose": "Searches memory of past web searches, URL fetches, and news lookups.",
             "inputs": {"query": "semantic search query", "top_k": "1-10 results"},
             "guidance": (
-                "Use before making a new web request if similar research may already exist. "
-                "If high-similarity results already answer the question, reuse them instead of repeating the search."
+                "Use before making a new web request if similar research may already exist and you cannot answer from the current context. "
+                "If high-similarity results already answer the question, reuse them instead of repeating the search. Unnecessary lookups waste tokens."
             ),
         },
     },
