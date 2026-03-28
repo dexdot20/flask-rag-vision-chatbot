@@ -1909,6 +1909,30 @@ function sumBreakdown(breakdown) {
   return INPUT_BREAKDOWN_ORDER.reduce((sum, key) => sum + toFiniteNumber(breakdown[key], 0), 0);
 }
 
+function getModelCallInputTokens(call) {
+  if (!call || typeof call !== "object") {
+    return 0;
+  }
+
+  const promptTokens = toNonNegativeIntOrNull(call.prompt_tokens);
+  if (promptTokens !== null) {
+    return promptTokens;
+  }
+
+  return toNonNegativeIntOrNull(call.estimated_input_tokens) ?? 0;
+}
+
+function getMaxInputTokensPerCall(modelCalls, fallbackPromptTokens = 0) {
+  const peak = (Array.isArray(modelCalls) ? modelCalls : []).reduce(
+    (maxValue, call) => Math.max(maxValue, getModelCallInputTokens(call)),
+    0,
+  );
+  if (peak > 0) {
+    return peak;
+  }
+  return Math.max(0, Math.round(toFiniteNumber(fallbackPromptTokens, 0)));
+}
+
 function normalizeModelCallPayload(callEntry) {
   const source = callEntry && typeof callEntry === "object" ? callEntry : {};
   const promptTokens = toNonNegativeIntOrNull(source.prompt_tokens);
@@ -1947,6 +1971,10 @@ function normalizeUsagePayload(usage) {
     Math.round(toFiniteNumber(source.model_call_count, 0)),
   );
   const estimatedInputTokens = promptTokens || sumBreakdown(inputBreakdown) || estimatedSourceTokens;
+  const configuredPromptMaxInputTokens = toNonNegativeIntOrNull(source.configured_prompt_max_input_tokens);
+  const maxInputTokensPerCall =
+    toNonNegativeIntOrNull(source.max_input_tokens_per_call) ??
+    getMaxInputTokensPerCall(modelCalls, promptTokens || estimatedInputTokens);
 
   return {
     prompt_tokens: promptTokens,
@@ -1956,6 +1984,8 @@ function normalizeUsagePayload(usage) {
     input_breakdown: inputBreakdown,
     model_call_count: modelCallCount,
     model_calls: modelCalls,
+    max_input_tokens_per_call: maxInputTokensPerCall,
+    configured_prompt_max_input_tokens: configuredPromptMaxInputTokens,
     cost: Math.max(0, toFiniteNumber(source.cost, 0)),
     currency: String(source.currency || "USD") || "USD",
     model: String(source.model || "—") || "—",
@@ -2130,6 +2160,15 @@ function renderTokenStats() {
   document.getElementById("stat-total").textContent = fmt(grandTotal);
   document.getElementById("stat-cost").textContent = "$" + totalCost.toFixed(6);
   document.getElementById("stat-last-input").textContent = lastTurn ? fmt(lastTurn.prompt_tokens) : "—";
+  document.getElementById("stat-last-peak-input").textContent = lastTurn
+    ? fmt(lastTurn.max_input_tokens_per_call)
+    : "—";
+  document.getElementById("stat-last-call-count").textContent = lastTurn
+    ? fmt(lastTurn.model_call_count)
+    : "—";
+  document.getElementById("stat-last-prompt-cap").textContent = lastTurn && lastTurn.configured_prompt_max_input_tokens !== null
+    ? fmt(lastTurn.configured_prompt_max_input_tokens)
+    : "—";
   document.getElementById("stat-last-output").textContent = lastTurn ? fmt(lastTurn.completion_tokens) : "—";
   document.getElementById("stat-last-total").textContent = lastTurn ? fmt(lastTurn.total_tokens) : "—";
   document.getElementById("stat-last-model").textContent = lastTurn ? lastTurn.model : "—";
@@ -2154,6 +2193,12 @@ function renderTokenStats() {
     .map(
       (turn, index) => {
         const callCount = Math.max(turn.model_call_count || 0, Array.isArray(turn.model_calls) ? turn.model_calls.length : 0);
+        const peakPromptStat = turn.max_input_tokens_per_call
+          ? `<span class="turn-stat">${fmt(turn.max_input_tokens_per_call)} peak call prompt</span>`
+          : "";
+        const promptCapStat = turn.configured_prompt_max_input_tokens !== null
+          ? `<span class="turn-stat">${fmt(turn.configured_prompt_max_input_tokens)} per-call prompt cap</span>`
+          : "";
         return (
         `<div class="turn-item">` +
           `<div class="turn-header">` +
@@ -2165,8 +2210,10 @@ function renderTokenStats() {
             `</div>` +
           `</div>` +
           `<div class="turn-details">` +
-            `<span class="turn-stat"><span class="stats-dot dot-user"></span>${fmt(turn.prompt_tokens)} in</span>` +
-            `<span class="turn-stat"><span class="stats-dot dot-asst"></span>${fmt(turn.completion_tokens)} out</span>` +
+            `<span class="turn-stat"><span class="stats-dot dot-user"></span>${fmt(turn.prompt_tokens)} prompt (all calls)</span>` +
+            peakPromptStat +
+            promptCapStat +
+            `<span class="turn-stat"><span class="stats-dot dot-asst"></span>${fmt(turn.completion_tokens)} completion</span>` +
             `<span class="turn-stat">${fmt(turn.total_tokens)} total</span>` +
             (turn.cost ? `<span class="turn-stat cost-stat">$${turn.cost.toFixed(6)}</span>` : "") +
           `</div>` +

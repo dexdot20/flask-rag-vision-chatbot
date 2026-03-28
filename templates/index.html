@@ -145,15 +145,27 @@
     <div class="stats-section-title">Provider totals (latest assistant turn)</div>
     <div class="stats-section-card">
     <div class="stats-row">
-      <span class="stats-label">Input tokens (prompt)</span>
+      <span class="stats-label">Billed prompt tokens (all model calls)</span>
       <span class="stats-value" id="stat-last-input">—</span>
     </div>
     <div class="stats-row">
-      <span class="stats-label">Output tokens (completion)</span>
+      <span class="stats-label">Peak prompt in one model call</span>
+      <span class="stats-value" id="stat-last-peak-input">—</span>
+    </div>
+    <div class="stats-row">
+      <span class="stats-label">Model calls</span>
+      <span class="stats-value" id="stat-last-call-count">—</span>
+    </div>
+    <div class="stats-row">
+      <span class="stats-label">Configured per-call prompt cap</span>
+      <span class="stats-value" id="stat-last-prompt-cap">—</span>
+    </div>
+    <div class="stats-row">
+      <span class="stats-label">Output tokens (completion, all calls)</span>
       <span class="stats-value" id="stat-last-output">—</span>
     </div>
     <div class="stats-row stats-row-total">
-      <span class="stats-label">Total tokens</span>
+      <span class="stats-label">Total tokens (all calls)</span>
       <span class="stats-value" id="stat-last-total">—</span>
     </div>
     <div class="stats-row">
@@ -161,7 +173,7 @@
       <span class="stats-value" id="stat-last-model">—</span>
     </div>
     </div>
-    <p class="stats-note">Includes every model call made while producing the latest assistant reply, including tool-execution rounds.</p>
+    <p class="stats-note">Includes every model call made while producing the latest assistant reply, including tool-execution rounds. The billed prompt total can exceed a model's single-call context window because later calls rebill prior history and tool results; compare the peak single-call prompt to the per-call cap.</p>
   </div>
 
   <div class="stats-section">
@@ -180,7 +192,7 @@
     <div class="stats-section-title">Estimated billed input sources (latest assistant turn)</div>
     <div class="stats-section-card">
     <div class="stats-row">
-      <span class="stats-label">Aligned billed input total</span>
+      <span class="stats-label">Aligned billed input total (all model calls)</span>
       <span class="stats-value" id="stat-breakdown-latest-total">—</span>
     </div>
     <div id="latest-breakdown-list" class="breakdown-list"></div>

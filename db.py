@@ -1093,7 +1093,14 @@ def _normalize_message_usage(value: dict | None) -> dict | None:
         return None
 
     cleaned = {}
-    for key in ("prompt_tokens", "completion_tokens", "total_tokens", "estimated_input_tokens"):
+    for key in (
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "estimated_input_tokens",
+        "max_input_tokens_per_call",
+        "configured_prompt_max_input_tokens",
+    ):
         normalized = _coerce_non_negative_int(value.get(key))
         if normalized is not None:
             cleaned[key] = normalized

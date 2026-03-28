@@ -379,6 +379,34 @@ def _estimate_messages_tokens(messages_to_send: list[dict]) -> int:
     return _estimate_input_breakdown(messages_to_send)[1]
 
 
+def _get_model_call_input_tokens(call: dict) -> int:
+    if not isinstance(call, dict):
+        return 0
+
+    prompt_tokens = call.get("prompt_tokens")
+    if isinstance(prompt_tokens, (int, float)):
+        return max(0, int(prompt_tokens))
+
+    estimated_input_tokens = call.get("estimated_input_tokens")
+    if isinstance(estimated_input_tokens, (int, float)):
+        return max(0, int(estimated_input_tokens))
+
+    return 0
+
+
+def _summarize_model_call_usage(model_calls: list[dict], fallback_input_tokens: int = 0) -> dict[str, int]:
+    max_input_tokens_per_call = 0
+    for call in model_calls:
+        max_input_tokens_per_call = max(max_input_tokens_per_call, _get_model_call_input_tokens(call))
+
+    if max_input_tokens_per_call <= 0:
+        max_input_tokens_per_call = max(0, int(fallback_input_tokens or 0))
+
+    return {
+        "max_input_tokens_per_call": max_input_tokens_per_call,
+    }
+
+
 def _is_context_overflow_error(error_str: str) -> bool:
     normalized = str(error_str or "").strip().lower()
     if not normalized:
@@ -2511,6 +2539,10 @@ def run_agent_stream(
         return compacted_turn_messages, True
 
     def usage_event():
+        call_usage_summary = _summarize_model_call_usage(
+            usage_totals["model_calls"],
+            fallback_input_tokens=usage_totals["prompt_tokens"],
+        )
         total_cost = calculate_cost(usage_totals["prompt_tokens"], usage_totals["completion_tokens"])
         return {
             "type": "usage",
@@ -2521,6 +2553,8 @@ def run_agent_stream(
             "input_breakdown": dict(usage_totals["input_breakdown"]),
             "model_call_count": usage_totals["model_call_count"],
             "model_calls": list(usage_totals["model_calls"]),
+            "max_input_tokens_per_call": call_usage_summary["max_input_tokens_per_call"],
+            "configured_prompt_max_input_tokens": PROMPT_MAX_INPUT_TOKENS,
             "cost": total_cost,
             "currency": "USD",
             "model": model,

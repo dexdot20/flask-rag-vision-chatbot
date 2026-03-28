@@ -27,6 +27,7 @@ from agent import (
     _is_context_overflow_error,
     _iter_agent_exchange_blocks,
     _prepare_tool_result_for_transcript,
+    _summarize_model_call_usage,
     _try_compact_messages,
     collect_agent_response,
     run_agent_stream,
@@ -2386,6 +2387,32 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(usage["input_breakdown"]["user_messages"], 2)
         self.assertEqual(usage["input_breakdown"]["unknown_provider_overhead"], 6)
 
+    def test_extract_message_usage_preserves_peak_input_and_prompt_cap(self):
+        usage = extract_message_usage(
+            {
+                "usage": {
+                    "prompt_tokens": 12,
+                    "max_input_tokens_per_call": 7,
+                    "configured_prompt_max_input_tokens": 100000,
+                }
+            }
+        )
+
+        self.assertEqual(usage["prompt_tokens"], 12)
+        self.assertEqual(usage["max_input_tokens_per_call"], 7)
+        self.assertEqual(usage["configured_prompt_max_input_tokens"], 100000)
+
+    def test_summarize_model_call_usage_reports_peak_single_call_input(self):
+        summary = _summarize_model_call_usage(
+            [
+                {"prompt_tokens": 48000, "estimated_input_tokens": 48000},
+                {"estimated_input_tokens": 61000},
+                {"prompt_tokens": 52000, "estimated_input_tokens": 52000},
+            ]
+        )
+
+        self.assertEqual(summary["max_input_tokens_per_call"], 61000)
+
     def test_frontend_restores_persistent_tool_trace_panel(self):
         script_path = Path(__file__).resolve().parent.parent / "static" / "app.js"
         script_text = script_path.read_text(encoding="utf-8")
@@ -3784,6 +3811,8 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(usage_event["completion_tokens"], 11)
         self.assertEqual(usage_event["total_tokens"], 18)
         self.assertGreater(usage_event["estimated_input_tokens"], 0)
+        self.assertEqual(usage_event["max_input_tokens_per_call"], 4)
+        self.assertGreater(usage_event["configured_prompt_max_input_tokens"], 0)
         self.assertGreater(usage_event["input_breakdown"]["user_messages"], 0)
         self.assertGreater(usage_event["input_breakdown"]["tool_results"], 0)
         self.assertEqual(usage_event["input_breakdown"]["assistant_history"], 0)
@@ -3897,6 +3926,19 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertTrue(_is_context_overflow_error("This model's maximum context length is 128000 tokens."))
         self.assertFalse(_is_context_overflow_error("rate_limit_exceeded"))
         self.assertFalse(_is_context_overflow_error("429 Too Many Requests"))
+
+    def test_usage_ui_copy_explains_multi_call_prompt_totals(self):
+        template_path = Path(__file__).resolve().parent.parent / "templates" / "index.html"
+        template_text = template_path.read_text(encoding="utf-8")
+
+        self.assertIn("Peak prompt in one model call", template_text)
+        self.assertIn("can exceed a model's single-call context window", template_text)
+
+        script_path = Path(__file__).resolve().parent.parent / "static" / "app.js"
+        script_text = script_path.read_text(encoding="utf-8")
+
+        self.assertIn("prompt (all calls)", script_text)
+        self.assertIn("peak call prompt", script_text)
 
     def test_iter_agent_exchange_blocks_keeps_assistant_and_tool_together(self):
         blocks = _iter_agent_exchange_blocks(
