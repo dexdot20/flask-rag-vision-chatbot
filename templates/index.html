@@ -65,7 +65,9 @@
     <button class="mobile-tools-action" id="mobile-prune-btn" type="button">Prune history</button>
     <a class="mobile-tools-action" id="mobile-settings-btn" href="/settings">Settings</a>
     {% if auth_enabled %}
-    <a class="mobile-tools-action" id="mobile-logout-btn" href="/logout">Sign out</a>
+    <form action="/logout" method="post">
+      <button class="mobile-tools-action mobile-tools-action--danger" id="mobile-logout-btn" type="submit">Sign out</button>
+    </form>
     {% endif %}
     <button class="mobile-tools-action mobile-tools-action--stats" id="mobile-tokens-btn" type="button">
       <span>Usage &amp; cost</span>

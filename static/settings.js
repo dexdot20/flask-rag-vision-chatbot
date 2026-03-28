@@ -99,6 +99,24 @@ function normalizeScratchpadNote(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
 }
 
+function readNumericSetting(element, defaultValue, { allowZero = true } = {}) {
+  if (!element) {
+    return defaultValue;
+  }
+  const rawValue = String(element.value || "").trim();
+  if (!rawValue) {
+    return defaultValue;
+  }
+  const parsed = Number.parseInt(rawValue, 10);
+  if (Number.isNaN(parsed)) {
+    return defaultValue;
+  }
+  if (!allowZero && parsed === 0) {
+    return defaultValue;
+  }
+  return parsed;
+}
+
 function readScratchpadNotesFromList() {
   if (!scratchpadListEl) {
     return [];
@@ -258,6 +276,8 @@ function syncOverviewStats() {
 }
 
 function applySettingsToForm() {
+  const scratchpadAdminEditingEnabled = Boolean(featureFlags.scratchpad_admin_editing);
+
   if (preferencesEl) {
     preferencesEl.value = appSettings.user_preferences || "";
     autoResize(preferencesEl);
@@ -289,12 +309,28 @@ function applySettingsToForm() {
     toolMemoryAutoInjectEl.checked = Boolean(featureFlags.rag_enabled ? appSettings.tool_memory_auto_inject : false);
   }
   updateRagSensitivityHint();
-  renderScratchpad();
+  if (scratchpadListEl || scratchpadAddBtn || scratchpadCountEl) {
+    if (scratchpadAdminEditingEnabled) {
+      renderScratchpad();
+    } else {
+      setScratchpadEmptyState();
+      if (scratchpadListEl) {
+        scratchpadListEl.hidden = true;
+      }
+      if (scratchpadAddBtn) {
+        scratchpadAddBtn.hidden = true;
+      }
+      if (scratchpadCountEl) {
+        scratchpadCountEl.hidden = true;
+      }
+    }
+  }
   syncOverviewStats();
 }
 
 function applyFeatureAvailability() {
   const ragEnabled = Boolean(featureFlags.rag_enabled);
+  const scratchpadAdminEditingEnabled = Boolean(featureFlags.scratchpad_admin_editing);
 
   if (ragAutoInjectEl) ragAutoInjectEl.disabled = !ragEnabled;
   if (ragSensitivityEl) ragSensitivityEl.disabled = !ragEnabled;
@@ -309,6 +345,15 @@ function applyFeatureAvailability() {
   }
   if (toolMemoryDisabledNoteEl) {
     toolMemoryDisabledNoteEl.hidden = ragEnabled;
+  }
+  if (scratchpadListEl) {
+    scratchpadListEl.hidden = !scratchpadAdminEditingEnabled;
+  }
+  if (scratchpadAddBtn) {
+    scratchpadAddBtn.hidden = !scratchpadAdminEditingEnabled;
+  }
+  if (scratchpadCountEl) {
+    scratchpadCountEl.hidden = !scratchpadAdminEditingEnabled;
   }
   if (!ragEnabled) {
     setKbStatus("RAG disabled in .env", "warning");
@@ -359,28 +404,32 @@ async function refreshSettings() {
 }
 
 async function saveSettings() {
+  const scratchpadAdminEditingEnabled = Boolean(featureFlags.scratchpad_admin_editing);
   const payload = {
     user_preferences: preferencesEl?.value.trim() || "",
-    max_steps: parseInt(maxStepsEl?.value || "", 10) || 5,
+    max_steps: readNumericSetting(maxStepsEl, 5, { allowZero: false }),
     chat_summary_mode: summaryModeEl?.value || "auto",
-    chat_summary_trigger_token_count: parseInt(summaryTriggerEl?.value || "", 10) || 80000,
-    summary_skip_first: parseInt(summarySkipFirstEl?.value || "", 10) || 0,
-    summary_skip_last: parseInt(summarySkipLastEl?.value || "", 10) || 1,
+    chat_summary_trigger_token_count: readNumericSetting(summaryTriggerEl, 80000, { allowZero: false }),
+    summary_skip_first: readNumericSetting(summarySkipFirstEl, 0),
+    summary_skip_last: readNumericSetting(summarySkipLastEl, 1),
     pruning_enabled: Boolean(pruningEnabledEl?.checked),
-    pruning_token_threshold: parseInt(pruningTokenThresholdEl?.value || "", 10) || 80000,
-    pruning_batch_size: parseInt(pruningBatchSizeEl?.value || "", 10) || 10,
-    fetch_url_token_threshold: parseInt(fetchThresholdEl?.value || "", 10) || 3500,
-    fetch_url_clip_aggressiveness: parseInt(fetchAggressivenessEl?.value || "", 10) || 50,
-    canvas_prompt_max_lines: parseInt(canvasPromptLinesEl?.value || "", 10) || 800,
-    canvas_expand_max_lines: parseInt(canvasExpandLinesEl?.value || "", 10) || 1600,
-    canvas_scroll_window_lines: parseInt(canvasScrollLinesEl?.value || "", 10) || 200,
+    pruning_token_threshold: readNumericSetting(pruningTokenThresholdEl, 80000, { allowZero: false }),
+    pruning_batch_size: readNumericSetting(pruningBatchSizeEl, 10, { allowZero: false }),
+    fetch_url_token_threshold: readNumericSetting(fetchThresholdEl, 3500, { allowZero: false }),
+    fetch_url_clip_aggressiveness: readNumericSetting(fetchAggressivenessEl, 50),
+    canvas_prompt_max_lines: readNumericSetting(canvasPromptLinesEl, 800, { allowZero: false }),
+    canvas_expand_max_lines: readNumericSetting(canvasExpandLinesEl, 1600, { allowZero: false }),
+    canvas_scroll_window_lines: readNumericSetting(canvasScrollLinesEl, 200, { allowZero: false }),
     active_tools: getSelectedTools(),
     rag_auto_inject: featureFlags.rag_enabled ? Boolean(ragAutoInjectEl?.checked) : false,
     rag_sensitivity: ragSensitivityEl?.value || "normal",
     rag_context_size: ragContextSizeEl?.value || "medium",
     tool_memory_auto_inject: featureFlags.rag_enabled ? Boolean(toolMemoryAutoInjectEl?.checked) : false,
-    scratchpad: readScratchpadNotesFromList().join("\n"),
   };
+
+  if (scratchpadAdminEditingEnabled) {
+    payload.scratchpad = readScratchpadNotesFromList().join("\n");
+  }
 
   saveButtons.forEach((button) => {
     button.disabled = true;

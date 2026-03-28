@@ -482,11 +482,14 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.get_json()["error"], "Invalid model.")
 
-    def test_create_app_runs_bootstrap_rag_sync(self):
-        with patch("app.sync_conversations_to_rag_safe") as mocked_sync:
-            create_app(database_path=f"{self.temp_dir.name}/bootstrap.db")
+    def test_create_app_registers_bootstrap_rag_sync(self):
+        with patch("rag_service.sync_conversations_to_rag_safe") as mocked_sync:
+            bootstrap_app = create_app(database_path=f"{self.temp_dir.name}/bootstrap.db")
+            mocked_sync.assert_not_called()
+            bootstrap_client = bootstrap_app.test_client()
+            bootstrap_client.get("/")
 
-        mocked_sync.assert_called_once_with()
+            mocked_sync.assert_called_once_with()
 
     def test_database_initialization_adds_rag_document_expiration_column(self):
         with get_db() as conn:

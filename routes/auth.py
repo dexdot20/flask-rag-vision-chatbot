@@ -163,7 +163,7 @@ def register_auth_routes(app) -> None:
         session.modified = True
         return _build_login_context(error="Invalid PIN.", next_url=next_url, status_code=401)
 
-    @app.route("/logout", methods=["GET"])
+    @app.route("/logout", methods=["POST"])
     def logout():
         _clear_auth_state()
         session.permanent = False

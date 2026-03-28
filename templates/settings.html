@@ -27,7 +27,9 @@
       <button class="btn-primary settings-save-trigger" type="button">Save settings</button>
       <a class="btn-ghost" href="/">Back to chat</a>
       {% if auth_enabled %}
-      <a class="btn-ghost btn-auth-link" href="/logout">Sign out</a>
+      <form action="/logout" method="post">
+        <button class="btn-ghost btn-auth-link" type="submit">Sign out</button>
+      </form>
       {% endif %}
     </div>
   </header>
