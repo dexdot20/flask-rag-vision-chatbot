@@ -4044,6 +4044,16 @@ kbd {
   gap: 10px;
 }
 
+.scratchpad-note-static {
+  padding: 12px 14px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text-primary);
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
 .scratchpad-note-row .settings-text {
   flex: 1;
 }

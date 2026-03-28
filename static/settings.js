@@ -17,6 +17,7 @@ const preferencesEl = document.getElementById("preferences-input");
 const scratchpadListEl = document.getElementById("scratchpad-list");
 const scratchpadAddBtn = document.getElementById("scratchpad-add-btn");
 const scratchpadCountEl = document.getElementById("scratchpad-count");
+const scratchpadReadonlyNoteEl = document.getElementById("scratchpad-readonly-note");
 const maxStepsEl = document.getElementById("max-steps-input");
 const summaryModeEl = document.getElementById("summary-mode-select");
 const summaryTriggerEl = document.getElementById("summary-trigger-input");
@@ -136,15 +137,30 @@ function readScratchpadNotesFromList() {
   return notes;
 }
 
+function getScratchpadNotesFromSettings() {
+  return String(appSettings.scratchpad || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .split("\n")
+    .map((line) => normalizeScratchpadNote(line))
+    .filter((line) => line.length > 0);
+}
+
+function getVisibleScratchpadNotes() {
+  return Boolean(featureFlags.scratchpad_admin_editing)
+    ? readScratchpadNotesFromList()
+    : getScratchpadNotesFromSettings();
+}
+
 function updateScratchpadCount() {
   if (!scratchpadCountEl) {
     return;
   }
-  const count = readScratchpadNotesFromList().length;
+  const count = getVisibleScratchpadNotes().length;
   scratchpadCountEl.textContent = count === 1 ? "1 note" : `${count} notes`;
 }
 
-function setScratchpadEmptyState() {
+function setScratchpadEmptyState(message = "No scratchpad entries yet.") {
   if (!scratchpadListEl) {
     return;
   }
@@ -152,7 +168,7 @@ function setScratchpadEmptyState() {
   scratchpadListEl.replaceChildren();
   const emptyState = document.createElement("div");
   emptyState.className = "scratchpad-empty-state";
-  emptyState.textContent = "No scratchpad entries yet. Add a note to get started.";
+  emptyState.textContent = message;
   scratchpadListEl.append(emptyState);
   updateScratchpadCount();
   syncOverviewStats();
@@ -192,34 +208,34 @@ function createScratchpadNoteRow(note = "") {
   return row;
 }
 
-function renderScratchpadList(notes) {
+function createScratchpadReadonlyRow(note = "") {
+  const row = document.createElement("div");
+  row.className = "scratchpad-note-static";
+  row.textContent = note;
+  return row;
+}
+
+function renderScratchpadList(notes, { editable = true } = {}) {
   if (!scratchpadListEl) {
     return;
   }
 
   scratchpadListEl.replaceChildren();
   if (!Array.isArray(notes) || !notes.length) {
-    setScratchpadEmptyState();
+    setScratchpadEmptyState(editable ? "No scratchpad entries yet. Add a note to get started." : "No scratchpad entries stored yet.");
     return;
   }
 
   for (const note of notes) {
-    scratchpadListEl.append(createScratchpadNoteRow(note));
+    scratchpadListEl.append(editable ? createScratchpadNoteRow(note) : createScratchpadReadonlyRow(note));
   }
 
   updateScratchpadCount();
   syncOverviewStats();
 }
 
-function renderScratchpad() {
-  const notes = String(appSettings.scratchpad || "")
-    .replace(/\r\n/g, "\n")
-    .replace(/\r/g, "\n")
-    .split("\n")
-    .map((line) => normalizeScratchpadNote(line))
-    .filter((line) => line.length > 0);
-
-  renderScratchpadList(notes);
+function renderScratchpad(editable = true) {
+  renderScratchpadList(getScratchpadNotesFromSettings(), { editable });
 }
 
 function addScratchpadNote(note = "") {
@@ -261,7 +277,7 @@ function applySelectedTools(selected) {
 
 function syncOverviewStats() {
   if (statScratchpadEl) {
-    const noteCount = readScratchpadNotesFromList().length;
+    const noteCount = getVisibleScratchpadNotes().length;
     statScratchpadEl.textContent = noteCount === 1 ? "1 note" : `${noteCount} notes`;
   }
 
@@ -311,18 +327,9 @@ function applySettingsToForm() {
   updateRagSensitivityHint();
   if (scratchpadListEl || scratchpadAddBtn || scratchpadCountEl) {
     if (scratchpadAdminEditingEnabled) {
-      renderScratchpad();
+      renderScratchpad(true);
     } else {
-      setScratchpadEmptyState();
-      if (scratchpadListEl) {
-        scratchpadListEl.hidden = true;
-      }
-      if (scratchpadAddBtn) {
-        scratchpadAddBtn.hidden = true;
-      }
-      if (scratchpadCountEl) {
-        scratchpadCountEl.hidden = true;
-      }
+      renderScratchpad(false);
     }
   }
   syncOverviewStats();
@@ -346,14 +353,11 @@ function applyFeatureAvailability() {
   if (toolMemoryDisabledNoteEl) {
     toolMemoryDisabledNoteEl.hidden = ragEnabled;
   }
-  if (scratchpadListEl) {
-    scratchpadListEl.hidden = !scratchpadAdminEditingEnabled;
-  }
   if (scratchpadAddBtn) {
     scratchpadAddBtn.hidden = !scratchpadAdminEditingEnabled;
   }
-  if (scratchpadCountEl) {
-    scratchpadCountEl.hidden = !scratchpadAdminEditingEnabled;
+  if (scratchpadReadonlyNoteEl) {
+    scratchpadReadonlyNoteEl.hidden = scratchpadAdminEditingEnabled;
   }
   if (!ragEnabled) {
     setKbStatus("RAG disabled in .env", "warning");
