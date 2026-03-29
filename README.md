@@ -462,7 +462,7 @@ Important interpretation details:
 - The panel is rebuilt from stored assistant-message metadata when conversation history is reloaded
 - Zero-value breakdown categories are hidden
 - Local input-source totals are explanatory only and can differ from billed prompt tokens
-- Cost uses the app's configured DeepSeek cache-miss input pricing because the usage payload does not expose cache-hit prompt-token counts
+- Cost uses DeepSeek cache-hit and cache-miss prompt-token counts when the provider reports them; otherwise it falls back to the configured cache-miss input pricing
 
 ### Editing a previous user message
 

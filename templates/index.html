@@ -115,7 +115,7 @@
   <div class="stats-section stats-section-intro">
     <div class="stats-section-title">How to read this</div>
     <p class="stats-note">Provider totals come from the API usage payload for completed assistant turns. Input-source sections below are local estimates of how each prompt was assembled.</p>
-    <p class="stats-note">Cost is estimated with the app's configured DeepSeek API pricing using cache-miss input tokens: $0.28 per 1M input tokens, $0.42 per 1M output tokens. If DeepSeek applies cache-hit pricing, actual billed cost can be lower.</p>
+    <p class="stats-note">Cost is estimated with the app's configured DeepSeek API pricing. When the provider reports cache-hit and cache-miss prompt tokens, the estimate uses $0.028 per 1M cache-hit input tokens, $0.28 per 1M cache-miss input tokens, and $0.42 per 1M output tokens. Otherwise it falls back to cache-miss input pricing.</p>
   </div>
 
   <div class="stats-section">
@@ -126,6 +126,14 @@
         <span class="stats-dot dot-user"></span>Input tokens (prompt)
       </span>
       <span class="stats-value" id="stat-user">0</span>
+    </div>
+    <div class="stats-row">
+      <span class="stats-label">Prompt cache hit tokens</span>
+      <span class="stats-value" id="stat-cache-hit">—</span>
+    </div>
+    <div class="stats-row">
+      <span class="stats-label">Prompt cache miss tokens</span>
+      <span class="stats-value" id="stat-cache-miss">—</span>
     </div>
     <div class="stats-row">
       <span class="stats-label">
@@ -151,6 +159,14 @@
     <div class="stats-row">
       <span class="stats-label">Billed prompt tokens (all model calls)</span>
       <span class="stats-value" id="stat-last-input">—</span>
+    </div>
+    <div class="stats-row">
+      <span class="stats-label">Prompt cache hit tokens</span>
+      <span class="stats-value" id="stat-last-cache-hit">—</span>
+    </div>
+    <div class="stats-row">
+      <span class="stats-label">Prompt cache miss tokens</span>
+      <span class="stats-value" id="stat-last-cache-miss">—</span>
     </div>
     <div class="stats-row">
       <span class="stats-label">Peak prompt in one model call</span>

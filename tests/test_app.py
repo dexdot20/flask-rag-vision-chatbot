@@ -1076,6 +1076,19 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn("Knowledge Base", content)
         self.assertIn("Context block", content)
 
+    def test_runtime_system_message_places_volatile_context_after_tool_calling(self):
+        message = build_runtime_system_message(
+            active_tool_names=["search_web", "search_knowledge_base", "search_tool_memory"],
+            retrieved_context="Context block",
+            tool_trace_context="- search_web [done]: prior result",
+            tool_memory_context="Remembered web result",
+        )
+
+        content = message["content"]
+        self.assertLess(content.index("## Tool Calling"), content.index("## Tool Execution History"))
+        self.assertLess(content.index("## Tool Calling"), content.index("## Tool Memory"))
+        self.assertLess(content.index("## Tool Calling"), content.index("## Knowledge Base"))
+
     def test_runtime_system_message_includes_user_profile_context(self):
         upsert_user_profile_entry("pref:concise", "The user prefers concise answers.", confidence=0.95, source="manual")
 
@@ -2445,6 +2458,51 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(expanded["manifest_excerpt"]["active_file"], "src/config.py")
         self.assertIn("os", expanded["relationship_map"]["imports"])
 
+    def test_expand_canvas_document_accepts_title_as_document_path(self):
+        runtime_state = {"canvas": create_canvas_runtime_state([
+            {
+                "id": "canvas-arduino",
+                "title": "Arduino Kodu - RobotBeyni.ino",
+                "role": "source",
+                "format": "code",
+                "language": "cpp",
+                "content": "int led = 13;\nvoid setup() {}",
+            }
+        ])}
+
+        expanded, summary = _execute_tool(
+            "expand_canvas_document",
+            {"document_path": "Arduino Kodu - RobotBeyni.ino"},
+            runtime_state=runtime_state,
+        )
+
+        self.assertEqual(summary, "Canvas expanded: Arduino Kodu - RobotBeyni.ino")
+        self.assertEqual(expanded["title"], "Arduino Kodu - RobotBeyni.ino")
+        self.assertEqual(expanded["visible_lines"], ["1: int led = 13;", "2: void setup() {}"])
+
+    def test_expand_canvas_document_accepts_unique_basename_as_document_path(self):
+        runtime_state = {"canvas": create_canvas_runtime_state([
+            {
+                "id": "canvas-arduino",
+                "title": "Arduino Kodu - RobotBeyni.ino",
+                "path": "projects/robot/Arduino Kodu - RobotBeyni.ino",
+                "role": "source",
+                "format": "code",
+                "language": "cpp",
+                "content": "int led = 13;\nvoid loop() {}",
+            }
+        ])}
+
+        expanded, summary = _execute_tool(
+            "expand_canvas_document",
+            {"document_path": "Arduino Kodu - RobotBeyni.ino"},
+            runtime_state=runtime_state,
+        )
+
+        self.assertEqual(summary, "Canvas expanded: projects/robot/Arduino Kodu - RobotBeyni.ino")
+        self.assertEqual(expanded["document_path"], "projects/robot/Arduino Kodu - RobotBeyni.ino")
+        self.assertEqual(expanded["visible_lines"], ["1: int led = 13;", "2: void loop() {}"])
+
     def test_chat_image_upload_persists_image_asset_and_metadata(self):
         conversation_id = self._create_conversation()
         fake_events = iter(
@@ -2721,6 +2779,21 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(usage["max_input_tokens_per_call"], 7)
         self.assertEqual(usage["configured_prompt_max_input_tokens"], 100000)
 
+    def test_extract_message_usage_preserves_deepseek_cache_token_counts(self):
+        usage = extract_message_usage(
+            {
+                "usage": {
+                    "prompt_tokens": 12,
+                    "prompt_cache_hit_tokens": 5,
+                    "prompt_cache_miss_tokens": 7,
+                }
+            }
+        )
+
+        self.assertEqual(usage["prompt_tokens"], 12)
+        self.assertEqual(usage["prompt_cache_hit_tokens"], 5)
+        self.assertEqual(usage["prompt_cache_miss_tokens"], 7)
+
     def test_summarize_model_call_usage_reports_peak_single_call_input(self):
         summary = _summarize_model_call_usage(
             [
@@ -2737,6 +2810,18 @@ class AppRoutesTestCase(unittest.TestCase):
         script_text = script_path.read_text(encoding="utf-8")
         self.assertIn("function updateAssistantToolTrace(group, metadata)", script_text)
         self.assertIn("tool_trace: assistantToolTrace", script_text)
+
+    def test_usage_panel_exposes_cache_hit_and_miss_metrics(self):
+        html_text = self.client.get("/").get_data(as_text=True)
+        script_path = Path(__file__).resolve().parent.parent / "static" / "app.js"
+        script_text = script_path.read_text(encoding="utf-8")
+
+        self.assertIn('id="stat-cache-hit"', html_text)
+        self.assertIn('id="stat-cache-miss"', html_text)
+        self.assertIn('id="stat-last-cache-hit"', html_text)
+        self.assertIn('id="stat-last-cache-miss"', html_text)
+        self.assertIn("prompt_cache_hit_tokens", script_text)
+        self.assertIn("prompt_cache_miss_tokens", script_text)
 
     def test_frontend_includes_clarification_ui_hooks(self):
         script_path = Path(__file__).resolve().parent.parent / "static" / "app.js"
@@ -4151,6 +4236,40 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(payload["document"]["path"], "src/app.py")
         self.assertEqual(payload["document"]["content"], "print('new')")
 
+    def test_canvas_patch_endpoint_accepts_title_label_as_document_path(self):
+        conversation_id = self._create_conversation()
+        metadata = serialize_message_metadata(
+            {
+                "canvas_documents": [
+                    {
+                        "id": "canvas-edit",
+                        "title": "Arduino Kodu - RobotBeyni.ino",
+                        "format": "code",
+                        "language": "cpp",
+                        "content": "int led = 13;",
+                    }
+                ]
+            }
+        )
+
+        with get_db() as conn:
+            insert_message(conn, conversation_id, "assistant", "Here is the sketch.", metadata=metadata)
+
+        response = self.client.patch(
+            f"/api/conversations/{conversation_id}/canvas",
+            json={
+                "document_path": "Arduino Kodu - RobotBeyni.ino",
+                "content": "int led = 12;",
+                "format": "code",
+                "language": "cpp",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["document"]["title"], "Arduino Kodu - RobotBeyni.ino")
+        self.assertEqual(payload["document"]["content"], "int led = 12;")
+
     def test_document_canvas_inference_for_code_files(self):
         self.assertEqual(infer_canvas_format("main.py"), "code")
         self.assertEqual(infer_canvas_language("main.py"), "python")
@@ -4305,14 +4424,30 @@ class AppRoutesTestCase(unittest.TestCase):
                             }
                         ]
                     ),
-                    self._stream_chunk(usage=SimpleNamespace(prompt_tokens=4, completion_tokens=6, total_tokens=10)),
+                    self._stream_chunk(
+                        usage=SimpleNamespace(
+                            prompt_tokens=4,
+                            prompt_cache_hit_tokens=1,
+                            prompt_cache_miss_tokens=3,
+                            completion_tokens=6,
+                            total_tokens=10,
+                        )
+                    ),
                 ]
             ),
             iter(
                 [
                     self._stream_chunk(reasoning="Using fetched context. "),
                     self._stream_chunk(content="Final answer."),
-                    self._stream_chunk(usage=SimpleNamespace(prompt_tokens=3, completion_tokens=5, total_tokens=8)),
+                    self._stream_chunk(
+                        usage=SimpleNamespace(
+                            prompt_tokens=3,
+                            prompt_cache_hit_tokens=2,
+                            prompt_cache_miss_tokens=1,
+                            completion_tokens=5,
+                            total_tokens=8,
+                        )
+                    ),
                 ]
             ),
         ]
@@ -4348,8 +4483,11 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(len(usage_events), 1)
         usage_event = usage_events[0]
         self.assertEqual(usage_event["prompt_tokens"], 7)
+        self.assertEqual(usage_event["prompt_cache_hit_tokens"], 3)
+        self.assertEqual(usage_event["prompt_cache_miss_tokens"], 4)
         self.assertEqual(usage_event["completion_tokens"], 11)
         self.assertEqual(usage_event["total_tokens"], 18)
+        self.assertEqual(usage_event["cost"], 0.000006)
         self.assertGreater(usage_event["estimated_input_tokens"], 0)
         self.assertEqual(usage_event["max_input_tokens_per_call"], 4)
         self.assertGreater(usage_event["configured_prompt_max_input_tokens"], 0)
@@ -4361,8 +4499,12 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(usage_event["model_calls"][0]["call_type"], "agent_step")
         self.assertEqual(usage_event["model_calls"][0]["step"], 1)
         self.assertFalse(usage_event["model_calls"][0]["missing_provider_usage"])
+        self.assertEqual(usage_event["model_calls"][0]["prompt_cache_hit_tokens"], 1)
+        self.assertEqual(usage_event["model_calls"][0]["prompt_cache_miss_tokens"], 3)
         self.assertEqual(usage_event["model_calls"][1]["call_type"], "agent_step")
         self.assertEqual(usage_event["model_calls"][1]["prompt_tokens"], 3)
+        self.assertEqual(usage_event["model_calls"][1]["prompt_cache_hit_tokens"], 2)
+        self.assertEqual(usage_event["model_calls"][1]["prompt_cache_miss_tokens"], 1)
         self.assertEqual(
             usage_event["model_calls"][1]["estimated_input_tokens"],
             usage_event["model_calls"][1]["prompt_tokens"],

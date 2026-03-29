@@ -303,6 +303,54 @@ def _normalize_document_path_for_lookup(document_path: str | None) -> str | None
     return normalized_path or None
 
 
+def _normalize_canvas_lookup_key(value) -> str | None:
+    normalized_value = _normalize_document_path_for_lookup(value)
+    if not normalized_value:
+        return None
+    return normalized_value.casefold()
+
+
+def _normalize_canvas_lookup_basename(value) -> str | None:
+    lookup_key = _normalize_canvas_lookup_key(value)
+    if not lookup_key:
+        return None
+    return lookup_key.rsplit("/", 1)[-1]
+
+
+def _find_canvas_document_by_path_locator(documents: list[dict], document_path: str | None) -> tuple[int, dict] | None:
+    lookup_key = _normalize_canvas_lookup_key(document_path)
+    if not lookup_key:
+        return None
+
+    exact_title_matches = []
+    basename_matches = []
+    lookup_basename = _normalize_canvas_lookup_basename(document_path)
+
+    for index, document in enumerate(documents):
+        path_key = _normalize_canvas_lookup_key(document.get("path"))
+        if path_key == lookup_key:
+            return index, document
+
+        title_key = _normalize_canvas_lookup_key(document.get("title"))
+        if title_key == lookup_key:
+            exact_title_matches.append((index, document))
+            continue
+
+        if not lookup_basename:
+            continue
+        if path_key and path_key.rsplit("/", 1)[-1] == lookup_basename:
+            basename_matches.append((index, document))
+            continue
+        if title_key and title_key.rsplit("/", 1)[-1] == lookup_basename:
+            basename_matches.append((index, document))
+
+    if len(exact_title_matches) == 1:
+        return exact_title_matches[0]
+    if len(basename_matches) == 1:
+        return basename_matches[0]
+    return None
+
+
 def extract_canvas_primary_locator(document: dict | None) -> dict | None:
     if not isinstance(document, dict):
         return None
@@ -636,9 +684,9 @@ def _find_canvas_document(
 
     normalized_path = _normalize_document_path_for_lookup(document_path)
     if normalized_path:
-        for index, document in enumerate(documents):
-            if str(document.get("path") or "").strip().lower() == normalized_path.lower():
-                return index, document
+        match = _find_canvas_document_by_path_locator(documents, normalized_path)
+        if match:
+            return match
         raise ValueError(f"Canvas document not found for path: {normalized_path}")
 
     target_id = str(document_id or runtime_state.get("active_document_id") or "").strip()
@@ -1030,10 +1078,15 @@ def find_latest_canvas_document(
 ) -> dict | None:
     target_id = str(document_id or "").strip()
     target_path = _normalize_document_path_for_lookup(document_path)
-    for document in reversed(find_latest_canvas_documents(messages)):
-        if target_path and str(document.get("path") or "").strip().lower() == target_path.lower():
+    documents = list(reversed(find_latest_canvas_documents(messages)))
+    if target_path:
+        match = _find_canvas_document_by_path_locator(documents, target_path)
+        if match:
+            _, document = match
             return dict(document)
-        if not target_path and (not target_id or document.get("id") == target_id):
+        return None
+    for document in documents:
+        if not target_id or document.get("id") == target_id:
             return dict(document)
     return None
 

@@ -1079,6 +1079,8 @@ def _normalize_message_usage_call(value: dict | None) -> dict | None:
         "message_count",
         "tool_schema_tokens",
         "prompt_tokens",
+        "prompt_cache_hit_tokens",
+        "prompt_cache_miss_tokens",
         "completion_tokens",
         "total_tokens",
         "estimated_input_tokens",
@@ -1123,6 +1125,8 @@ def _normalize_message_usage(value: dict | None) -> dict | None:
     cleaned = {}
     for key in (
         "prompt_tokens",
+        "prompt_cache_hit_tokens",
+        "prompt_cache_miss_tokens",
         "completion_tokens",
         "total_tokens",
         "estimated_input_tokens",

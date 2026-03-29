@@ -2580,9 +2580,20 @@ function getMaxInputTokensPerCall(modelCalls, fallbackPromptTokens = 0) {
   return Math.max(0, Math.round(toFiniteNumber(fallbackPromptTokens, 0)));
 }
 
+function hasCacheUsageMetrics(entry) {
+  return Boolean(
+    entry && typeof entry === "object" && (
+      entry.prompt_cache_hit_tokens !== null ||
+      entry.prompt_cache_miss_tokens !== null
+    )
+  );
+}
+
 function normalizeModelCallPayload(callEntry) {
   const source = callEntry && typeof callEntry === "object" ? callEntry : {};
   const promptTokens = toNonNegativeIntOrNull(source.prompt_tokens);
+  const promptCacheHitTokens = toNonNegativeIntOrNull(source.prompt_cache_hit_tokens);
+  const promptCacheMissTokens = toNonNegativeIntOrNull(source.prompt_cache_miss_tokens);
   const completionTokens = toNonNegativeIntOrNull(source.completion_tokens);
   const totalTokens = toNonNegativeIntOrNull(source.total_tokens);
   const estimatedTarget = promptTokens ?? toNonNegativeIntOrNull(source.estimated_input_tokens);
@@ -2597,6 +2608,8 @@ function normalizeModelCallPayload(callEntry) {
     message_count: toNonNegativeIntOrNull(source.message_count),
     tool_schema_tokens: toNonNegativeIntOrNull(source.tool_schema_tokens),
     prompt_tokens: promptTokens,
+    prompt_cache_hit_tokens: promptCacheHitTokens,
+    prompt_cache_miss_tokens: promptCacheMissTokens,
     completion_tokens: completionTokens,
     total_tokens: totalTokens,
     estimated_input_tokens: estimatedTarget ?? sumBreakdown(inputBreakdown),
@@ -2608,6 +2621,8 @@ function normalizeModelCallPayload(callEntry) {
 function normalizeUsagePayload(usage) {
   const source = usage && typeof usage === "object" ? usage : {};
   const promptTokens = Math.max(0, Math.round(toFiniteNumber(source.prompt_tokens, 0)));
+  const promptCacheHitTokens = toNonNegativeIntOrNull(source.prompt_cache_hit_tokens);
+  const promptCacheMissTokens = toNonNegativeIntOrNull(source.prompt_cache_miss_tokens);
   const estimatedSourceTokens = Math.max(0, Math.round(toFiniteNumber(source.estimated_input_tokens, 0)));
   const inputBreakdown = normalizeBreakdown(source.input_breakdown, promptTokens || estimatedSourceTokens || null);
   const modelCalls = Array.isArray(source.model_calls)
@@ -2625,6 +2640,8 @@ function normalizeUsagePayload(usage) {
 
   return {
     prompt_tokens: promptTokens,
+    prompt_cache_hit_tokens: promptCacheHitTokens,
+    prompt_cache_miss_tokens: promptCacheMissTokens,
     completion_tokens: Math.max(0, Math.round(toFiniteNumber(source.completion_tokens, 0))),
     total_tokens: Math.max(0, Math.round(toFiniteNumber(source.total_tokens, 0))),
     estimated_input_tokens: estimatedInputTokens,
@@ -2736,6 +2753,12 @@ function renderModelCallItem(call) {
   const promptStat = call.prompt_tokens !== null
     ? `<span class="turn-call-stat">${fmt(call.prompt_tokens)} prompt</span>`
     : `<span class="turn-call-stat">${fmt(call.estimated_input_tokens)} estimated prompt</span>`;
+  const cacheHitStat = call.prompt_cache_hit_tokens !== null
+    ? `<span class="turn-call-stat">${fmt(call.prompt_cache_hit_tokens)} cache hit</span>`
+    : "";
+  const cacheMissStat = call.prompt_cache_miss_tokens !== null
+    ? `<span class="turn-call-stat">${fmt(call.prompt_cache_miss_tokens)} cache miss</span>`
+    : "";
   const completionStat = call.completion_tokens !== null
     ? `<span class="turn-call-stat">${fmt(call.completion_tokens)} completion</span>`
     : "";
@@ -2756,7 +2779,7 @@ function renderModelCallItem(call) {
         missingBadge +
       `</div>` +
       `<div class="turn-call-meta">` +
-        promptStat + completionStat + messageCountStat + schemaStat +
+        promptStat + cacheHitStat + cacheMissStat + completionStat + messageCountStat + schemaStat +
       `</div>` +
       `<div class="turn-call-breakdown">${renderBreakdownChips(call.input_breakdown, "turn-call-breakdown-chip")}</div>` +
     `</div>`
@@ -2796,17 +2819,29 @@ function renderModelCallDrawer(turn) {
 
 function renderTokenStats() {
   const totalUser = tokenTurns.reduce((sum, turn) => sum + turn.prompt_tokens, 0);
+  const totalCacheHit = tokenTurns.reduce((sum, turn) => sum + toFiniteNumber(turn.prompt_cache_hit_tokens, 0), 0);
+  const totalCacheMiss = tokenTurns.reduce((sum, turn) => sum + toFiniteNumber(turn.prompt_cache_miss_tokens, 0), 0);
   const totalAsst = tokenTurns.reduce((sum, turn) => sum + turn.completion_tokens, 0);
   const grandTotal = tokenTurns.reduce((sum, turn) => sum + turn.total_tokens, 0);
   const totalCost = tokenTurns.reduce((sum, turn) => sum + turn.cost, 0);
   const sessionBreakdown = aggregateBreakdown(tokenTurns);
   const lastTurn = tokenTurns.length ? tokenTurns[tokenTurns.length - 1] : null;
+  const sessionHasCacheMetrics = tokenTurns.some(hasCacheUsageMetrics);
+  const lastTurnHasCacheMetrics = hasCacheUsageMetrics(lastTurn);
 
   document.getElementById("stat-user").textContent = fmt(totalUser);
+  document.getElementById("stat-cache-hit").textContent = sessionHasCacheMetrics ? fmt(totalCacheHit) : "—";
+  document.getElementById("stat-cache-miss").textContent = sessionHasCacheMetrics ? fmt(totalCacheMiss) : "—";
   document.getElementById("stat-asst").textContent = fmt(totalAsst);
   document.getElementById("stat-total").textContent = fmt(grandTotal);
   document.getElementById("stat-cost").textContent = "$" + totalCost.toFixed(6);
   document.getElementById("stat-last-input").textContent = lastTurn ? fmt(lastTurn.prompt_tokens) : "—";
+  document.getElementById("stat-last-cache-hit").textContent = lastTurnHasCacheMetrics
+    ? fmt(toFiniteNumber(lastTurn.prompt_cache_hit_tokens, 0))
+    : "—";
+  document.getElementById("stat-last-cache-miss").textContent = lastTurnHasCacheMetrics
+    ? fmt(toFiniteNumber(lastTurn.prompt_cache_miss_tokens, 0))
+    : "—";
   document.getElementById("stat-last-peak-input").textContent = lastTurn
     ? fmt(lastTurn.max_input_tokens_per_call)
     : "—";
@@ -2846,6 +2881,12 @@ function renderTokenStats() {
         const promptCapStat = turn.configured_prompt_max_input_tokens !== null
           ? `<span class="turn-stat">${fmt(turn.configured_prompt_max_input_tokens)} per-call prompt cap</span>`
           : "";
+        const cacheHitStat = hasCacheUsageMetrics(turn)
+          ? `<span class="turn-stat">${fmt(toFiniteNumber(turn.prompt_cache_hit_tokens, 0))} cache hit</span>`
+          : "";
+        const cacheMissStat = hasCacheUsageMetrics(turn)
+          ? `<span class="turn-stat">${fmt(toFiniteNumber(turn.prompt_cache_miss_tokens, 0))} cache miss</span>`
+          : "";
         return (
         `<div class="turn-item">` +
           `<div class="turn-header">` +
@@ -2860,6 +2901,8 @@ function renderTokenStats() {
             `<span class="turn-stat"><span class="stats-dot dot-user"></span>${fmt(turn.prompt_tokens)} prompt (all calls)</span>` +
             peakPromptStat +
             promptCapStat +
+            cacheHitStat +
+            cacheMissStat +
             `<span class="turn-stat"><span class="stats-dot dot-asst"></span>${fmt(turn.completion_tokens)} completion</span>` +
             `<span class="turn-stat">${fmt(turn.total_tokens)} total</span>` +
             (turn.cost ? `<span class="turn-stat cost-stat">$${turn.cost.toFixed(6)}</span>` : "") +

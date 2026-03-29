@@ -188,10 +188,60 @@ def _get_agent_trace_logger():
 
 def get_model_pricing(model_id: str) -> dict:
     pricing = {
-        "deepseek-chat": {"input": 0.28, "output": 0.42},
-        "deepseek-reasoner": {"input": 0.28, "output": 0.42},
+        "deepseek-chat": {"input": 0.28, "input_cache_hit": 0.028, "output": 0.42},
+        "deepseek-reasoner": {"input": 0.28, "input_cache_hit": 0.028, "output": 0.42},
     }
-    return pricing.get(model_id, {"input": 0, "output": 0})
+    return pricing.get(model_id, {"input": 0, "input_cache_hit": 0, "output": 0})
+
+
+def _coerce_usage_int(value) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _extract_usage_metrics(usage) -> dict[str, int]:
+    fields = (
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "prompt_cache_hit_tokens",
+        "prompt_cache_miss_tokens",
+    )
+    payload: dict = {}
+
+    if isinstance(usage, dict):
+        payload.update(usage)
+    elif usage is not None:
+        model_dump = getattr(usage, "model_dump", None)
+        if callable(model_dump):
+            try:
+                dumped = model_dump()
+            except TypeError:
+                dumped = None
+            if isinstance(dumped, dict):
+                payload.update(dumped)
+        else:
+            dict_method = getattr(usage, "dict", None)
+            if callable(dict_method):
+                try:
+                    dumped = dict_method()
+                except TypeError:
+                    dumped = None
+                if isinstance(dumped, dict):
+                    payload.update(dumped)
+
+        model_extra = getattr(usage, "model_extra", None)
+        if isinstance(model_extra, dict):
+            payload.update(model_extra)
+
+        for key in fields:
+            attr_value = getattr(usage, key, None)
+            if attr_value is not None:
+                payload[key] = attr_value
+
+    return {key: _coerce_usage_int(payload.get(key)) for key in fields}
 
 
 def _empty_input_breakdown() -> dict[str, int]:
@@ -2578,6 +2628,8 @@ def run_agent_stream(
     canvas_modified = False
     usage_totals = {
         "prompt_tokens": 0,
+        "prompt_cache_hit_tokens": 0,
+        "prompt_cache_miss_tokens": 0,
         "completion_tokens": 0,
         "total_tokens": 0,
         "estimated_input_tokens": 0,
@@ -2633,24 +2685,65 @@ def run_agent_stream(
 
     def add_usage(usage):
         if not usage:
-            return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "received": False}
+            return {
+                "prompt_tokens": 0,
+                "prompt_cache_hit_tokens": 0,
+                "prompt_cache_miss_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "received": False,
+            }
 
-        prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
-        completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
-        total_tokens = int(getattr(usage, "total_tokens", 0) or 0)
+        metrics = _extract_usage_metrics(usage)
+        prompt_tokens = metrics["prompt_tokens"]
+        prompt_cache_hit_tokens = metrics["prompt_cache_hit_tokens"]
+        prompt_cache_miss_tokens = metrics["prompt_cache_miss_tokens"]
+        completion_tokens = metrics["completion_tokens"]
+        total_tokens = metrics["total_tokens"]
 
         usage_totals["prompt_tokens"] += prompt_tokens
+        usage_totals["prompt_cache_hit_tokens"] += prompt_cache_hit_tokens
+        usage_totals["prompt_cache_miss_tokens"] += prompt_cache_miss_tokens
         usage_totals["completion_tokens"] += completion_tokens
         usage_totals["total_tokens"] += total_tokens
         return {
             "prompt_tokens": prompt_tokens,
+            "prompt_cache_hit_tokens": prompt_cache_hit_tokens,
+            "prompt_cache_miss_tokens": prompt_cache_miss_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": total_tokens,
-            "received": any(value > 0 for value in (prompt_tokens, completion_tokens, total_tokens)),
+            "received": any(
+                value > 0
+                for value in (
+                    prompt_tokens,
+                    prompt_cache_hit_tokens,
+                    prompt_cache_miss_tokens,
+                    completion_tokens,
+                    total_tokens,
+                )
+            ),
         }
 
-    def calculate_cost(prompt_tokens, completion_tokens):
-        input_cost = (prompt_tokens / 1_000_000) * pricing["input"]
+    def calculate_cost(
+        prompt_tokens,
+        completion_tokens,
+        prompt_cache_hit_tokens=0,
+        prompt_cache_miss_tokens=None,
+    ):
+        prompt_tokens = _coerce_usage_int(prompt_tokens)
+        completion_tokens = _coerce_usage_int(completion_tokens)
+        prompt_cache_hit_tokens = _coerce_usage_int(prompt_cache_hit_tokens)
+        if prompt_cache_miss_tokens is None:
+            prompt_cache_miss_tokens = prompt_tokens if prompt_cache_hit_tokens <= 0 else max(0, prompt_tokens - prompt_cache_hit_tokens)
+        else:
+            prompt_cache_miss_tokens = _coerce_usage_int(prompt_cache_miss_tokens)
+            accounted_prompt_tokens = prompt_cache_hit_tokens + prompt_cache_miss_tokens
+            if prompt_tokens > accounted_prompt_tokens:
+                prompt_cache_miss_tokens += prompt_tokens - accounted_prompt_tokens
+
+        cache_hit_input_rate = pricing.get("input_cache_hit", pricing["input"]) or pricing["input"]
+        input_cost = (prompt_cache_hit_tokens / 1_000_000) * cache_hit_input_rate
+        input_cost += (prompt_cache_miss_tokens / 1_000_000) * pricing["input"]
         output_cost = (completion_tokens / 1_000_000) * pricing["output"]
         return round(input_cost + output_cost, 6)
 
@@ -2700,10 +2793,20 @@ def run_agent_stream(
             usage_totals["model_calls"],
             fallback_input_tokens=usage_totals["prompt_tokens"],
         )
-        total_cost = calculate_cost(usage_totals["prompt_tokens"], usage_totals["completion_tokens"])
+        cache_usage_available = (
+            usage_totals["prompt_cache_hit_tokens"] > 0 or usage_totals["prompt_cache_miss_tokens"] > 0
+        )
+        total_cost = calculate_cost(
+            usage_totals["prompt_tokens"],
+            usage_totals["completion_tokens"],
+            prompt_cache_hit_tokens=usage_totals["prompt_cache_hit_tokens"],
+            prompt_cache_miss_tokens=usage_totals["prompt_cache_miss_tokens"] if cache_usage_available else None,
+        )
         return {
             "type": "usage",
             "prompt_tokens": usage_totals["prompt_tokens"],
+            "prompt_cache_hit_tokens": usage_totals["prompt_cache_hit_tokens"],
+            "prompt_cache_miss_tokens": usage_totals["prompt_cache_miss_tokens"],
             "completion_tokens": usage_totals["completion_tokens"],
             "total_tokens": usage_totals["total_tokens"],
             "estimated_input_tokens": usage_totals["estimated_input_tokens"],
@@ -2759,7 +2862,14 @@ def run_agent_stream(
     ) -> dict:
         turn_reasoning_emitted = False
         turn_tools = []
-        provider_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "received": False}
+        provider_usage = {
+            "prompt_tokens": 0,
+            "prompt_cache_hit_tokens": 0,
+            "prompt_cache_miss_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "received": False,
+        }
         _trace_agent_event(
             "model_turn_started",
             trace_id=trace_id,
@@ -2811,6 +2921,8 @@ def run_agent_stream(
                     "message_count": len(messages_to_send),
                     "tool_schema_tokens": tool_schema_tokens,
                     "prompt_tokens": provider_usage["prompt_tokens"] if provider_usage["received"] else None,
+                    "prompt_cache_hit_tokens": provider_usage["prompt_cache_hit_tokens"] if provider_usage["received"] else None,
+                    "prompt_cache_miss_tokens": provider_usage["prompt_cache_miss_tokens"] if provider_usage["received"] else None,
                     "completion_tokens": provider_usage["completion_tokens"] if provider_usage["received"] else None,
                     "total_tokens": provider_usage["total_tokens"] if provider_usage["received"] else None,
                     "estimated_input_tokens": estimated_input_tokens,
@@ -2914,6 +3026,8 @@ def run_agent_stream(
                 if getattr(chunk, "usage", None):
                     usage_snapshot = add_usage(chunk.usage)
                     provider_usage["prompt_tokens"] += usage_snapshot["prompt_tokens"]
+                    provider_usage["prompt_cache_hit_tokens"] += usage_snapshot["prompt_cache_hit_tokens"]
+                    provider_usage["prompt_cache_miss_tokens"] += usage_snapshot["prompt_cache_miss_tokens"]
                     provider_usage["completion_tokens"] += usage_snapshot["completion_tokens"]
                     provider_usage["total_tokens"] += usage_snapshot["total_tokens"]
                     provider_usage["received"] = provider_usage["received"] or usage_snapshot["received"]

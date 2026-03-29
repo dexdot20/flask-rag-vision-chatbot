@@ -536,6 +536,7 @@ def build_runtime_system_message(
     active_tool_names = resolve_runtime_tool_names(active_tool_names or [], canvas_documents=canvas_documents)
     
     parts = ["You are a helpful AI assistant. You must respect the rules and guidelines provided below.\n"]
+    volatile_parts: list[str] = []
 
     # User preferences
     if preferences_text:
@@ -571,37 +572,37 @@ def build_runtime_system_message(
 
     normalized_tool_trace_context = str(tool_trace_context or "").strip()
     if normalized_tool_trace_context:
-        parts.append("## Tool Execution History")
-        parts.append(
+        volatile_parts.append("## Tool Execution History")
+        volatile_parts.append(
             "*Use this as recent operational memory about which tools were already tried, what they returned, and which paths should not be repeated without a concrete reason.*\n"
         )
-        parts.append(normalized_tool_trace_context)
-        parts.append("")
+        volatile_parts.append(normalized_tool_trace_context)
+        volatile_parts.append("")
 
     tool_memory_payload = _build_tool_memory_payload(tool_memory_context, active_tool_names)
     if tool_memory_payload:
-        parts.append("## Tool Memory")
+        volatile_parts.append("## Tool Memory")
         if "guidance" in tool_memory_payload:
-            parts.append(f"*{tool_memory_payload['guidance']}*\n")
+            volatile_parts.append(f"*{tool_memory_payload['guidance']}*\n")
         if tool_memory_payload.get("auto_injected_context"):
             if isinstance(tool_memory_payload["auto_injected_context"], str):
-                parts.append(tool_memory_payload["auto_injected_context"])
+                volatile_parts.append(tool_memory_payload["auto_injected_context"])
             else:
-                parts.append(json.dumps(tool_memory_payload["auto_injected_context"], ensure_ascii=False, indent=2))
-        parts.append("")
+                volatile_parts.append(json.dumps(tool_memory_payload["auto_injected_context"], ensure_ascii=False, indent=2))
+        volatile_parts.append("")
         
     # Knowledge Base / RAG Context
     kb_payload = _build_knowledge_base_payload(retrieved_context, active_tool_names)
     if kb_payload:
-        parts.append("## Knowledge Base")
+        volatile_parts.append("## Knowledge Base")
         if "guidance" in kb_payload:
-            parts.append(f"*{kb_payload['guidance']}*\n")
+            volatile_parts.append(f"*{kb_payload['guidance']}*\n")
         if kb_payload.get("auto_injected_context"):
             if isinstance(kb_payload["auto_injected_context"], str):
-                parts.append(kb_payload["auto_injected_context"])
+                volatile_parts.append(kb_payload["auto_injected_context"])
             else:
-                parts.append(json.dumps(kb_payload["auto_injected_context"], ensure_ascii=False, indent=2))
-        parts.append("")
+                volatile_parts.append(json.dumps(kb_payload["auto_injected_context"], ensure_ascii=False, indent=2))
+        volatile_parts.append("")
 
     # Policies
     policies = []
@@ -624,8 +625,8 @@ def build_runtime_system_message(
         parts.append("- Review: Prefer returned unified diffs or preview_workspace_changes before high-impact rewrites, and use workspace undo/redo tools for recovery.\n")
 
     if isinstance(project_workflow, dict) and project_workflow:
-        parts.append("## Project Workflow")
-        parts.append("```json\n" + json.dumps(project_workflow, ensure_ascii=False, indent=2) + "\n```\n")
+        volatile_parts.append("## Project Workflow")
+        volatile_parts.append("```json\n" + json.dumps(project_workflow, ensure_ascii=False, indent=2) + "\n```\n")
 
     canvas_payload = _build_canvas_prompt_payload(
         canvas_documents,
@@ -633,37 +634,37 @@ def build_runtime_system_message(
         max_lines=canvas_prompt_max_lines or CANVAS_PROMPT_MAX_LINES,
     )
     if canvas_payload:
-        parts.extend(_build_canvas_workspace_summary(canvas_payload))
+        volatile_parts.extend(_build_canvas_workspace_summary(canvas_payload))
         active_document = canvas_payload["active_document"]
-        parts.append("## Active Canvas Document")
-        parts.append(f"- Working mode: {canvas_payload['mode']}")
-        parts.append(f"- Document count: {canvas_payload['document_count']}")
-        parts.append(f"- Active document id: {active_document['id']}")
-        parts.append(f"- Title: {active_document['title']}")
+        volatile_parts.append("## Active Canvas Document")
+        volatile_parts.append(f"- Working mode: {canvas_payload['mode']}")
+        volatile_parts.append(f"- Document count: {canvas_payload['document_count']}")
+        volatile_parts.append(f"- Active document id: {active_document['id']}")
+        volatile_parts.append(f"- Title: {active_document['title']}")
         if active_document.get("path"):
-            parts.append(f"- Path: {active_document['path']}")
+            volatile_parts.append(f"- Path: {active_document['path']}")
         if active_document.get("role"):
-            parts.append(f"- Role: {active_document['role']}")
-        parts.append(f"- Format: {active_document['format']}")
+            volatile_parts.append(f"- Role: {active_document['role']}")
+        volatile_parts.append(f"- Format: {active_document['format']}")
         if active_document.get("language"):
-            parts.append(f"- Language: {active_document['language']}")
+            volatile_parts.append(f"- Language: {active_document['language']}")
         if active_document.get("summary"):
-            parts.append(f"- Summary: {active_document['summary']}")
-        parts.append(f"- Total lines: {canvas_payload['total_lines']}")
-        parts.append(
+            volatile_parts.append(f"- Summary: {active_document['summary']}")
+        volatile_parts.append(f"- Total lines: {canvas_payload['total_lines']}")
+        volatile_parts.append(
             f"- Visible lines in prompt: 1-{canvas_payload['visible_line_end']}"
             + (" (truncated excerpt)" if canvas_payload["is_truncated"] else "")
         )
-        parts.append(
+        volatile_parts.append(
             "- Guidance: Use visible line numbers for line-level canvas edits. "
             "If you do not know the document_id, target by document_path from the workspace summary or active file label instead. "
             "If this excerpt is truncated, call expand_canvas_document for a larger view or scroll_canvas_document for a targeted range before editing. "
             "Never guess line numbers outside the visible excerpt."
         )
         if canvas_payload["visible_lines"]:
-            parts.append("```text\n" + "\n".join(canvas_payload["visible_lines"]) + "\n```\n")
+            volatile_parts.append("```text\n" + "\n".join(canvas_payload["visible_lines"]) + "\n```\n")
         else:
-            parts.append("(The active canvas document is empty.)\n")
+            volatile_parts.append("(The active canvas document is empty.)\n")
 
     canvas_editing_guidance = _build_canvas_editing_guidance(active_tool_names, canvas_payload)
     if canvas_editing_guidance:
@@ -688,6 +689,8 @@ def build_runtime_system_message(
         for rule in contract["rules"]:
             parts.append(f"- {rule}")
         parts.append("")
+
+    parts.extend(volatile_parts)
 
     if include_time_context:
         parts.append(_build_current_time_context(now))
