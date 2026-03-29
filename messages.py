@@ -484,6 +484,18 @@ def _build_canvas_editing_guidance(active_tool_names: list[str], canvas_payload:
         "- If you do not know the document_id, use the document_path from the workspace summary, active file label, or manifest; document_id is optional.",
         "- Use rewrite_canvas_document when most of the document should change or when you already know the complete intended replacement content.",
         "- Multiple canvas tool calls in one answer are fine when needed: inspect, then edit, then create or update other files.",
+        "- When using replace_canvas_lines or insert_canvas_lines, ALL code content must be placed INSIDE the `lines` array as properly escaped JSON strings. "
+        'Example: {"start_line": 2, "end_line": 3, "lines": ["const char* ssid = \\"MyNet\\";", "const char* pass = \\"abc\\";"]}. '
+        "Never put code outside the lines array, never use code identifiers as argument keys.",
+        "## Code Document Rules",
+        "- For any source code file, use format='code' and set the language (e.g. python, cpp, javascript, bash). "
+        "If path is given (e.g. sketch.ino, src/app.py), format and language are inferred from the extension automatically.",
+        "- The content of a code document is raw source code — do NOT wrap it in triple-backtick fences. "
+        "Fences are added automatically by the renderer.",
+        "- When editing code lines, preserve the original indentation exactly. "
+        "Each element of the lines array is one complete line; spaces and tabs matter.",
+        "- If the visible excerpt says [Excerpt: lines 1\u2013N of M], the document has M lines total. "
+        "Use scroll_canvas_document to navigate to any hidden region before editing those lines.",
     ]
     if (canvas_payload or {}).get("mode") == "project":
         lines.append("- In project mode, prefer document_path for targeting; it is enough even when you do not know the document_id yet, and keep one file per canvas document.")

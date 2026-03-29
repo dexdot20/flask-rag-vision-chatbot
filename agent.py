@@ -138,6 +138,7 @@ TOOL_ARGUMENT_CODE_FENCE_RE = re.compile(
     r'^\s*```(?:json|javascript|js|python|py)?\s*(?P<body>.*?)\s*```\s*$',
     re.IGNORECASE | re.DOTALL,
 )
+_VALID_IDENTIFIER_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 TOOL_ARGUMENT_LANGUAGE_LABELS = {"json", "javascript", "js", "python", "py"}
 WEB_TOOL_NAMES = {
     "search_web",
@@ -1061,7 +1062,7 @@ def _parse_json_like_text(text: str):
     except Exception:
         pass
 
-    if _repair_json is not None:
+    if _repair_json is not None and raw_text.lstrip().startswith("{"):
         try:
             repaired = _repair_json(raw_text, return_objects=True, ensure_ascii=False)
             if isinstance(repaired, (dict, list)):
@@ -1653,6 +1654,15 @@ def _validate_tool_arguments(tool_name: str, tool_args: dict) -> str | None:
     for field_name in required:
         if field_name not in tool_args:
             return f"Missing required argument '{field_name}' for {tool_name}"
+
+    # Strip keys that are clearly not valid property names (e.g. code content that leaked
+    # into a key position due to model serialisation errors: contains ';', '*', '=', spaces, etc.).
+    bogus_keys = [
+        k for k in list(tool_args)
+        if k not in properties and not _VALID_IDENTIFIER_RE.match(k)
+    ]
+    for bk in bogus_keys:
+        del tool_args[bk]
 
     for key, value in tool_args.items():
         property_schema = properties.get(key)

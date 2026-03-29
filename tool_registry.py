@@ -40,7 +40,11 @@ def build_canvas_decision_matrix(
                     else "You need a brand-new file, draft, or artifact."
                 ),
                 "tool": "create_canvas_document",
-                "notes": "Create one file or artifact per canvas document. After the file exists, prefer localized line edits for partial changes instead of full rewrites.",
+                "notes": (
+                    "For source code, set format='code' and language (e.g. python, cpp, javascript, bash). "
+                    "If path is set (e.g. src/main.py, sketch.ino), format and language are inferred automatically from the extension. "
+                    "Create one file per canvas document. After the file exists, prefer localized line edits for partial changes."
+                ),
             }
         )
     if enabled("rewrite_canvas_document"):
@@ -928,7 +932,11 @@ TOOL_SPECS = [
                 },
                 "content": {
                     "type": "string",
-                    "description": "Full markdown content for the new canvas document."
+                    "description": (
+                        "Full document content. "
+                        "For format='code' documents this is raw source code without any markdown wrapper — no triple-backtick fences. "
+                        "For format='markdown' documents this is the markdown body."
+                    )
                 },
                 "format": {
                     "type": "string",
@@ -987,10 +995,10 @@ TOOL_SPECS = [
             "purpose": "Creates an editable canvas document attached to the conversation, optionally as part of a project workspace.",
             "inputs": {
                 "title": "document title",
-                "content": "full markdown body",
-                "format": "currently markdown",
-                "language": "optional dominant code language",
-                "path": "optional project-relative file path",
+                "content": "full document body (raw source code for code format; markdown body for markdown format — no fences around code)",
+                "format": "markdown or code — set code for source files, scripts, configs, and any file with a code extension",
+                "language": "dominant code language e.g. python, cpp, javascript, bash, sql; auto-inferred from path extension if omitted",
+                "path": "optional project-relative file path e.g. src/app.py, sketch.ino, config.yaml",
                 "role": "optional semantic document role",
                 "summary": "optional short responsibility summary",
                 "imports": "optional referenced modules, files, or config keys",
@@ -1001,7 +1009,9 @@ TOOL_SPECS = [
                 "workspace_id": "optional workspace identifier"
             },
             "guidance": (
-                "Use this when the user would benefit from a persistent artifact that can be revised. "
+                "For source code files, always set format='code' and language so the document renders with syntax highlighting. "
+                "If path is provided (e.g. sketch.ino, src/main.py), format and language are inferred automatically — you can omit them. "
+                "The content field must contain raw code — do NOT wrap it in triple-backtick fences. "
                 "Prefer creating the document before line-level edits. "
                 "Keep one file or artifact per canvas document instead of bundling multiple files together. "
                 "Once the document exists, prefer localized line edits for partial changes. "
@@ -1017,7 +1027,11 @@ TOOL_SPECS = [
             "properties": {
                 "content": {
                     "type": "string",
-                    "description": "The full replacement markdown content."
+                    "description": (
+                        "The full replacement content. "
+                        "For code documents this is raw source code without any markdown wrapper — no triple-backtick fences. "
+                        "For markdown documents this is the markdown body."
+                    )
                 },
                 "title": {
                     "type": "string",
@@ -1107,7 +1121,13 @@ TOOL_SPECS = [
                 "lines": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Replacement lines without trailing newline characters."
+                    "description": (
+                        "Replacement lines. Each element is one line of text as a properly quoted JSON string — "
+                        "no trailing newline characters. Code content (including quotes, backslashes, semicolons) "
+                        "must appear INSIDE these strings, properly escaped. "
+                        'Example: ["const char* ssid = \\"MyNet\\";", "const char* pass = \\"abc\\";"]. '
+                        "Never place code outside this array or as an argument key."
+                    )
                 },
                 "document_id": {
                     "type": "string",
@@ -1122,9 +1142,11 @@ TOOL_SPECS = [
         },
         "prompt": {
             "purpose": "Replaces specific lines in the canvas document.",
-            "inputs": {"start_line": "first line", "end_line": "last line", "lines": "replacement lines", "document_id": "optional target id", "document_path": "optional target project-relative path"},
+            "inputs": {"start_line": "first line", "end_line": "last line", "lines": "replacement lines as JSON string array", "document_id": "optional target id", "document_path": "optional target project-relative path"},
             "guidance": (
                 "Use only when the exact 1-based line range is known from the visible excerpt or a recent scroll/expand result. "
+                "Put ALL code content inside the lines array as properly escaped JSON strings. "
+                'Example: {"start_line": 3, "end_line": 5, "lines": ["  int x = 1;", "  return x;"]}. '
                 "Multiple localized replace_canvas_lines calls are fine when the changes are separated. "
                 "If you do not know the document_id, use document_path from the workspace summary or manifest. "
                 "For broad rewrites, prefer rewrite_canvas_document. In project mode, prefer document_path when possible."
@@ -1141,7 +1163,11 @@ TOOL_SPECS = [
                 "lines": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "New lines without trailing newline characters."
+                    "description": (
+                        "New lines to insert. Each element is one line of text as a properly quoted JSON string — "
+                        "no trailing newline characters. Code content must appear INSIDE these strings, properly escaped. "
+                        "Never place code outside this array or as an argument key."
+                    )
                 },
                 "document_id": {
                     "type": "string",

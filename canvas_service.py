@@ -90,6 +90,69 @@ def _normalize_canvas_language(value) -> str | None:
     return language or None
 
 
+_EXTENSION_LANGUAGE_MAP: dict[str, str] = {
+    ".py": "python", ".pyw": "python",
+    ".js": "javascript", ".mjs": "javascript", ".cjs": "javascript",
+    ".ts": "typescript", ".mts": "typescript",
+    ".jsx": "jsx", ".tsx": "tsx",
+    ".c": "c", ".h": "c",
+    ".cpp": "cpp", ".cc": "cpp", ".cxx": "cpp", ".hpp": "cpp", ".hh": "cpp",
+    ".ino": "cpp",  # Arduino
+    ".cs": "csharp",
+    ".java": "java",
+    ".rb": "ruby",
+    ".go": "go",
+    ".rs": "rust",
+    ".php": "php",
+    ".swift": "swift",
+    ".kt": "kotlin", ".kts": "kotlin",
+    ".scala": "scala",
+    ".sh": "bash", ".bash": "bash", ".zsh": "bash",
+    ".ps1": "powershell", ".psm1": "powershell",
+    ".html": "html", ".htm": "html",
+    ".css": "css", ".scss": "scss", ".sass": "sass", ".less": "less",
+    ".sql": "sql",
+    ".json": "json", ".jsonc": "json",
+    ".yaml": "yaml", ".yml": "yaml",
+    ".toml": "toml",
+    ".ini": "ini", ".cfg": "ini",
+    ".xml": "xml",
+    ".md": "markdown", ".mdx": "markdown",
+    ".r": "r",
+    ".lua": "lua",
+    ".dart": "dart",
+    ".ex": "elixir", ".exs": "elixir",
+    ".hs": "haskell",
+    ".tf": "terraform", ".tfvars": "terraform",
+    ".proto": "protobuf",
+    ".vue": "vue",
+    ".svelte": "svelte",
+}
+_NAME_LANGUAGE_MAP: dict[str, str] = {
+    "dockerfile": "dockerfile",
+    "makefile": "makefile",
+    "gemfile": "ruby",
+    "rakefile": "ruby",
+    "vagrantfile": "ruby",
+    "jenkinsfile": "groovy",
+}
+
+
+def _infer_canvas_language(path_or_name: str | None) -> str | None:
+    if not path_or_name:
+        return None
+    name = str(path_or_name).rsplit("/", 1)[-1].lower().strip()
+    if not name:
+        return None
+    stem_lang = _NAME_LANGUAGE_MAP.get(name)
+    if stem_lang:
+        return stem_lang
+    dot_idx = name.rfind(".")
+    if dot_idx < 0:
+        return None
+    return _EXTENSION_LANGUAGE_MAP.get(name[dot_idx:])
+
+
 def _normalize_canvas_short_text(value, max_length: int) -> str | None:
     text = re.sub(r"\s+", " ", _normalize_line_endings(str(value or "")).strip())[:max_length]
     return text or None
@@ -531,13 +594,25 @@ def normalize_canvas_document(value, *, fallback_title: str = "Canvas") -> dict 
 
     document_id = str(value.get("id") or "").strip()[:80] or uuid4().hex
     title = str(value.get("title") or fallback_title).strip()[:CANVAS_MAX_TITLE_LENGTH] or fallback_title
-    format_name = str(value.get("format") or "markdown").strip().lower() or "markdown"
-    if format_name not in CANVAS_ALLOWED_FORMATS:
-        format_name = "markdown"
-
     content = _clip_text(value.get("content") or "", CANVAS_MAX_CONTENT_LENGTH)
-    language = _normalize_canvas_language(value.get("language"))
+
+    # Resolve path and language early so we can auto-infer format.
     path = _normalize_canvas_path(value.get("path"))
+    language = (
+        _normalize_canvas_language(value.get("language"))
+        or _infer_canvas_language(path)
+        or _infer_canvas_language(str(value.get("title") or "").strip())
+    )
+
+    # Promote format to "code" when path/title extension indicates source code and
+    # no explicit format was given by the caller.
+    explicit_format = str(value.get("format") or "").strip().lower()
+    if explicit_format in CANVAS_ALLOWED_FORMATS:
+        format_name = explicit_format
+    elif language and language != "markdown":
+        format_name = "code"
+    else:
+        format_name = "markdown"
     created_at = str(value.get("created_at") or "").strip()[:80]
     updated_at = str(value.get("updated_at") or "").strip()[:80]
     role = _normalize_canvas_role(value.get("role")) or _infer_canvas_role(path, title, format_name)
@@ -1013,6 +1088,12 @@ def build_canvas_document_context_result(
         max_lines=max_lines or CANVAS_CONTEXT_MAX_LINES,
         max_chars=max_chars,
     )
+    if is_truncated:
+        total = normalized.get("line_count") or 0
+        shown = len(numbered_lines)
+        numbered_lines = [f"[Excerpt: lines 1\u2013{shown} of {total}. Use scroll_canvas_document to view hidden lines.]", *numbered_lines]
+    else:
+        shown = len(numbered_lines)
     documents = get_canvas_runtime_documents(runtime_state)
     manifest = build_canvas_project_manifest(documents, active_document_id=get_canvas_runtime_active_document_id(runtime_state))
     relationship_map = build_canvas_relationship_map(documents)
@@ -1029,7 +1110,7 @@ def build_canvas_document_context_result(
         "summary": normalized.get("summary"),
         "line_count": normalized.get("line_count"),
         "visible_lines": numbered_lines,
-        "visible_line_end": len(numbered_lines),
+        "visible_line_end": shown,
         "is_truncated": is_truncated,
         "primary_locator": extract_canvas_primary_locator(normalized),
         "manifest_excerpt": {
