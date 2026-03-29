@@ -3107,21 +3107,25 @@ kbd {
   gap: 8px;
 }
 
+.rag-setting-group--full {
+  grid-column: 1 / -1;
+}
+
 .rag-source-type-list {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 12px;
+  grid-template-columns: 1fr;
+  gap: 10px;
   align-items: stretch;
 }
 
 .rag-source-toggle {
   display: grid;
   grid-template-columns: 18px minmax(0, 1fr);
-  column-gap: 10px;
+  column-gap: 12px;
   align-items: start;
   width: 100%;
   min-height: 100%;
-  padding: 14px 14px 13px;
+  padding: 14px 16px 13px;
   border: 1px solid var(--border);
   border-radius: 14px;
   background: rgba(255, 255, 255, 0.03);
@@ -4493,6 +4497,10 @@ body.login-page-body {
   .kb-actions-row__buttons > .btn-ghost,
   .kb-actions-row__buttons > .btn-primary {
     width: 100%;
+  }
+
+  .rag-source-toggle {
+    padding: 13px 14px;
   }
 }
 
