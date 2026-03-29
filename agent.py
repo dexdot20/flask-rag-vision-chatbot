@@ -2528,6 +2528,7 @@ def run_agent_stream(
             "tool_results": persisted_tool_results,
             "canvas_documents": current_canvas_documents,
             "active_document_id": active_canvas_document_id,
+            "canvas_modified": canvas_modified,
             "canvas_cleared": canvas_modified and not current_canvas_documents,
             "project_workflow": project_workflow,
         }

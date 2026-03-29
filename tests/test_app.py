@@ -94,6 +94,7 @@ from routes.chat import (
     _count_prunable_message_tokens,
     _estimate_prompt_tokens,
     _is_failed_tool_summary,
+    _persist_streaming_assistant_message,
     _select_recent_prompt_window,
     _select_summary_source_messages_by_token_budget,
     build_summary_prompt_messages,
@@ -1436,6 +1437,8 @@ class AppRoutesTestCase(unittest.TestCase):
         )
 
         content = message["content"]
+        self.assertIn("## Canvas Editing Guidance", content)
+        self.assertIn("Do not rewrite the whole document when only part needs to change", content)
         self.assertIn("## Tool Calling", content)
         self.assertIn("Native function calling is enabled for this turn.", content)
         self.assertNotIn("## Active Canvas Document", content)
@@ -1465,6 +1468,8 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn("- Language: python", content)
         self.assertIn("1: print('hello')", content)
         self.assertIn("2: print('world')", content)
+        self.assertIn("## Canvas Editing Guidance", content)
+        self.assertIn("Multiple canvas tool calls in one answer are fine", content)
         self.assertIn("## Canvas Decision Matrix", content)
         self.assertIn("| Situation | Preferred tool | Notes |", content)
         self.assertIn("create_canvas_document", content)
@@ -1535,11 +1540,21 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn("- Path: src/app.py", content)
         self.assertIn("- Role: source", content)
         self.assertIn("- Active document id: canvas-1", content)
+        self.assertIn("In project mode, prefer document_path for targeting", content)
         self.assertIn("## Canvas Decision Matrix", content)
         self.assertIn("Prefer document_path", content)
         self.assertNotIn("## Canvas Project Manifest", content)
         self.assertNotIn("## Canvas Relationship Map", content)
         self.assertNotIn("## Other Canvas Documents", content)
+
+    def test_canvas_tool_specs_prefer_smallest_valid_edit(self):
+        rewrite_guidance = TOOL_SPEC_BY_NAME["rewrite_canvas_document"]["prompt"]["guidance"]
+        replace_guidance = TOOL_SPEC_BY_NAME["replace_canvas_lines"]["prompt"]["guidance"]
+        scroll_description = TOOL_SPEC_BY_NAME["scroll_canvas_document"]["description"]
+
+        self.assertIn("Do not default to this when only part of the file needs to change", rewrite_guidance)
+        self.assertIn("Multiple localized replace_canvas_lines calls are fine", replace_guidance)
+        self.assertIn("before line-level edits", scroll_description)
 
     def test_openai_tool_specs_include_expand_canvas_document_with_canvas_documents(self):
         tools = get_openai_tool_specs(
@@ -2561,6 +2576,9 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn("clearEditTarget();", script_text)
         self.assertIn("const fragment = document.createDocumentFragment();", script_text)
         self.assertIn("messagesEl.replaceChildren(fragment);", script_text)
+        self.assertIn("function isPersistedMessageId(messageId)", script_text)
+        self.assertIn("function isCanvasStreamingPreviewTool(toolName)", script_text)
+        self.assertIn("isCanvasStreamingPreviewTool(event.tool)", script_text)
 
     def test_external_settings_script_exists_and_contains_tabbed_settings_logic(self):
         script_path = Path(__file__).resolve().parent.parent / "static" / "settings.js"
@@ -3588,6 +3606,7 @@ class AppRoutesTestCase(unittest.TestCase):
                 {
                     "type": "tool_capture",
                     "tool_results": [],
+                    "canvas_modified": True,
                     "canvas_documents": [
                         {
                             "id": "canvas-1",
@@ -3616,12 +3635,53 @@ class AppRoutesTestCase(unittest.TestCase):
         events = [json.loads(line) for line in response.get_data(as_text=True).strip().splitlines()]
         canvas_event = next((event for event in events if event["type"] == "canvas_sync"), None)
         self.assertIsNotNone(canvas_event)
+        self.assertTrue(canvas_event["auto_open"])
         self.assertEqual(canvas_event["documents"][0]["title"], "Draft")
 
         conversation_response = self.client.get(f"/api/conversations/{conversation_id}")
         messages = conversation_response.get_json()["messages"]
         assistant_messages = [message for message in messages if message["role"] == "assistant"]
         self.assertEqual(assistant_messages[-1]["metadata"]["canvas_documents"][0]["id"], "canvas-1")
+
+    def test_chat_does_not_auto_open_canvas_when_state_is_unchanged(self):
+        conversation_id = self._create_conversation()
+        fake_events = iter(
+            [
+                {"type": "answer_start"},
+                {"type": "answer_delta", "text": "Answer without changing the canvas."},
+                {
+                    "type": "tool_capture",
+                    "tool_results": [],
+                    "canvas_modified": False,
+                    "canvas_documents": [
+                        {
+                            "id": "canvas-existing",
+                            "title": "Existing Draft",
+                            "format": "markdown",
+                            "content": "# Draft\n\nUnchanged",
+                        }
+                    ],
+                },
+                {"type": "done"},
+            ]
+        )
+
+        with patch("routes.chat.run_agent_stream", return_value=fake_events):
+            response = self.client.post(
+                "/chat",
+                json={
+                    "conversation_id": conversation_id,
+                    "model": "deepseek-chat",
+                    "user_content": "Answer the question",
+                    "messages": [{"role": "user", "content": "Answer the question"}],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        events = [json.loads(line) for line in response.get_data(as_text=True).strip().splitlines()]
+        canvas_event = next((event for event in events if event["type"] == "canvas_sync"), None)
+        self.assertIsNotNone(canvas_event)
+        self.assertFalse(canvas_event["auto_open"])
 
     def test_chat_persists_canvas_documents_without_text_response(self):
         conversation_id = self._create_conversation()
@@ -3676,6 +3736,7 @@ class AppRoutesTestCase(unittest.TestCase):
                 {
                     "type": "tool_capture",
                     "tool_results": [],
+                    "canvas_modified": True,
                     "canvas_documents": [],
                     "canvas_cleared": True,
                 },
@@ -3707,6 +3768,51 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(len(assistant_messages), 1)
         self.assertEqual(assistant_messages[0]["metadata"]["canvas_documents"], [])
         self.assertTrue(assistant_messages[0]["metadata"]["canvas_cleared"])
+
+    def test_persist_streaming_assistant_message_upserts_partial_output(self):
+        conversation_id = self._create_conversation()
+
+        assistant_message_id = _persist_streaming_assistant_message(
+            conversation_id,
+            None,
+            content="Partial answer.",
+            reasoning="Reasoning in progress.",
+            usage_data={"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8},
+            tool_results=[{"tool_name": "fetch_url", "status": "ok"}],
+            canvas_documents=[],
+            active_document_id=None,
+            canvas_cleared=False,
+            project_workflow=None,
+            tool_trace_entries=[{"tool_name": "fetch_url", "state": "done", "step": 1}],
+            pending_clarification=None,
+        )
+
+        self.assertIsInstance(assistant_message_id, int)
+
+        updated_message_id = _persist_streaming_assistant_message(
+            conversation_id,
+            assistant_message_id,
+            content="Partial answer. Continued.",
+            reasoning="Reasoning completed.",
+            usage_data={"prompt_tokens": 4, "completion_tokens": 7, "total_tokens": 11},
+            tool_results=[{"tool_name": "fetch_url", "status": "ok"}],
+            canvas_documents=[],
+            active_document_id=None,
+            canvas_cleared=False,
+            project_workflow=None,
+            tool_trace_entries=[{"tool_name": "fetch_url", "state": "done", "step": 1}],
+            pending_clarification=None,
+        )
+
+        self.assertEqual(updated_message_id, assistant_message_id)
+
+        conversation_response = self.client.get(f"/api/conversations/{conversation_id}")
+        messages = conversation_response.get_json()["messages"]
+        assistant_messages = [message for message in messages if message["role"] == "assistant"]
+        self.assertEqual(len(assistant_messages), 1)
+        self.assertEqual(assistant_messages[0]["content"], "Partial answer. Continued.")
+        self.assertEqual(assistant_messages[0]["usage"]["total_tokens"], 11)
+        self.assertEqual(assistant_messages[0]["metadata"]["reasoning_content"], "Reasoning completed.")
 
     def test_uploaded_document_prompts_before_opening_canvas(self):
         conversation_id = self._create_conversation()

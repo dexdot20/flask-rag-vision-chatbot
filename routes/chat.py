@@ -132,6 +132,119 @@ SUMMARY_TOOL_TRACE_LIMIT = 8
 OMITTED_TOOL_OUTPUT_TEXT = "[Tool output omitted from older history to save context budget.]"
 
 
+def _build_assistant_message_metadata(
+    *,
+    tool_results: list[dict] | None = None,
+    canvas_documents: list[dict] | None = None,
+    active_document_id: str | None = None,
+    canvas_cleared: bool = False,
+    project_workflow: dict | None = None,
+    tool_trace_entries: list[dict] | None = None,
+    reasoning: str = "",
+    pending_clarification: dict | None = None,
+    usage_data: dict | None = None,
+) -> str | None:
+    return serialize_message_metadata(
+        {
+            "tool_results": tool_results or [],
+            "canvas_documents": canvas_documents or [],
+            "active_document_id": active_document_id,
+            "canvas_cleared": canvas_cleared,
+            "project_workflow": project_workflow,
+            "tool_trace": tool_trace_entries or [],
+            "reasoning_content": reasoning,
+            "pending_clarification": pending_clarification,
+            "usage": usage_data,
+        }
+    )
+
+
+def _persist_streaming_assistant_message(
+    conversation_id: int | None,
+    assistant_message_id: int | None,
+    *,
+    content: str,
+    reasoning: str,
+    usage_data: dict | None,
+    tool_results: list[dict],
+    canvas_documents: list[dict],
+    active_document_id: str | None,
+    canvas_cleared: bool,
+    project_workflow: dict | None,
+    tool_trace_entries: list[dict],
+    pending_clarification: dict | None,
+) -> int | None:
+    normalized_conversation_id = int(conversation_id or 0)
+    if normalized_conversation_id <= 0:
+        return assistant_message_id
+
+    normalized_content = str(content or "")
+    has_meaningful_output = bool(
+        normalized_content.strip()
+        or pending_clarification
+        or canvas_documents
+        or canvas_cleared
+        or project_workflow
+    )
+    if not has_meaningful_output:
+        return assistant_message_id
+
+    prompt_tokens = usage_data.get("prompt_tokens") if isinstance(usage_data, dict) else None
+    completion_tokens = usage_data.get("completion_tokens") if isinstance(usage_data, dict) else None
+    total_tokens = usage_data.get("total_tokens") if isinstance(usage_data, dict) else None
+    assistant_message_metadata = _build_assistant_message_metadata(
+        tool_results=tool_results,
+        canvas_documents=canvas_documents,
+        active_document_id=active_document_id,
+        canvas_cleared=canvas_cleared,
+        project_workflow=project_workflow,
+        tool_trace_entries=tool_trace_entries,
+        reasoning=reasoning,
+        pending_clarification=pending_clarification,
+        usage_data=usage_data,
+    )
+
+    with get_db() as conn:
+        normalized_message_id = int(assistant_message_id or 0)
+        if normalized_message_id > 0:
+            cursor = conn.execute(
+                """UPDATE messages
+                      SET content = ?, metadata = ?, prompt_tokens = ?, completion_tokens = ?, total_tokens = ?
+                    WHERE id = ? AND conversation_id = ?""",
+                (
+                    normalized_content,
+                    assistant_message_metadata,
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                    normalized_message_id,
+                    normalized_conversation_id,
+                ),
+            )
+            if cursor.rowcount:
+                conn.execute(
+                    "UPDATE conversations SET updated_at = datetime('now') WHERE id = ?",
+                    (normalized_conversation_id,),
+                )
+                return normalized_message_id
+
+        assistant_message_id = insert_message(
+            conn,
+            normalized_conversation_id,
+            "assistant",
+            normalized_content,
+            metadata=assistant_message_metadata,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+        )
+        conn.execute(
+            "UPDATE conversations SET updated_at = datetime('now') WHERE id = ?",
+            (normalized_conversation_id,),
+        )
+        return assistant_message_id
+
+
 def _select_title_source_messages(messages: list[dict]) -> list[dict]:
     selected = []
     for message in messages or []:
@@ -1585,37 +1698,77 @@ def register_chat_routes(app) -> None:
             payload.append(item)
         return payload
 
-    def persist_tool_history_rows(conversation_id: int, tool_history_messages: list[dict]) -> None:
+    def persist_tool_history_rows(
+        conversation_id: int,
+        tool_history_messages: list[dict],
+        trailing_assistant_message_id: int | None = None,
+    ) -> None:
         if not conversation_id or not isinstance(tool_history_messages, list):
             return
 
+        rows_to_insert = []
+        for message in tool_history_messages:
+            if not isinstance(message, dict):
+                continue
+
+            role = str(message.get("role") or "").strip()
+            content = message.get("content")
+            if content is None:
+                content = ""
+            if not isinstance(content, str):
+                content = str(content)
+
+            if role == "assistant":
+                rows_to_insert.append(
+                    {
+                        "role": "assistant",
+                        "content": content,
+                        "tool_calls": serialize_message_tool_calls(message.get("tool_calls")),
+                    }
+                )
+            elif role == "tool":
+                rows_to_insert.append(
+                    {
+                        "role": "tool",
+                        "content": content,
+                        "tool_call_id": str(message.get("tool_call_id") or "").strip() or None,
+                    }
+                )
+
+        if not rows_to_insert:
+            return
+
         with get_db() as conn:
-            for message in tool_history_messages:
-                if not isinstance(message, dict):
-                    continue
+            insert_position = None
+            normalized_assistant_message_id = int(trailing_assistant_message_id or 0)
+            if normalized_assistant_message_id > 0:
+                assistant_row = conn.execute(
+                    "SELECT position FROM messages WHERE id = ? AND conversation_id = ?",
+                    (normalized_assistant_message_id, conversation_id),
+                ).fetchone()
+                if assistant_row and int(assistant_row["position"] or 0) > 0:
+                    insert_position = int(assistant_row["position"])
+                    shift_message_positions(conn, conversation_id, insert_position, len(rows_to_insert))
 
-                role = str(message.get("role") or "").strip()
-                content = message.get("content")
-                if content is None:
-                    content = ""
-                if not isinstance(content, str):
-                    content = str(content)
-
-                if role == "assistant":
+            for offset, row in enumerate(rows_to_insert):
+                position = insert_position + offset if insert_position is not None else None
+                if row["role"] == "assistant":
                     insert_message(
                         conn,
                         conversation_id,
                         "assistant",
-                        content,
-                        tool_calls=serialize_message_tool_calls(message.get("tool_calls")),
+                        row["content"],
+                        tool_calls=row.get("tool_calls"),
+                        position=position,
                     )
-                elif role == "tool":
+                else:
                     insert_message(
                         conn,
                         conversation_id,
                         "tool",
-                        content,
-                        tool_call_id=str(message.get("tool_call_id") or "").strip() or None,
+                        row["content"],
+                        tool_call_id=row.get("tool_call_id"),
+                        position=position,
                     )
 
             conn.execute(
@@ -1975,6 +2128,23 @@ def register_chat_routes(app) -> None:
             persisted_assistant_message_id = None
             summary_future = None
 
+            def persist_assistant_snapshot() -> None:
+                nonlocal persisted_assistant_message_id
+                persisted_assistant_message_id = _persist_streaming_assistant_message(
+                    conv_id,
+                    persisted_assistant_message_id,
+                    content=full_response,
+                    reasoning=full_reasoning,
+                    usage_data=usage_data,
+                    tool_results=stored_tool_results,
+                    canvas_documents=canvas_documents,
+                    active_document_id=active_document_id,
+                    canvas_cleared=canvas_cleared,
+                    project_workflow=project_workflow,
+                    tool_trace_entries=tool_trace_entries,
+                    pending_clarification=pending_clarification,
+                )
+
             for vision_event in vision_events:
                 yield json.dumps(vision_event, ensure_ascii=False) + "\n"
 
@@ -2041,11 +2211,14 @@ def register_chat_routes(app) -> None:
             ):
                 if event["type"] == "answer_delta":
                     full_response += event["text"]
+                    persist_assistant_snapshot()
                 elif event["type"] == "answer_sync":
                     full_response = event["text"]
+                    persist_assistant_snapshot()
                 elif event["type"] == "clarification_request":
                     full_response = str(event.get("text") or "").strip()
                     pending_clarification = event.get("clarification") if isinstance(event.get("clarification"), dict) else None
+                    persist_assistant_snapshot()
                 elif event["type"] == "reasoning_delta":
                     full_reasoning += event["text"]
                 elif event["type"] == "usage":
@@ -2057,7 +2230,12 @@ def register_chat_routes(app) -> None:
                 elif event["type"] == "tool_history":
                     history_messages = normalize_chat_messages(event.get("messages") or [])
                     if history_messages:
-                        persisted_tool_history.extend(history_messages)
+                        if conv_id:
+                            persist_tool_history_rows(
+                                conv_id,
+                                history_messages,
+                                trailing_assistant_message_id=persisted_assistant_message_id,
+                            )
                         yield json.dumps(
                             {
                                 "type": "assistant_tool_history",
@@ -2093,8 +2271,10 @@ def register_chat_routes(app) -> None:
                     stored_tool_results = extract_message_tool_results({"tool_results": event.get("tool_results")})
                     canvas_documents = extract_canvas_documents({"canvas_documents": event.get("canvas_documents")})
                     active_document_id = str(event.get("active_document_id") or "").strip() or None
+                    canvas_modified = event.get("canvas_modified") is True
                     canvas_cleared = event.get("canvas_cleared") is True
                     project_workflow = event.get("project_workflow") if isinstance(event.get("project_workflow"), dict) else project_workflow
+                    persist_assistant_snapshot()
                     ui_tool_results = build_tool_results_ui_payload(stored_tool_results)
                     if ui_tool_results:
                         yield json.dumps(
@@ -2110,7 +2290,7 @@ def register_chat_routes(app) -> None:
                                 "type": "canvas_sync",
                                 "documents": canvas_documents,
                                 "active_document_id": active_document_id,
-                                "auto_open": True,
+                                "auto_open": canvas_modified,
                                 "cleared": canvas_cleared,
                             },
                             ensure_ascii=False,
@@ -2120,40 +2300,26 @@ def register_chat_routes(app) -> None:
 
             with app_obj.app_context():
                 if conv_id and persisted_tool_history:
-                    persist_tool_history_rows(conv_id, persisted_tool_history)
-
-                if conv_id and (full_response or full_reasoning or pending_clarification or canvas_documents or canvas_cleared or project_workflow):
-                    prompt_tokens = usage_data.get("prompt_tokens") if usage_data else None
-                    completion_tokens = usage_data.get("completion_tokens") if usage_data else None
-                    total_tokens = usage_data.get("total_tokens") if usage_data else None
-                    assistant_message_metadata = serialize_message_metadata(
-                        {
-                            "tool_results": stored_tool_results,
-                            "canvas_documents": canvas_documents,
-                            "active_document_id": active_document_id,
-                            "canvas_cleared": canvas_cleared,
-                            "project_workflow": project_workflow,
-                            "tool_trace": tool_trace_entries,
-                            "reasoning_content": full_reasoning,
-                            "pending_clarification": pending_clarification,
-                            "usage": usage_data,
-                        }
+                    persist_tool_history_rows(
+                        conv_id,
+                        persisted_tool_history,
+                        trailing_assistant_message_id=persisted_assistant_message_id,
                     )
-                    with get_db() as conn:
-                        persisted_assistant_message_id = insert_message(
-                            conn,
-                            conv_id,
-                            "assistant",
-                            full_response,
-                            metadata=assistant_message_metadata,
-                            prompt_tokens=prompt_tokens,
-                            completion_tokens=completion_tokens,
-                            total_tokens=total_tokens,
-                        )
-                        conn.execute(
-                            "UPDATE conversations SET updated_at = datetime('now') WHERE id = ?",
-                            (conv_id,),
-                        )
+
+                persisted_assistant_message_id = _persist_streaming_assistant_message(
+                    conv_id,
+                    persisted_assistant_message_id,
+                    content=full_response,
+                    reasoning=full_reasoning,
+                    usage_data=usage_data,
+                    tool_results=stored_tool_results,
+                    canvas_documents=canvas_documents,
+                    active_document_id=active_document_id,
+                    canvas_cleared=canvas_cleared,
+                    project_workflow=project_workflow,
+                    tool_trace_entries=tool_trace_entries,
+                    pending_clarification=pending_clarification,
+                )
 
                 if persisted_user_message_id is not None or persisted_assistant_message_id is not None:
                     yield json.dumps(

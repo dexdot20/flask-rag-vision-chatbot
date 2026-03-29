@@ -419,6 +419,11 @@ const markdownEngine = globalThis.marked || null;
 const sanitizer = globalThis.DOMPurify || null;
 const highlighter = globalThis.hljs || null;
 const SIDEBAR_STORAGE_KEY = "chatbot.sidebarOpen";
+const CANVAS_STREAMING_PREVIEW_TOOLS = new Set(["create_canvas_document", "rewrite_canvas_document"]);
+
+function isCanvasStreamingPreviewTool(toolName) {
+  return CANVAS_STREAMING_PREVIEW_TOOLS.has(String(toolName || "").trim());
+}
 
 function normalizeCanvasDocument(document) {
   if (!document || typeof document !== "object") {
@@ -3142,10 +3147,15 @@ async function streamNdjsonResponse(response, onEvent) {
 
 function getHistoryMessageIndex(messageId) {
   const normalizedId = Number(messageId);
-  if (!Number.isInteger(normalizedId)) {
+  if (!Number.isInteger(normalizedId) || normalizedId <= 0) {
     return -1;
   }
   return history.findIndex((item) => Number(item.id) === normalizedId);
+}
+
+function isPersistedMessageId(messageId) {
+  const normalizedId = Number(messageId);
+  return Number.isInteger(normalizedId) && normalizedId > 0;
 }
 
 function getHistoryMessage(messageId) {
@@ -3219,7 +3229,7 @@ function createMessageActions(message, options = {}) {
     editBtn.type = "button";
     editBtn.className = "msg-action-btn";
     editBtn.textContent = "Edit";
-    editBtn.disabled = !Number.isInteger(Number(messageId));
+    editBtn.disabled = !isPersistedMessageId(messageId);
     editBtn.addEventListener("click", () => beginEditingMessage(messageId));
     actions.appendChild(editBtn);
   }
@@ -3310,7 +3320,9 @@ function renderConversationHistory(options = {}) {
     fragment.appendChild(createMessageGroup(message.role, message.content, message.metadata || null, {
       messageId: message.id,
       editable: message.role === "user",
-      isEditingTarget: Number(message.id) === Number(editingMessageId),
+      isEditingTarget: isPersistedMessageId(message.id)
+        && isPersistedMessageId(editingMessageId)
+        && Number(message.id) === Number(editingMessageId),
       isLatestVisible: index === visibleEntries.length - 1,
       toolCalls: message.tool_calls,
     }));
@@ -3454,7 +3466,7 @@ function applyPersistedMessageIds(persistedIds, assistantEntry) {
   }
 
   const userId = Number(persistedIds.user_message_id);
-  if (Number.isInteger(userId)) {
+  if (isPersistedMessageId(userId)) {
     for (let index = history.length - 1; index >= 0; index -= 1) {
       if (history[index].role === "user") {
         history[index].id = userId;
@@ -3464,7 +3476,7 @@ function applyPersistedMessageIds(persistedIds, assistantEntry) {
   }
 
   const assistantId = Number(persistedIds.assistant_message_id);
-  if (assistantEntry && Number.isInteger(assistantId)) {
+  if (assistantEntry && isPersistedMessageId(assistantId)) {
     assistantEntry.id = assistantId;
   }
 }
@@ -5630,6 +5642,9 @@ async function sendMessage(options = {}) {
   const editingEntry = getHistoryMessage(editingMessageId);
   const isEditing = Boolean(editingEntry && editingEntry.role === "user");
   const editedMessageId = isEditing ? Number(editingEntry.id) : null;
+  if (!isEditing) {
+    clearEditTarget();
+  }
 
   errorArea.innerHTML = "";
   inputEl.value = "";
@@ -6052,6 +6067,9 @@ async function sendMessage(options = {}) {
           : [];
         assistantToolHistory.push(...nextToolHistory);
       } else if (event.type === "canvas_loading") {
+        if (!isCanvasStreamingPreviewTool(event.tool)) {
+          return;
+        }
         ensureStreamingCanvasPreview(event.tool, event.preview_key, event.snapshot);
         if (!isCanvasOpen()) {
           openCanvas();
@@ -6060,6 +6078,9 @@ async function sendMessage(options = {}) {
         }
         setCanvasStatus("Preparing canvas...", "muted");
       } else if (event.type === "canvas_content_delta") {
+        if (!isCanvasStreamingPreviewTool(event.tool)) {
+          return;
+        }
         const previewDocument = ensureStreamingCanvasPreview(event.tool, event.preview_key, event.snapshot);
         if (previewDocument) {
           previewDocument.content += String(event.delta || "");

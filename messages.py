@@ -443,6 +443,35 @@ def _build_canvas_decision_matrix_rows(active_tool_names: list[str], canvas_payl
     )
 
 
+def _build_canvas_editing_guidance(active_tool_names: list[str], canvas_payload: dict | None = None) -> list[str]:
+    active_set = set(active_tool_names or [])
+    if not active_set.intersection(
+        {
+            "create_canvas_document",
+            "rewrite_canvas_document",
+            "replace_canvas_lines",
+            "insert_canvas_lines",
+            "delete_canvas_lines",
+            "expand_canvas_document",
+            "scroll_canvas_document",
+        }
+    ):
+        return []
+
+    lines = [
+        "## Canvas Editing Guidance",
+        "- Prefer the smallest valid canvas change that satisfies the request.",
+        "- Do not rewrite the whole document when only part needs to change; use replace_canvas_lines, insert_canvas_lines, or delete_canvas_lines for local edits when the exact visible lines are known.",
+        "- If the target lines are not visible yet, inspect first with scroll_canvas_document for a focused range or expand_canvas_document for a wider view.",
+        "- Use rewrite_canvas_document when most of the document should change or when you already know the complete intended replacement content.",
+        "- Multiple canvas tool calls in one answer are fine when needed: inspect, then edit, then create or update other files.",
+    ]
+    if (canvas_payload or {}).get("mode") == "project":
+        lines.append("- In project mode, prefer document_path for targeting and keep one file per canvas document.")
+    lines.append("")
+    return lines
+
+
 def build_tool_call_contract(active_tool_names: list[str], canvas_documents=None) -> dict | None:
     runtime_tool_names = resolve_runtime_tool_names(active_tool_names or [], canvas_documents=canvas_documents)
     if not runtime_tool_names:
@@ -626,6 +655,10 @@ def build_runtime_system_message(
             parts.append("```text\n" + "\n".join(canvas_payload["visible_lines"]) + "\n```\n")
         else:
             parts.append("(The active canvas document is empty.)\n")
+
+    canvas_editing_guidance = _build_canvas_editing_guidance(active_tool_names, canvas_payload)
+    if canvas_editing_guidance:
+        parts.extend(canvas_editing_guidance)
 
     canvas_decision_matrix = _build_canvas_decision_matrix_rows(active_tool_names, canvas_payload)
     if canvas_decision_matrix:

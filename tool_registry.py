@@ -40,15 +40,15 @@ def build_canvas_decision_matrix(
                     else "You need a brand-new file, draft, or artifact."
                 ),
                 "tool": "create_canvas_document",
-                "notes": "Create one file or artifact per canvas document before attempting line-level edits.",
+                "notes": "Create one file or artifact per canvas document. After the file exists, prefer localized line edits for partial changes instead of full rewrites.",
             }
         )
     if enabled("rewrite_canvas_document"):
         rows.append(
             {
-                "situation": "The whole document should be replaced in one pass.",
+                "situation": "Most or all of the document should change and you already know the intended final content.",
                 "tool": "rewrite_canvas_document",
-                "notes": "Keep the same document id; do not turn one existing file into a different file.",
+                "notes": "Keep the same document id; reserve this for near-full replacements. For targeted changes, use line-level tools instead.",
             }
         )
     if enabled("replace_canvas_lines", "insert_canvas_lines", "delete_canvas_lines"):
@@ -56,7 +56,7 @@ def build_canvas_decision_matrix(
             {
                 "situation": "Only a localized region should change and the exact visible 1-based lines are known.",
                 "tool": "replace_canvas_lines / insert_canvas_lines / delete_canvas_lines",
-                "notes": "Use only the visible excerpt or a recent scroll/expand result. Never guess hidden line numbers.",
+                "notes": "Use only the visible excerpt or a recent scroll/expand result. Multiple localized edits are fine. Never guess hidden line numbers.",
             }
         )
     if enabled("scroll_canvas_document"):
@@ -64,7 +64,7 @@ def build_canvas_decision_matrix(
             {
                 "situation": "You need a specific hidden range outside the visible excerpt.",
                 "tool": "scroll_canvas_document",
-                "notes": "Read the smallest relevant window instead of expanding the entire file.",
+                "notes": "Read the smallest relevant window first, then edit with line-level tools once the target lines are visible.",
             }
         )
     if enabled("expand_canvas_document"):
@@ -72,7 +72,7 @@ def build_canvas_decision_matrix(
             {
                 "situation": "You need a wider full-file view before reasoning or editing.",
                 "tool": "expand_canvas_document",
-                "notes": "Use this when the excerpt or targeted scroll is still insufficient.",
+                "notes": "Use this when the excerpt or targeted scroll is still insufficient before a broad rewrite or multi-region edit.",
             }
         )
     if canvas_mode == "project" and rows:
@@ -451,6 +451,7 @@ TOOL_SPECS = [
         "name": "expand_canvas_document",
         "description": (
             "Load the full context of a specific canvas document when the active excerpt and manifest summaries are not enough. "
+            "Use this before deciding between localized line edits and a full rewrite. "
             "Prefer targeting by document_path in project mode."
         ),
         "parameters": {
@@ -471,6 +472,7 @@ TOOL_SPECS = [
             "inputs": {"document_id": "optional target id", "document_path": "optional target project-relative path"},
             "guidance": (
                 "Use this when the manifest and active-document excerpt are insufficient and you need another canvas file in full detail. "
+                "After expanding, prefer the smallest valid edit that solves the request. "
                 "In project mode, prefer document_path over document_id so file targeting stays stable."
             ),
         },
@@ -479,6 +481,7 @@ TOOL_SPECS = [
         "name": "scroll_canvas_document",
         "description": (
             "Read a targeted line range from a specific canvas document when you need lines outside the visible excerpt. "
+            "Use this before line-level edits when the target region is not visible yet. "
             "Prefer targeting by document_path in project mode."
         ),
         "parameters": {
@@ -513,6 +516,7 @@ TOOL_SPECS = [
             },
             "guidance": (
                 "Use this when you know which region you need and the active excerpt is truncated. "
+                "After inspecting the right window, prefer line-level edit tools for localized changes instead of rewriting the whole file. "
                 "In project mode, prefer document_path over document_id so file targeting stays stable."
             ),
         },
@@ -908,7 +912,8 @@ TOOL_SPECS = [
         "description": (
             "Create a canvas document for the current conversation. "
             "Use this for a single editable draft or as one file inside a multi-file canvas project workspace. "
-            "Create one file or artifact per canvas document; when the user needs multiple files, use separate tool calls."
+            "Create one file or artifact per canvas document; when the user needs multiple files, use separate tool calls. "
+            "After creation, do not default to full rewrites for small follow-up changes."
         ),
         "parameters": {
             "type": "object",
@@ -995,13 +1000,14 @@ TOOL_SPECS = [
                 "Use this when the user would benefit from a persistent artifact that can be revised. "
                 "Prefer creating the document before line-level edits. "
                 "Keep one file or artifact per canvas document instead of bundling multiple files together. "
+                "Once the document exists, prefer localized line edits for partial changes. "
                 "In project mode, set path, role, and ideally summary so the workspace manifest stays coherent."
             ),
         },
     },
     {
         "name": "rewrite_canvas_document",
-        "description": "Rewrite one existing canvas document in full while keeping the same document id. Do not use this to append a different file into the current document.",
+        "description": "Rewrite one existing canvas document in full while keeping the same document id. Use this when most of the document should change or when you already know the full intended replacement. Do not use this for small localized edits or to append a different file into the current document.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -1079,6 +1085,7 @@ TOOL_SPECS = [
             "inputs": {"content": "full document body", "title": "optional title", "format": "optional markdown or code", "language": "optional dominant code language", "path": "optional project-relative file path", "role": "optional semantic role", "summary": "optional short responsibility summary", "imports": "optional import list", "exports": "optional export list", "symbols": "optional symbol list", "dependencies": "optional dependency list", "project_id": "optional project identifier", "workspace_id": "optional workspace identifier", "document_id": "optional target id", "document_path": "optional target project-relative path"},
             "guidance": (
                 "Use this for full-document replacement once you know the intended final content. "
+                "Do not default to this when only part of the file needs to change; use replace_canvas_lines, insert_canvas_lines, or delete_canvas_lines for targeted edits. "
                 "In project mode prefer document_path when possible. "
                 "If the user needs an additional file, create a separate canvas document instead of rewriting the current one into a different file."
             ),
@@ -1086,7 +1093,7 @@ TOOL_SPECS = [
     },
     {
         "name": "replace_canvas_lines",
-        "description": "Replace a 1-based inclusive visible line range inside the active canvas document. Use this for localized edits, not broad rewrites.",
+        "description": "Replace a 1-based inclusive visible line range inside the active canvas document. Use this for localized edits; you do not need to rewrite the whole document when only part should change.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -1113,6 +1120,7 @@ TOOL_SPECS = [
             "inputs": {"start_line": "first line", "end_line": "last line", "lines": "replacement lines", "document_id": "optional target id", "document_path": "optional target project-relative path"},
             "guidance": (
                 "Use only when the exact 1-based line range is known from the visible excerpt or a recent scroll/expand result. "
+                "Multiple localized replace_canvas_lines calls are fine when the changes are separated. "
                 "For broad rewrites, prefer rewrite_canvas_document. In project mode, prefer document_path when possible."
             ),
         },
@@ -1145,6 +1153,7 @@ TOOL_SPECS = [
             "inputs": {"after_line": "insertion point", "lines": "new lines", "document_id": "optional target id", "document_path": "optional target project-relative path"},
             "guidance": (
                 "Use only when the insertion point is known from the visible excerpt or a recent scroll/expand result. "
+                "Use this for partial additions instead of rewriting the whole document when the rest should stay intact. "
                 "If the target region is not visible, inspect it first. In project mode, prefer document_path when possible."
             ),
         },
@@ -1173,6 +1182,7 @@ TOOL_SPECS = [
             "inputs": {"start_line": "first line", "end_line": "last line", "document_id": "optional target id", "document_path": "optional target project-relative path"},
             "guidance": (
                 "Use only when the exact 1-based line range is visible in the current excerpt or in a recent scroll/expand result. "
+                "Use this for partial removals instead of rewriting the whole document when the rest should stay intact. "
                 "If the target region is not visible, inspect it first. In project mode, prefer document_path when possible."
             ),
         },
