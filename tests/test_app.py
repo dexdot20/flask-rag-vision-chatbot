@@ -191,6 +191,8 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertTrue(payload["tool_memory_auto_inject"])
         self.assertIn("features", payload)
         self.assertTrue(payload["features"]["rag_enabled"])
+        self.assertTrue(payload["features"]["ocr_enabled"])
+        self.assertTrue(payload["features"]["image_uploads_enabled"])
         self.assertTrue(payload["features"]["vision_enabled"])
 
         response = self.client.patch(
@@ -946,12 +948,19 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(str(journal_mode).lower(), "wal")
 
     def test_disabled_features_reflect_in_settings_and_routes(self):
-        with patch("config.RAG_ENABLED", False), patch("db.RAG_ENABLED", False), patch("routes.pages.RAG_ENABLED", False), patch("routes.conversations.RAG_ENABLED", False):
+        with patch("config.RAG_ENABLED", False), patch("config.OCR_ENABLED", False), patch(
+            "config.VISION_ENABLED", False
+        ), patch("config.IMAGE_UPLOADS_ENABLED", False), patch("db.RAG_ENABLED", False), patch(
+            "db.VISION_ENABLED", False
+        ), patch("routes.pages.RAG_ENABLED", False), patch("routes.conversations.RAG_ENABLED", False):
             response = self.client.get("/api/settings")
             self.assertEqual(response.status_code, 200)
             payload = response.get_json()
             self.assertFalse(payload["rag_auto_inject"])
             self.assertFalse(payload["features"]["rag_enabled"])
+            self.assertFalse(payload["features"]["ocr_enabled"])
+            self.assertFalse(payload["features"]["image_uploads_enabled"])
+            self.assertFalse(payload["features"]["vision_enabled"])
 
             response = self.client.patch(
                 "/api/settings",
@@ -967,7 +976,9 @@ class AppRoutesTestCase(unittest.TestCase):
             response = self.client.delete(f"/api/conversations/{conversation_id}")
             self.assertEqual(response.status_code, 204)
 
-        with patch("routes.chat.VISION_ENABLED", False):
+        with patch("routes.chat.OCR_ENABLED", False), patch("routes.chat.VISION_ENABLED", False), patch(
+            "routes.chat.IMAGE_UPLOADS_ENABLED", False
+        ):
             response = self.client.post(
                 "/chat",
                 data={
@@ -979,6 +990,52 @@ class AppRoutesTestCase(unittest.TestCase):
                 },
             )
             self.assertEqual(response.status_code, 410)
+
+    def test_chat_allows_image_upload_in_ocr_only_mode(self):
+        conversation_id = self._create_conversation()
+        fake_events = iter(
+            [
+                {"type": "answer_start"},
+                {"type": "answer_delta", "text": "Done."},
+                {"type": "tool_capture", "tool_results": []},
+                {"type": "done"},
+            ]
+        )
+
+        with patch("db.IMAGE_STORAGE_DIR", self.image_storage_dir), patch("routes.chat.VISION_ENABLED", False), patch(
+            "routes.chat.analyze_uploaded_image",
+            return_value={
+                "ocr_text": "invoice total 42",
+                "vision_summary": "Readable text was detected in the image and added to the context.",
+                "assistant_guidance": "Use the extracted OCR text as the primary image context when answering the user.",
+                "key_points": [],
+            },
+        ), patch("routes.chat.run_agent_stream", return_value=fake_events):
+            response = self.client.post(
+                "/chat",
+                data={
+                    "messages": json.dumps([{"role": "user", "content": "Bu görselde ne yazıyor?"}]),
+                    "model": "deepseek-chat",
+                    "conversation_id": str(conversation_id),
+                    "user_content": "Bu görselde ne yazıyor?",
+                    "image": (io.BytesIO(b"fake image bytes"), "receipt.png", "image/png"),
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        response.get_data(as_text=True)
+
+        conversation_response = self.client.get(f"/api/conversations/{conversation_id}")
+        self.assertEqual(conversation_response.status_code, 200)
+        messages = conversation_response.get_json()["messages"]
+        user_messages = [message for message in messages if message["role"] == "user"]
+        self.assertEqual(len(user_messages), 1)
+        metadata = user_messages[0]["metadata"]
+        self.assertEqual(metadata["ocr_text"], "invoice total 42")
+        self.assertEqual(
+            metadata["assistant_guidance"],
+            "Use the extracted OCR text as the primary image context when answering the user.",
+        )
 
     def test_runtime_system_message_includes_explicit_current_date_and_time(self):
         now = datetime(2026, 3, 15, 21, 42, 5, tzinfo=timezone(timedelta(hours=3)))
@@ -1737,6 +1794,8 @@ class AppRoutesTestCase(unittest.TestCase):
 
         self.assertIn("Stored image reference: image_id=img_123, file=screen-a.png", content)
         self.assertIn("Stored image reference: image_id=img_456, file=screen-b.png", content)
+        self.assertIn("[Local image analysis] Attachment 1", content)
+        self.assertIn("[Local image analysis] Attachment 2", content)
         self.assertIn("[Uploaded document: notes.txt]", content)
         self.assertIn("Visual summary: A dashboard is visible.", content)
         self.assertIn("Visual summary: A settings page is visible.", content)
@@ -2328,7 +2387,7 @@ class AppRoutesTestCase(unittest.TestCase):
         )
 
         with patch("db.IMAGE_STORAGE_DIR", self.image_storage_dir), patch(
-            "routes.chat.run_image_vision_analysis",
+            "routes.chat.analyze_uploaded_image",
             return_value={
                 "ocr_text": "hello",
                 "vision_summary": "A login screen is shown.",
@@ -2376,7 +2435,7 @@ class AppRoutesTestCase(unittest.TestCase):
             return iter([{"type": "done"}])
 
         with patch("db.IMAGE_STORAGE_DIR", self.image_storage_dir), patch(
-            "routes.chat.run_image_vision_analysis",
+            "routes.chat.analyze_uploaded_image",
             side_effect=[
                 {
                     "ocr_text": "alpha",

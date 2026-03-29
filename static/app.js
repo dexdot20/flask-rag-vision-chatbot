@@ -4758,7 +4758,7 @@ function handleSelectedFiles(files, options = {}) {
       showError(`Unsupported document type: ${file.name}`);
       continue;
     }
-    if (!featureFlags.vision_enabled) {
+    if (!featureFlags.image_uploads_enabled) {
       showError("Image uploads are disabled. Only documents can be attached.");
       continue;
     }
@@ -5621,7 +5621,7 @@ async function sendMessage(options = {}) {
 
   setPendingDocumentCanvasOpen(pendingDocuments);
 
-  if (pendingImages.length && !Boolean(featureFlags.vision_enabled)) {
+  if (pendingImages.length && !Boolean(featureFlags.image_uploads_enabled)) {
     clearSelectedImage();
     showError("Image uploads are disabled in .env.");
     return;

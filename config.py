@@ -69,9 +69,8 @@ def _get_torch_dtype_name() -> str:
     return raw_value if raw_value in allowed else "float16"
 
 
-OCR_MODEL_PATH = (os.getenv("QWEN_VL_MODEL_PATH") or "").strip()
-OCR_MAX_IMAGE_BYTES = 10 * 1024 * 1024
-OCR_ALLOWED_IMAGE_TYPES = {
+IMAGE_MAX_BYTES = 10 * 1024 * 1024
+IMAGE_ALLOWED_MIME_TYPES = {
     "image/png",
     "image/jpeg",
     "image/webp",
@@ -87,15 +86,21 @@ DOCUMENT_ALLOWED_MIME_TYPES = {
 DOCUMENT_MAX_BYTES = 20 * 1024 * 1024
 DOCUMENT_MAX_TEXT_CHARS = 50_000
 DOCUMENT_STORAGE_DIR = (os.getenv("DOCUMENT_STORAGE_DIR") or os.path.join(BASE_DIR, "data", "documents")).strip()
-OCR_ATTENTION_IMPL = (os.getenv("QWEN_VL_ATTENTION") or "").strip() or None
-OCR_MAX_NEW_TOKENS = max(128, min(4096, _parse_int_env("QWEN_VL_MAX_NEW_TOKENS", 768)))
-OCR_MIN_PIXELS = max(28 * 28, _parse_int_env("QWEN_VL_MIN_PIXELS", 256 * 28 * 28))
-OCR_MAX_PIXELS = max(OCR_MIN_PIXELS, _parse_int_env("QWEN_VL_MAX_PIXELS", 896 * 28 * 28))
-OCR_MAX_IMAGE_SIDE = max(560, _parse_int_env("QWEN_VL_MAX_IMAGE_SIDE", 1280))
-OCR_LOAD_IN_4BIT = _parse_bool_env("QWEN_VL_LOAD_IN_4BIT", True)
-OCR_TORCH_DTYPE_NAME = _get_torch_dtype_name()
-OCR_PRELOAD_ON_STARTUP = _parse_bool_env("QWEN_VL_PRELOAD", True)
 VISION_ENABLED = _parse_bool_env("VISION_ENABLED", True)
+OCR_ENABLED = _parse_bool_env("OCR_ENABLED", VISION_ENABLED)
+OCR_PROVIDER = (os.getenv("OCR_PROVIDER") or "paddleocr").strip().lower() or "paddleocr"
+OCR_SUPPORTED_PROVIDERS = {"paddleocr", "easyocr"}
+OCR_PRELOAD_ON_STARTUP = _parse_bool_env("OCR_PRELOAD", True)
+IMAGE_UPLOADS_ENABLED = OCR_ENABLED or VISION_ENABLED
+VISION_MODEL_PATH = (os.getenv("QWEN_VL_MODEL_PATH") or "").strip()
+VISION_ATTENTION_IMPL = (os.getenv("QWEN_VL_ATTENTION") or "").strip() or None
+VISION_MAX_NEW_TOKENS = max(128, min(4096, _parse_int_env("QWEN_VL_MAX_NEW_TOKENS", 768)))
+VISION_MIN_PIXELS = max(28 * 28, _parse_int_env("QWEN_VL_MIN_PIXELS", 256 * 28 * 28))
+VISION_MAX_PIXELS = max(VISION_MIN_PIXELS, _parse_int_env("QWEN_VL_MAX_PIXELS", 896 * 28 * 28))
+VISION_MAX_IMAGE_SIDE = max(560, _parse_int_env("QWEN_VL_MAX_IMAGE_SIDE", 1280))
+VISION_LOAD_IN_4BIT = _parse_bool_env("QWEN_VL_LOAD_IN_4BIT", True)
+VISION_TORCH_DTYPE_NAME = _get_torch_dtype_name()
+VISION_PRELOAD_ON_STARTUP = _parse_bool_env("QWEN_VL_PRELOAD", True)
 
 FETCH_TIMEOUT = 20
 FETCH_MAX_SIZE = 5 * 1024 * 1024
@@ -235,7 +240,11 @@ RAG_DISABLED_INGEST_ERROR = (
     "Manual RAG ingestion is disabled. RAG now only indexes conversation history and successful text-like tool results."
 )
 RAG_DISABLED_FEATURE_ERROR = "RAG is disabled in configuration. Set RAG_ENABLED=true to use it."
-VISION_DISABLED_FEATURE_ERROR = "Vision is disabled in configuration. Set VISION_ENABLED=true to use it."
+OCR_DISABLED_FEATURE_ERROR = "OCR is disabled in configuration. Set OCR_ENABLED=true to use OCR."
+VISION_DISABLED_FEATURE_ERROR = "Vision is disabled in configuration. Set VISION_ENABLED=true to use visual image analysis."
+IMAGE_UPLOADS_DISABLED_FEATURE_ERROR = (
+    "Image uploads are disabled in configuration. Set OCR_ENABLED=true or VISION_ENABLED=true to use image uploads."
+)
 
 
 def _nearest_preset_name(value: float, presets: dict[str, float | int], fallback: str) -> str:
@@ -295,6 +304,8 @@ DEFAULT_SETTINGS = {
 def get_feature_flags() -> dict:
     return {
         "rag_enabled": RAG_ENABLED,
+        "ocr_enabled": OCR_ENABLED,
+        "image_uploads_enabled": IMAGE_UPLOADS_ENABLED,
         "vision_enabled": VISION_ENABLED,
         "scratchpad_admin_editing": SCRATCHPAD_ADMIN_EDITING_ENABLED,
         "login_pin_enabled": bool(LOGIN_PIN),

@@ -1,0 +1,1 @@
+paddleocr>=3.0

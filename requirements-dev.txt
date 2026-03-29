@@ -1,3 +1,7 @@
 -r requirements.txt
+-r requirements-rag.txt
+-r requirements-vl.txt
+-r requirements-ocr-easy.txt
+-r requirements-ocr-paddle.txt
 ruff>=0.11,<0.12
 pytest>=9.0.2

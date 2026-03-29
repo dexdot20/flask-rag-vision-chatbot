@@ -52,7 +52,47 @@ ensure_venv() {
 install_requirements() {
   info "Installing runtime dependencies"
   "${VENV_DIR}/bin/python" -m pip install --upgrade pip
-  "${VENV_DIR}/bin/python" -m pip install -r "${ROOT_DIR}/requirements.txt"
+  install_requirements_file "${ROOT_DIR}/requirements.txt"
+
+  if [[ "${RAG_ENABLED_VALUE}" == "true" ]]; then
+    install_requirements_file "${ROOT_DIR}/requirements-rag.txt"
+  fi
+
+  if [[ "${OCR_ENABLED_VALUE}" == "true" ]]; then
+    if [[ "${OCR_PROVIDER_VALUE}" == "paddleocr" ]]; then
+      install_paddle_runtime
+      install_requirements_file "${ROOT_DIR}/requirements-ocr-paddle.txt"
+    else
+      install_requirements_file "${ROOT_DIR}/requirements-ocr-easy.txt"
+    fi
+  fi
+
+  if [[ "${VISION_ENABLED_VALUE}" == "true" ]]; then
+    install_requirements_file "${ROOT_DIR}/requirements-vl.txt"
+  fi
+}
+
+install_requirements_file() {
+  local requirements_file="$1"
+  if [[ ! -f "${requirements_file}" ]]; then
+    die "Missing requirements file: ${requirements_file}"
+  fi
+  info "Installing $(basename "${requirements_file}")"
+  "${VENV_DIR}/bin/python" -m pip install -r "${requirements_file}"
+}
+
+install_paddle_runtime() {
+  if [[ "${ACCELERATOR}" == "CUDA" ]]; then
+    info "Attempting PaddlePaddle GPU runtime installation"
+    if "${VENV_DIR}/bin/python" -m pip install paddlepaddle-gpu; then
+      return
+    fi
+    warn "Automatic paddlepaddle-gpu installation failed; falling back to paddlepaddle CPU runtime."
+    warn "See README.md if you want to install a CUDA-specific PaddlePaddle wheel manually."
+  fi
+
+  info "Installing PaddlePaddle runtime"
+  "${VENV_DIR}/bin/python" -m pip install paddlepaddle
 }
 
 prompt_choice() {
@@ -62,10 +102,10 @@ prompt_choice() {
   local selection=""
 
   while [[ -z "${selection}" ]]; do
-    printf '\n%s\n' "${prompt_text}"
+    printf '\n%s\n' "${prompt_text}" >&2
     local i=1
     for choice in "${choices[@]}"; do
-      printf '  %s) %s\n' "${i}" "${choice}"
+      printf '  %s) %s\n' "${i}" "${choice}" >&2
       i=$((i + 1))
     done
     read -r -p "> " selection
@@ -197,6 +237,9 @@ info "Select accelerator"
 ACCELERATOR="$(prompt_choice "Choose an accelerator:" "CUDA" "CPU")"
 info "Selected accelerator: ${ACCELERATOR}"
 
+IMAGE_STACK="$(prompt_choice "Choose an image processing stack:" "None" "OCR only" "OCR + VL")"
+info "Selected image processing stack: ${IMAGE_STACK}"
+
 if [[ "${ACCELERATOR}" == "CUDA" ]] && ! cuda_available; then
   warn "CUDA was selected, but no NVIDIA runtime was detected."
   answer="$(prompt_yes_no "Continue in CPU mode instead?" "y")"
@@ -207,12 +250,26 @@ if [[ "${ACCELERATOR}" == "CUDA" ]] && ! cuda_available; then
   fi
 fi
 
+if [[ "${ACCELERATOR}" == "CPU" ]] && [[ "${IMAGE_STACK}" == "OCR + VL" ]]; then
+  warn "OCR + VL requires CUDA for the local Qwen vision model."
+  answer="$(prompt_yes_no "Fallback to OCR only?" "y")"
+  if [[ "${answer}" == "yes" ]]; then
+    IMAGE_STACK="OCR only"
+  else
+    IMAGE_STACK="None"
+  fi
+  info "Adjusted image processing stack: ${IMAGE_STACK}"
+fi
+
 DEEPSEEK_API_KEY="$(prompt_text "Enter your DeepSeek API key:")"
 if [[ -z "${DEEPSEEK_API_KEY}" ]]; then
   die "DEEPSEEK_API_KEY cannot be empty."
 fi
 
 RAG_ENABLED_VALUE="false"
+OCR_ENABLED_VALUE="false"
+OCR_PROVIDER_VALUE="paddleocr"
+OCR_PRELOAD="false"
 VISION_ENABLED_VALUE="false"
 BGE_BATCH_SIZE="8"
 BGE_DEVICE="cpu"
@@ -225,23 +282,56 @@ QWEN_DTYPE="float16"
 case "${PROFILE}" in
   Low)
     RAG_ENABLED_VALUE="false"
-    VISION_ENABLED_VALUE="false"
     BGE_BATCH_SIZE="8"
     ;;
   Medium)
     RAG_ENABLED_VALUE="true"
-    VISION_ENABLED_VALUE="false"
     BGE_BATCH_SIZE="16"
     ;;
   High)
     RAG_ENABLED_VALUE="true"
-    VISION_ENABLED_VALUE="true"
     BGE_BATCH_SIZE="32"
     ;;
   *)
     die "Unknown profile: ${PROFILE}"
     ;;
 esac
+
+case "${IMAGE_STACK}" in
+  "None")
+    OCR_ENABLED_VALUE="false"
+    VISION_ENABLED_VALUE="false"
+    ;;
+  "OCR only")
+    OCR_ENABLED_VALUE="true"
+    VISION_ENABLED_VALUE="false"
+    OCR_PRELOAD="true"
+    ;;
+  "OCR + VL")
+    OCR_ENABLED_VALUE="true"
+    VISION_ENABLED_VALUE="true"
+    OCR_PRELOAD="true"
+    ;;
+  *)
+    die "Unknown image processing stack: ${IMAGE_STACK}"
+    ;;
+esac
+
+if [[ "${OCR_ENABLED_VALUE}" == "true" ]]; then
+  OCR_PROVIDER_CHOICE="$(prompt_choice "Choose an OCR provider:" "PaddleOCR" "EasyOCR")"
+  case "${OCR_PROVIDER_CHOICE}" in
+    PaddleOCR)
+      OCR_PROVIDER_VALUE="paddleocr"
+      ;;
+    EasyOCR)
+      OCR_PROVIDER_VALUE="easyocr"
+      ;;
+    *)
+      die "Unknown OCR provider: ${OCR_PROVIDER_CHOICE}"
+      ;;
+  esac
+  info "Selected OCR provider: ${OCR_PROVIDER_CHOICE}"
+fi
 
 if [[ "${ACCELERATOR}" == "CUDA" ]]; then
   BGE_DEVICE="cuda"
@@ -269,6 +359,9 @@ else
   BGE_PRELOAD="false"
   RAG_ENABLED_VALUE="false"
   VISION_ENABLED_VALUE="false"
+  QWEN_MODEL_PATH=""
+  QWEN_PRELOAD="false"
+  QWEN_LOAD_IN_4BIT="false"
 fi
 
 if [[ "${VISION_ENABLED_VALUE}" == "false" ]]; then
@@ -277,9 +370,16 @@ if [[ "${VISION_ENABLED_VALUE}" == "false" ]]; then
   QWEN_LOAD_IN_4BIT="false"
 fi
 
+if [[ "${OCR_ENABLED_VALUE}" == "false" ]]; then
+  OCR_PRELOAD="false"
+fi
+
 write_env "${ENV_FILE}" \
   "DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}" \
   "RAG_ENABLED=${RAG_ENABLED_VALUE}" \
+  "OCR_ENABLED=${OCR_ENABLED_VALUE}" \
+  "OCR_PROVIDER=${OCR_PROVIDER_VALUE}" \
+  "OCR_PRELOAD=${OCR_PRELOAD}" \
   "VISION_ENABLED=${VISION_ENABLED_VALUE}" \
   "BGE_M3_MODEL_PATH=BAAI/bge-m3" \
   "BGE_M3_DEVICE=${BGE_DEVICE}" \
@@ -297,7 +397,12 @@ install_requirements
 info "Installation summary"
 printf '  profile: %s\n' "${PROFILE}"
 printf '  accelerator: %s\n' "${ACCELERATOR}"
+printf '  image stack: %s\n' "${IMAGE_STACK}"
 printf '  RAG_ENABLED: %s\n' "${RAG_ENABLED_VALUE}"
+printf '  OCR_ENABLED: %s\n' "${OCR_ENABLED_VALUE}"
+if [[ "${OCR_ENABLED_VALUE}" == "true" ]]; then
+  printf '  OCR_PROVIDER: %s\n' "${OCR_PROVIDER_VALUE}"
+fi
 printf '  VISION_ENABLED: %s\n' "${VISION_ENABLED_VALUE}"
 printf '  .env: %s\n' "${ENV_FILE}"
 if [[ -n "${QWEN_MODEL_PATH}" ]]; then

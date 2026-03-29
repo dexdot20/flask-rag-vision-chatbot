@@ -1,6 +1,6 @@
-# Flask ChatBot: DeepSeek + Tools + RAG + Vision + Canvas + Memory
+# Flask ChatBot: DeepSeek + Tools + RAG + OCR + Vision + Canvas + Memory
 
-This is a single-page Flask chat application built around DeepSeek models, multi-step tool use, local RAG, local vision OCR, conversation summarization, pruning, persistent memory, editable canvas documents, and a per-conversation workspace sandbox.
+This is a single-page Flask chat application built around DeepSeek models, multi-step tool use, local RAG, dedicated local OCR, optional local vision analysis, conversation summarization, pruning, persistent memory, editable canvas documents, and a per-conversation workspace sandbox.
 
 It is not a minimal prompt/response demo. The app keeps conversation history in SQLite, restores assistant metadata when a conversation is reopened, supports editing earlier user messages, streams tool progress and reasoning, can enrich a user turn with local OCR or extracted document text before the model sees it, and can compact older content with summaries and pruning.
 
@@ -53,7 +53,7 @@ It is not a minimal prompt/response demo. The app keeps conversation history in 
 
 ### Attachments
 
-- Image uploads are analyzed locally with Qwen2.5-VL when vision is enabled
+- Image uploads are processed locally with a dedicated OCR provider and can optionally be enriched with Qwen2.5-VL visual analysis
 - Document uploads are extracted locally and injected into the conversation context
 - Supported image formats:
   - PNG
@@ -101,16 +101,17 @@ Manual smoke test checklist for the Canvas UI is available in [docs/canvas-ui-sm
 
 1. The browser sends JSON or multipart form data to `/chat`.
 2. The backend loads persisted settings from SQLite.
-3. If an image is attached, local vision analysis runs first.
-4. If a document is attached, its text is extracted and added to the turn context.
-5. If RAG auto-injection is enabled, the user message is searched against the knowledge base.
-6. If tool-memory auto-injection is enabled, the same query searches remembered web results.
-7. A runtime system message is built with the current time, preferences, scratchpad, user profile facts, tool guidance, and any retrieved context.
-8. The agent streams model output.
-9. Tool calls are validated, executed, cached, and appended to the transcript.
-10. Tool progress, reasoning deltas, answer deltas, usage, and message IDs are streamed back as NDJSON.
-11. The final assistant message is stored with metadata such as reasoning, usage, tool trace, canvas state, and stored tool results.
-12. After a turn finishes, the app may summarize older context, prune older visible messages, and sync conversations or tool results into the RAG store.
+3. If an image is attached and OCR is enabled, local OCR runs first.
+4. If vision is also enabled, local Qwen2.5-VL analysis adds non-text visual context.
+5. If a document is attached, its text is extracted and added to the turn context.
+6. If RAG auto-injection is enabled, the user message is searched against the knowledge base.
+7. If tool-memory auto-injection is enabled, the same query searches remembered web results.
+8. A runtime system message is built with the current time, preferences, scratchpad, user profile facts, tool guidance, and any retrieved context.
+9. The agent streams model output.
+10. Tool calls are validated, executed, cached, and appended to the transcript.
+11. Tool progress, reasoning deltas, answer deltas, usage, and message IDs are streamed back as NDJSON.
+12. The final assistant message is stored with metadata such as reasoning, usage, tool trace, canvas state, and stored tool results.
+13. After a turn finishes, the app may summarize older context, prune older visible messages, and sync conversations or tool results into the RAG store.
 
 ## Project structure
 
@@ -123,12 +124,14 @@ Manual smoke test checklist for the Canvas UI is available in [docs/canvas-ui-sm
 ├── conversation_export.py  # Conversation and canvas export utilities
 ├── db.py                   # SQLite schema, settings, assets, cache, metadata helpers
 ├── doc_service.py          # Document upload and text extraction
+├── image_service.py        # OCR + vision orchestration for uploaded images
 ├── messages.py             # Runtime prompt construction and API message preparation
+├── ocr_service.py          # Dedicated OCR provider loading and text extraction
 ├── prune_service.py        # Message pruning helpers
 ├── rag_service.py          # RAG sync/search orchestration and tool-memory storage
 ├── token_utils.py          # Token counting and prompt-source estimation
 ├── tool_registry.py        # Tool definitions and schemas exposed to the model
-├── vision.py               # Local Qwen2.5-VL OCR and image analysis pipeline
+├── vision.py               # Local Qwen2.5-VL visual analysis and image follow-up pipeline
 ├── web_tools.py            # Web search, news search, safe URL fetch, proxy rotation
 ├── routes/
 │   ├── chat.py             # /chat, /api/fix-text, title generation, summarization, pruning helpers
@@ -162,7 +165,7 @@ Quick start:
 bash install.sh
 ```
 
-The installer asks for a system profile and accelerator, writes `.env`, and installs runtime dependencies. If you prefer a manual setup, follow the steps below.
+The installer asks for a system profile, accelerator, image stack (`None`, `OCR only`, or `OCR + VL`), and OCR provider when needed. It writes `.env` and installs only the dependency sets needed for that selection. If you prefer a manual setup, follow the steps below.
 
 ### 1) Create a virtual environment
 
@@ -179,27 +182,46 @@ Runtime:
 pip install -r requirements.txt
 ```
 
+Optional stacks:
+
+```bash
+pip install -r requirements-rag.txt
+pip install -r requirements-ocr-easy.txt
+pip install -r requirements-vl.txt
+```
+
+If you want PaddleOCR instead of EasyOCR:
+
+```bash
+pip install paddlepaddle
+pip install -r requirements-ocr-paddle.txt
+```
+
 Development:
 
 ```bash
 pip install -r requirements-dev.txt
 ```
 
-`requirements.txt` includes the heavier RAG, OCR, export, and document-processing dependencies.
+`requirements.txt` is the shared app baseline. RAG, OCR, and VL stacks live in separate requirement files so manual installs can stay targeted.
 
 ### 3) Hardware and runtime requirements
 
-The RAG embedder and the local vision model are GPU-backed in this codebase.
+RAG and local vision remain GPU-first in this codebase, while OCR can run without the Qwen vision model.
 
 - RAG embeddings require PyTorch with CUDA support and a CUDA-capable GPU.
+- Local OCR can run in OCR-only mode with EasyOCR or PaddleOCR.
 - Local Qwen2.5-VL vision inference requires CUDA and a local model directory.
-- There is no CPU fallback in the current codebase for either local RAG or local vision.
+- There is no CPU fallback in the current codebase for local RAG or local Qwen vision.
+- PaddleOCR GPU installs can require a CUDA-specific PaddlePaddle wheel; `install.sh` attempts a best-effort install and falls back to CPU PaddlePaddle when needed.
 - If you do not have the required GPU stack, disable the features explicitly in `.env` instead of leaving them enabled.
 
 Example overrides for a lighter setup:
 
 ```env
 RAG_ENABLED=false
+OCR_ENABLED=true
+OCR_PROVIDER=easyocr
 VISION_ENABLED=false
 ```
 
@@ -238,7 +260,7 @@ Then open:
 http://127.0.0.1:5000
 ```
 
-Running `python app.py` also triggers optional preload hooks for the local vision model and the embedder. Importing `create_app()` alone does not run those preload hooks.
+Running `python app.py` also triggers optional preload hooks for the OCR engine, the local vision model, and the embedder. Importing `create_app()` alone does not run those preload hooks.
 
 ## Configuration
 
@@ -297,16 +319,19 @@ Some settings come from environment variables, and some are stored in SQLite thr
 
 Note: `rag_context_size` and `rag_sensitivity` are the runtime settings used during retrieval. The corresponding env vars above only seed the default presets stored in SQLite.
 
-### Vision and OCR
+### OCR and vision
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `VISION_ENABLED` | `true` | Enables image analysis and image follow-up |
+| `OCR_ENABLED` | `same as VISION_ENABLED` | Enables dedicated OCR for uploaded images |
+| `OCR_PROVIDER` | `paddleocr` | OCR backend: `paddleocr` or `easyocr` |
+| `OCR_PRELOAD` | `true` | Preload the OCR engine on startup |
+| `VISION_ENABLED` | `true` | Enables Qwen visual analysis and image follow-up |
 | `QWEN_VL_MODEL_PATH` | empty | Required local Qwen2.5-VL model directory |
 | `QWEN_VL_ATTENTION` | empty | Optional Transformers attention implementation |
 | `QWEN_VL_LOAD_IN_4BIT` | `true` | Use 4-bit loading when supported |
 | `QWEN_VL_TORCH_DTYPE` | `float16` | `float16`, `bfloat16`, or `float32` |
-| `QWEN_VL_MAX_NEW_TOKENS` | `768` | Generation limit for image analysis |
+| `QWEN_VL_MAX_NEW_TOKENS` | `768` | Generation limit for visual analysis and image follow-up |
 | `QWEN_VL_MIN_PIXELS` | `256 * 28 * 28` | Processor min-pixels setting |
 | `QWEN_VL_MAX_PIXELS` | `896 * 28 * 28` | Processor max-pixels setting |
 | `QWEN_VL_MAX_IMAGE_SIDE` | `1280` | Resize limit before local inference |
@@ -455,10 +480,11 @@ If you attach an image:
 1. The frontend validates file type and size.
 2. The backend revalidates and reads the upload.
 3. The image is optimized locally.
-4. Qwen2.5-VL extracts OCR text and visual context.
-5. That context is injected into the user message before the main model call.
+4. The configured OCR provider extracts readable text when OCR is enabled.
+5. If vision is enabled, Qwen2.5-VL adds non-text visual context.
+6. That context is injected into the user message before the main model call.
 
-The backend also stores the analysis so follow-up questions about the same image can use the `image_explain` tool.
+The backend also stores the analysis so follow-up questions about the same image can use the `image_explain` tool when vision is enabled. In OCR-only mode, image uploads still work but `image_explain` is not exposed.
 
 ### Document upload workflow
 
@@ -918,9 +944,9 @@ The scratchpad editor is only shown when `SCRATCHPAD_ADMIN_EDITING_ENABLED` is t
 
 Canvas documents are attached to the current conversation. Make sure you are in the same conversation where the document was created, and open the Canvas panel from the top bar.
 
-**Vision uploads are rejected**
+**Image uploads are rejected**
 
-Image uploads require an existing saved conversation and a supported image type. Vision must also be enabled in `.env`.
+Image uploads require an existing saved conversation and a supported image type. At least one of `OCR_ENABLED` or `VISION_ENABLED` must be enabled in `.env`.
 
 **Document uploads fail**
 
@@ -938,7 +964,11 @@ Delete the `chroma_db` directory or the path configured in `CHROMA_DB_PATH`, the
 
 **Why is the vision model not loading?**
 
-Make sure `QWEN_VL_MODEL_PATH` points to a local directory that contains the Qwen2.5-VL model files.
+Make sure `QWEN_VL_MODEL_PATH` points to a local directory that contains the Qwen2.5-VL model files. Vision also requires CUDA in this codebase.
+
+**Why is OCR not starting?**
+
+Check `OCR_ENABLED`, `OCR_PROVIDER`, and the provider-specific runtime. EasyOCR needs its PyTorch stack, while PaddleOCR also needs a compatible `paddlepaddle` runtime.
 
 **How do I enable debug logging?**
 

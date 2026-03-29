@@ -21,12 +21,14 @@ from canvas_service import (
 )
 from config import (
     CHAT_SUMMARY_MODEL,
+    IMAGE_UPLOADS_DISABLED_FEATURE_ERROR,
+    IMAGE_UPLOADS_ENABLED,
+    OCR_ENABLED,
     PROMPT_RAG_AUTO_MAX_TOKENS,
     RAG_ENABLED,
     RAG_SENSITIVITY_PRESETS,
     RAG_SOURCE_CONVERSATION,
     RAG_SOURCE_TOOL_RESULT,
-    VISION_DISABLED_FEATURE_ERROR,
     VISION_ENABLED,
 )
 from db import (
@@ -98,6 +100,8 @@ from messages import (
     normalize_chat_messages,
     prepend_runtime_context,
 )
+from image_service import analyze_uploaded_image
+from ocr_service import preload_ocr_engine
 from project_workspace_service import create_workspace_runtime_state, find_latest_project_workflow, get_workspace_root
 from rag import preload_embedder
 from rag_service import build_rag_auto_context, build_tool_memory_auto_context, conversation_rag_source_key
@@ -105,7 +109,7 @@ from rag_service import sync_conversations_to_rag_safe
 from routes.request_utils import is_valid_model_id, normalize_model_id, parse_messages_payload, parse_optional_int
 from token_utils import estimate_text_tokens
 from tool_registry import resolve_runtime_tool_names
-from vision import preload_local_ocr_engine, read_uploaded_image, run_image_vision_analysis
+from vision import preload_local_vision_engine, read_uploaded_image
 from prune_service import is_prunable_message, prune_conversation_batch
 
 
@@ -1676,8 +1680,8 @@ def register_chat_routes(app) -> None:
         if uploaded_images or uploaded_documents:
             if latest_user_message is None:
                 return jsonify({"error": "Attachments require a user message."}), 400
-            if uploaded_images and not VISION_ENABLED:
-                return jsonify({"error": VISION_DISABLED_FEATURE_ERROR}), 410
+            if uploaded_images and not IMAGE_UPLOADS_ENABLED:
+                return jsonify({"error": IMAGE_UPLOADS_DISABLED_FEATURE_ERROR}), 410
             if conv_id is None:
                 return jsonify({"error": "Attachments require an existing saved conversation."}), 400
 
@@ -1687,7 +1691,7 @@ def register_chat_routes(app) -> None:
                     image_name, image_mime_type, image_bytes = read_uploaded_image(uploaded_file)
                     created_image_asset = create_image_asset(conv_id, image_name, image_mime_type, image_bytes)
                     created_image_assets.append(created_image_asset)
-                    vision_analysis = run_image_vision_analysis(
+                    vision_analysis = analyze_uploaded_image(
                         image_bytes,
                         image_mime_type,
                         user_text=latest_user_message["content"],
@@ -1764,7 +1768,7 @@ def register_chat_routes(app) -> None:
                     delete_file_asset(asset["file_id"], conversation_id=conv_id)
                 if processing_stage == "document":
                     return jsonify({"error": f"Document processing failed: {exc}"}), 502
-                return jsonify({"error": f"Local image analysis failed: {exc}"}), 502
+                return jsonify({"error": f"Local image processing failed: {exc}"}), 502
 
             latest_user_message["metadata"] = _merge_attachment_metadata(
                 latest_user_message.get("metadata"),
@@ -1774,6 +1778,8 @@ def register_chat_routes(app) -> None:
         settings = get_app_settings()
         max_steps = max(1, min(10, int(settings.get("max_steps", 5))))
         active_tool_names = get_active_tool_names(settings)
+        if not VISION_ENABLED:
+            active_tool_names = [name for name in active_tool_names if name != "image_explain"]
         fetch_url_clip_aggressiveness = get_fetch_url_clip_aggressiveness(settings)
         fetch_url_token_threshold = get_fetch_url_token_threshold(settings)
         rag_query_text = ""
@@ -2504,7 +2510,9 @@ def register_chat_routes(app) -> None:
 
 
 def preload_dependencies(app) -> None:
+    if OCR_ENABLED:
+        preload_ocr_engine(app)
     if VISION_ENABLED:
-        preload_local_ocr_engine(app)
+        preload_local_vision_engine(app)
     if RAG_ENABLED:
         preload_embedder()

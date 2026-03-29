@@ -247,7 +247,7 @@ def build_user_message_for_model(
         assistant_guidance = str(attachment.get("assistant_guidance") or "").strip()
         key_points = attachment.get("key_points") if isinstance(attachment.get("key_points"), list) else []
 
-        heading = "[Local Qwen2.5-VL-7B vision assistant analysis]"
+        heading = "[Local image analysis]"
         if len(vision_attachments) > 1:
             heading = f"{heading} Attachment {index}"
         vision_parts = [heading]

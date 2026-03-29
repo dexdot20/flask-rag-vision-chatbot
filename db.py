@@ -47,6 +47,7 @@ from config import (
     RAG_TOOL_RESULT_SUMMARY_MAX_CHARS,
     SUMMARY_RETRY_MIN_SOURCE_TOKENS,
     SUMMARY_SOURCE_TARGET_TOKENS,
+    VISION_ENABLED,
 )
 from token_utils import estimate_text_tokens
 
@@ -1869,6 +1870,8 @@ def get_active_tool_names(settings: dict | None = None) -> list[str]:
     names = normalize_active_tool_names(source.get("active_tools"))
     if not RAG_ENABLED:
         names = [name for name in names if name != "search_knowledge_base"]
+    if not VISION_ENABLED:
+        names = [name for name in names if name != "image_explain"]
     if names:
         if "append_scratchpad" in names:
             names = _ensure_tool("replace_scratchpad", names)
@@ -1877,6 +1880,8 @@ def get_active_tool_names(settings: dict | None = None) -> list[str]:
         names = normalize_active_tool_names(DEFAULT_SETTINGS["active_tools"])
         if not RAG_ENABLED:
             names = [name for name in names if name != "search_knowledge_base"]
+        if not VISION_ENABLED:
+            names = [name for name in names if name != "image_explain"]
         if "append_scratchpad" in names:
             names = _ensure_tool("replace_scratchpad", names)
         return names
