@@ -1069,6 +1069,29 @@ def clear_canvas(runtime_state: dict) -> dict:
     }
 
 
+def build_canvas_document_result_snapshot(document: dict | None) -> dict | None:
+    normalized = normalize_canvas_document(document)
+    if not normalized:
+        return None
+
+    snapshot = {
+        "id": normalized["id"],
+        "title": normalized["title"],
+        "format": normalized["format"],
+        "line_count": normalized["line_count"],
+    }
+    if normalized.get("language"):
+        snapshot["language"] = normalized["language"]
+    for key in ("path", "role", "summary", "project_id", "workspace_id"):
+        if normalized.get(key):
+            snapshot[key] = normalized[key]
+    for key in ("imports", "exports", "symbols", "dependencies"):
+        values = normalized.get(key) if isinstance(normalized.get(key), list) else []
+        if values:
+            snapshot[key] = values
+    return snapshot
+
+
 def build_canvas_tool_result(
     document: dict,
     *,
@@ -1101,7 +1124,7 @@ def build_canvas_tool_result(
     result = {
         "status": "ok",
         "action": action,
-        "document": normalized,
+        "document": build_canvas_document_result_snapshot(normalized),
         "document_id": normalized["id"],
         "primary_locator": extract_canvas_primary_locator(normalized),
         "title": normalized["title"],
@@ -1152,7 +1175,7 @@ def build_canvas_document_context_result(
     return {
         "status": "ok",
         "action": "expanded",
-        "document": normalized,
+        "document": build_canvas_document_result_snapshot(normalized),
         "document_id": normalized["id"],
         "document_path": normalized.get("path"),
         "title": normalized["title"],

@@ -83,6 +83,7 @@ from db import (
     upsert_user_profile_facts,
     update_file_asset,
     update_image_asset,
+    update_message_metadata,
 )
 from doc_service import (
     build_canvas_markdown,
@@ -95,6 +96,7 @@ from doc_service import (
 from messages import (
     SUMMARY_LABEL,
     build_api_messages,
+    build_runtime_context_injection,
     build_user_message_for_model,
     format_knowledge_base_auto_context,
     normalize_chat_messages,
@@ -1035,13 +1037,13 @@ def _build_budgeted_prompt_messages(
     canvas_prompt_max_lines: int | None = None,
     workspace_root: str | None = None,
     project_workflow: dict | None = None,
-) -> tuple[list[dict], dict]:
+) -> tuple[list[dict], dict, str | None]:
     ordered_messages = [message for message in canonical_messages if isinstance(message, dict)]
     tool_trace_context = _build_tool_trace_context(ordered_messages)
     user_profile_context = build_user_profile_system_context(max_tokens=500)
     runtime_tool_names = resolve_runtime_tool_names(active_tool_names, canvas_documents=canvas_documents)
     prompt_budget = max(2_000, get_prompt_max_input_tokens(settings) - get_prompt_response_token_reserve(settings))
-    base_runtime_message = prepend_runtime_context(
+    base_runtime_messages = prepend_runtime_context(
         [],
         settings["user_preferences"],
         runtime_tool_names,
@@ -1055,8 +1057,8 @@ def _build_budgeted_prompt_messages(
         canvas_prompt_max_lines=canvas_prompt_max_lines,
         workspace_root=workspace_root,
         project_workflow=project_workflow,
-    )[0]
-    base_system_tokens = estimate_text_tokens(str(base_runtime_message.get("content") or ""))
+    )
+    base_system_tokens = sum(estimate_text_tokens(str(message.get("content") or "")) for message in base_runtime_messages)
     history_budget = max(1_000, prompt_budget - base_system_tokens)
 
     summary_messages = [message for message in ordered_messages if str(message.get("role") or "").strip() == "summary"]
@@ -1097,6 +1099,19 @@ def _build_budgeted_prompt_messages(
         min(max(0, tool_memory_budget_cap - tool_trace_tokens), remaining_context_budget),
     )
 
+    current_context_injection = build_runtime_context_injection(
+        active_tool_names=runtime_tool_names,
+        retrieved_context=rag_context,
+        tool_trace_context=trimmed_tool_trace,
+        tool_memory_context=trimmed_tool_memory,
+        canvas_documents=canvas_documents,
+        canvas_active_document_id=canvas_active_document_id,
+        canvas_prompt_max_lines=canvas_prompt_max_lines,
+        project_workflow=project_workflow,
+        summary_count=len(selected_summaries),
+        include_time_context=True,
+    )
+
     api_messages = prepend_runtime_context(
         prompt_history_api,
         settings["user_preferences"],
@@ -1111,6 +1126,8 @@ def _build_budgeted_prompt_messages(
         canvas_prompt_max_lines=canvas_prompt_max_lines,
         workspace_root=workspace_root,
         project_workflow=project_workflow,
+        current_context_injection=current_context_injection,
+        summary_count=len(selected_summaries),
     )
 
     stats = {
@@ -1126,7 +1143,7 @@ def _build_budgeted_prompt_messages(
         "summary_message_count": len(selected_summaries),
         "recent_message_count": len(selected_recent),
     }
-    return api_messages, stats
+    return api_messages, stats, current_context_injection or None
 
 
 def _select_summary_source_messages_by_token_budget(
@@ -2096,7 +2113,7 @@ def register_chat_routes(app) -> None:
             initial_canvas_documents = get_canvas_runtime_documents(pre_created_canvas_state)
             initial_canvas_active_document_id = get_canvas_runtime_active_document_id(pre_created_canvas_state)
         runtime_tool_names = resolve_runtime_tool_names(active_tool_names, canvas_documents=initial_canvas_documents)
-        api_messages, prompt_budget_stats = _build_budgeted_prompt_messages(
+        api_messages, prompt_budget_stats, current_context_injection = _build_budgeted_prompt_messages(
             canonical_messages,
             settings,
             runtime_tool_names,
@@ -2108,6 +2125,13 @@ def register_chat_routes(app) -> None:
             workspace_root=workspace_root,
             project_workflow=initial_project_workflow,
         )
+        if persisted_user_message_id is not None and current_context_injection:
+            update_message_metadata(
+                persisted_user_message_id,
+                {
+                    "context_injection": current_context_injection,
+                },
+            )
 
         app_obj = current_app._get_current_object()
         defer_post_response_tasks = not current_app.testing

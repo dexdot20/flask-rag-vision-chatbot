@@ -73,6 +73,7 @@ from db import (
     MESSAGE_USAGE_BREAKDOWN_REDUCTION_ORDER,
     append_to_scratchpad,
     get_rag_source_types,
+    parse_message_tool_calls,
     read_image_asset_bytes,
     replace_scratchpad,
 )
@@ -1579,7 +1580,7 @@ def _build_assistant_tool_call_message(content_text: str, tool_calls: list[dict]
     return {
         "role": "assistant",
         "content": str(content_text or ""),
-        "tool_calls": serialized_tool_calls,
+        "tool_calls": parse_message_tool_calls(serialized_tool_calls),
     }
 
 
@@ -3043,6 +3044,15 @@ def run_agent_stream(
         return compacted_turn_messages, True
 
     def usage_event():
+        prompt_tokens_total = max(0, int(usage_totals["prompt_tokens"] or 0))
+        input_breakdown = dict(usage_totals["input_breakdown"])
+        estimated_input_tokens = max(0, int(usage_totals["estimated_input_tokens"] or 0))
+        if prompt_tokens_total > 0:
+            input_breakdown = _align_breakdown_to_provider_total(input_breakdown, prompt_tokens_total)
+            estimated_input_tokens = prompt_tokens_total
+        elif input_breakdown:
+            estimated_input_tokens = sum(max(0, int(value or 0)) for value in input_breakdown.values())
+
         call_usage_summary = _summarize_model_call_usage(
             usage_totals["model_calls"],
             fallback_input_tokens=usage_totals["prompt_tokens"],
@@ -3058,13 +3068,13 @@ def run_agent_stream(
         )
         return {
             "type": "usage",
-            "prompt_tokens": usage_totals["prompt_tokens"],
+            "prompt_tokens": prompt_tokens_total,
             "prompt_cache_hit_tokens": usage_totals["prompt_cache_hit_tokens"],
             "prompt_cache_miss_tokens": usage_totals["prompt_cache_miss_tokens"],
             "completion_tokens": usage_totals["completion_tokens"],
             "total_tokens": usage_totals["total_tokens"],
-            "estimated_input_tokens": usage_totals["estimated_input_tokens"],
-            "input_breakdown": dict(usage_totals["input_breakdown"]),
+            "estimated_input_tokens": estimated_input_tokens,
+            "input_breakdown": input_breakdown,
             "model_call_count": usage_totals["model_call_count"],
             "model_calls": list(usage_totals["model_calls"]),
             "max_input_tokens_per_call": call_usage_summary["max_input_tokens_per_call"],

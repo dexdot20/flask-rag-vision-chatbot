@@ -291,11 +291,23 @@ def build_user_message_for_model(
 
 def build_api_messages(messages: list[dict], *, canvas_documents: list[dict] | None = None) -> list[dict]:
     api_messages = []
-    for message in messages:
+    last_user_index = -1
+    for index, message in enumerate(messages):
+        if isinstance(message, dict) and str(message.get("role") or "").strip() == "user":
+            last_user_index = index
+    for index, message in enumerate(messages):
         content = message["content"]
         role = message["role"]
         metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
         if role == "user":
+            context_injection = str(metadata.get("context_injection") or "").strip()
+            if context_injection and index == last_user_index:
+                api_messages.append(
+                    {
+                        "role": "system",
+                        "content": context_injection,
+                    }
+                )
             content = build_user_message_for_model(content, metadata, canvas_documents=canvas_documents)
         elif role == "summary":
             role = "assistant"
@@ -480,25 +492,21 @@ def _build_canvas_editing_guidance(active_tool_names: list[str], canvas_payload:
         "## Canvas Editing Guidance",
         "- Prefer the smallest valid canvas change that satisfies the request.",
         "- Do not rewrite the whole document when only part needs to change; use replace_canvas_lines, insert_canvas_lines, or delete_canvas_lines for local edits when the exact visible lines are known.",
-        "- If the target lines are not visible yet, inspect first with scroll_canvas_document for a focused range or expand_canvas_document for a wider view.",
+        "- If the target lines are not visible yet, inspect first with scroll_canvas_document or expand_canvas_document.",
         "- If you do not know the document_id, use the document_path from the workspace summary, active file label, or manifest; document_id is optional.",
         "- Use rewrite_canvas_document when most of the document should change or when you already know the complete intended replacement content.",
         "- Multiple canvas tool calls in one answer are fine when needed: inspect, then edit, then create or update other files.",
         "- When using replace_canvas_lines or insert_canvas_lines, ALL code content must be placed INSIDE the `lines` array as properly escaped JSON strings. "
-        'Example: {"start_line": 2, "end_line": 3, "lines": ["const char* ssid = \\"MyNet\\";", "const char* pass = \\"abc\\";"]}. '
-        "Never put code outside the lines array, never use code identifiers as argument keys.",
+        'Example: {"start_line": 2, "end_line": 3, "lines": ["const char* ssid = \\"MyNet\\";"]}. '
+        "Never put code outside the lines array.",
         "## Code Document Rules",
-        "- For any source code file, use format='code' and set the language (e.g. python, cpp, javascript, bash). "
-        "If path is given (e.g. sketch.ino, src/app.py), format and language are inferred from the extension automatically.",
-        "- The content of a code document is raw source code — do NOT wrap it in triple-backtick fences. "
-        "Fences are added automatically by the renderer.",
-        "- When editing code lines, preserve the original indentation exactly. "
-        "Each element of the lines array is one complete line; spaces and tabs matter.",
-        "- If the visible excerpt says [Excerpt: lines 1\u2013N of M], the document has M lines total. "
-        "Use scroll_canvas_document to navigate to any hidden region before editing those lines.",
+        "- For source code files, use format='code'. If path is given, format and language are usually inferred automatically.",
+        "- The content of a code document is raw source code — do NOT wrap it in triple-backtick fences.",
+        "- When editing code lines, preserve indentation exactly. Each element of the lines array is one complete line.",
+        "- If the excerpt says [Excerpt: lines 1\u2013N of M], use scroll_canvas_document before editing hidden lines.",
     ]
     if (canvas_payload or {}).get("mode") == "project":
-        lines.append("- In project mode, prefer document_path for targeting; it is enough even when you do not know the document_id yet, and keep one file per canvas document.")
+        lines.append("- In project mode, prefer document_path for targeting, even when you do not know the document_id yet.")
     lines.append("")
     return lines
 
@@ -555,72 +563,56 @@ def build_tool_call_contract(active_tool_names: list[str], canvas_documents=None
     return {"rules": rules}
 
 
+def _round_time_for_cache(now: datetime, window_minutes: int = 5) -> datetime:
+    normalized_now = now.astimezone().replace(second=0, microsecond=0)
+    if window_minutes <= 1:
+        return normalized_now
+    rounded_minute = (normalized_now.minute // window_minutes) * window_minutes
+    return normalized_now.replace(minute=rounded_minute)
+
+
 def _build_current_time_context(now: datetime) -> str:
-    normalized_now = now.astimezone()
+    normalized_now = _round_time_for_cache(now)
     offset = normalized_now.strftime("%z")
     timezone_label = f"UTC{offset[:3]}:{offset[3:]}" if offset else (normalized_now.tzname() or "UTC")
     return (
         f"## Current Date and Time\n- ISO: {normalized_now.isoformat(timespec='seconds')}\n"
-        f"- Date: {normalized_now.date().isoformat()}\n- Time: {normalized_now.strftime('%H:%M:%S')}\n"
+        f"- Date: {normalized_now.date().isoformat()}\n- Time: {normalized_now.strftime('%H:%M')}\n"
         f"- Weekday: {normalized_now.strftime('%A')}\n- Timezone: {timezone_label}\n"
     )
 
 
-def build_runtime_system_message(
-    user_preferences="",
-    active_tool_names=None,
+def _count_summary_messages(messages: list[dict] | None) -> int:
+    count = 0
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "").strip()
+        if role == "summary":
+            count += 1
+            continue
+        if role == "assistant":
+            content = str(message.get("content") or "").strip()
+            if content.lower().startswith(SUMMARY_LABEL.lower()):
+                count += 1
+    return count
+
+
+def _build_runtime_volatile_parts(
+    *,
+    active_tool_names: list[str],
     retrieved_context=None,
-    user_profile_context=None,
     tool_trace_context=None,
     tool_memory_context=None,
-    now=None,
-    scratchpad="",
+    now: datetime,
     canvas_documents=None,
     canvas_active_document_id: str | None = None,
     canvas_prompt_max_lines: int | None = None,
-    workspace_root: str | None = None,
     project_workflow: dict | None = None,
+    summary_count: int = 0,
     include_time_context: bool = True,
-):
-    now = (now or datetime.now().astimezone()).astimezone()
-    preferences_text = (user_preferences or "").strip()[:MAX_USER_PREFERENCES_LENGTH]
-    scratchpad_text = (scratchpad or "").strip()
-    active_tool_names = resolve_runtime_tool_names(active_tool_names or [], canvas_documents=canvas_documents)
-    
-    parts = ["You are a helpful AI assistant. You must respect the rules and guidelines provided below.\n"]
+) -> list[str]:
     volatile_parts: list[str] = []
-
-    # User preferences
-    if preferences_text:
-        parts.append(f"## User Preferences\n{preferences_text}\n")
-
-    normalized_user_profile_context = str(user_profile_context or "").strip()
-    if normalized_user_profile_context:
-        parts.append("## User Profile")
-        parts.append(
-            "*Use this as durable cross-conversation memory about the user when it is relevant to the current request. Do not treat it as higher priority than the user's latest explicit instruction.*\n"
-        )
-        parts.append(normalized_user_profile_context)
-        parts.append("")
-
-    # Scratchpad
-    if scratchpad_text or any(name in {"append_scratchpad", "replace_scratchpad"} for name in active_tool_names):
-        parts.append("## Scratchpad (AI Persistent Memory)")
-        parts.append("*This section is your complete scratchpad — you can read it directly here without calling any tool.*\n")
-        if scratchpad_text:
-            parts.append(scratchpad_text)
-        else:
-            parts.append("(Empty)")
-        if any(name in {"append_scratchpad", "replace_scratchpad"} for name in active_tool_names):
-            parts.append(
-                "\n### Memory Write Policy\n"
-                "- **DO save**: Only durable, high-signal facts that are likely to change future answers or actions. Examples: stable user preferences, long-lived constraints, confirmed identity details, and recurring requirements.\n"
-                "- **DO NOT save**: One-off tasks, transient project state, raw tool outputs, web/search results, speculative inferences, broad summaries, or details already obvious from the current chat.\n"
-                "- **Before saving**: Ask whether this information will still matter in a future conversation and whether it is specific enough to be useful as a single short note. If not, do not save it.\n"
-                "- **Web findings**: Do not turn search/news/URL results into scratchpad entries unless the result is clearly durable and the user would reasonably expect it to be remembered later. Never save them just because they were requested.\n"
-                "- **Style**: Each `notes` item must be one single short standalone fact. Never put multiple facts in one item. Call `append_scratchpad` once per batch of facts instead of once per fact."
-            )
-        parts.append("")
 
     normalized_tool_trace_context = str(tool_trace_context or "").strip()
     if normalized_tool_trace_context:
@@ -642,8 +634,7 @@ def build_runtime_system_message(
             else:
                 volatile_parts.append(json.dumps(tool_memory_payload["auto_injected_context"], ensure_ascii=False, indent=2))
         volatile_parts.append("")
-        
-    # Knowledge Base / RAG Context
+
     kb_payload = _build_knowledge_base_payload(retrieved_context, active_tool_names)
     if kb_payload:
         volatile_parts.append("## Knowledge Base")
@@ -655,26 +646,6 @@ def build_runtime_system_message(
             else:
                 volatile_parts.append(json.dumps(kb_payload["auto_injected_context"], ensure_ascii=False, indent=2))
         volatile_parts.append("")
-
-    # Policies
-    policies = []
-    clarification_policy = _build_clarification_policy_payload(active_tool_names)
-    if clarification_policy:
-        policies.append(f"**Clarification**: {clarification_policy['guidance']}")
-    image_policy = _build_image_policy_payload(active_tool_names)
-    if image_policy:
-        policies.append(f"**Image Follow-up**: {image_policy['guidance']}")
-    
-    if policies:
-        parts.append("## Important Policies\n" + "\n".join(f"- {p}" for p in policies) + "\n")
-
-    normalized_workspace_root = str(workspace_root or "").strip()
-    if normalized_workspace_root:
-        parts.append("## Workspace Sandbox")
-        parts.append(f"- Root: {normalized_workspace_root}")
-        parts.append("- Scope: All workspace file tools must stay inside this root.")
-        parts.append("- Safety: If a batch write tool returns needs_confirmation, wait for explicit user approval before re-running with confirm=true.\n")
-        parts.append("- Review: Prefer returned unified diffs or preview_workspace_changes before high-impact rewrites, and use workspace undo/redo tools for recovery.\n")
 
     if isinstance(project_workflow, dict) and project_workflow:
         volatile_parts.append("## Project Workflow")
@@ -718,6 +689,131 @@ def build_runtime_system_message(
         else:
             volatile_parts.append("(The active canvas document is empty.)\n")
 
+    if summary_count:
+        volatile_parts.append(
+            f"## Conversation Summaries\nCount: {summary_count}\n*Guidance: Summary-role messages compress earlier deleted conversation turns and should be treated as authoritative context.*"
+        )
+
+    if include_time_context:
+        volatile_parts.append(_build_current_time_context(now))
+
+    return volatile_parts
+
+
+def build_runtime_context_injection(
+    active_tool_names=None,
+    retrieved_context=None,
+    tool_trace_context=None,
+    tool_memory_context=None,
+    now=None,
+    canvas_documents=None,
+    canvas_active_document_id: str | None = None,
+    canvas_prompt_max_lines: int | None = None,
+    project_workflow: dict | None = None,
+    summary_count: int = 0,
+    include_time_context: bool = True,
+) -> str:
+    normalized_now = (now or datetime.now().astimezone()).astimezone()
+    resolved_tool_names = resolve_runtime_tool_names(active_tool_names or [], canvas_documents=canvas_documents)
+    return "\n".join(
+        _build_runtime_volatile_parts(
+            active_tool_names=resolved_tool_names,
+            retrieved_context=retrieved_context,
+            tool_trace_context=tool_trace_context,
+            tool_memory_context=tool_memory_context,
+            now=normalized_now,
+            canvas_documents=canvas_documents,
+            canvas_active_document_id=canvas_active_document_id,
+            canvas_prompt_max_lines=canvas_prompt_max_lines,
+            project_workflow=project_workflow,
+            summary_count=summary_count,
+            include_time_context=include_time_context,
+        )
+    ).strip()
+
+
+def build_runtime_system_message(
+    user_preferences="",
+    active_tool_names=None,
+    retrieved_context=None,
+    user_profile_context=None,
+    tool_trace_context=None,
+    tool_memory_context=None,
+    now=None,
+    scratchpad="",
+    canvas_documents=None,
+    canvas_active_document_id: str | None = None,
+    canvas_prompt_max_lines: int | None = None,
+    workspace_root: str | None = None,
+    project_workflow: dict | None = None,
+    include_time_context: bool = True,
+    include_volatile_context: bool = True,
+    summary_count: int = 0,
+):
+    now = (now or datetime.now().astimezone()).astimezone()
+    preferences_text = (user_preferences or "").strip()[:MAX_USER_PREFERENCES_LENGTH]
+    scratchpad_text = (scratchpad or "").strip()
+    active_tool_names = resolve_runtime_tool_names(active_tool_names or [], canvas_documents=canvas_documents)
+    
+    parts = ["You are a helpful AI assistant. You must respect the rules and guidelines provided below.\n"]
+
+    # User preferences
+    if preferences_text:
+        parts.append(f"## User Preferences\n{preferences_text}\n")
+
+    normalized_user_profile_context = str(user_profile_context or "").strip()
+    if normalized_user_profile_context:
+        parts.append("## User Profile")
+        parts.append(
+            "*Use this as durable cross-conversation memory about the user when it is relevant to the current request. Do not treat it as higher priority than the user's latest explicit instruction.*\n"
+        )
+        parts.append(normalized_user_profile_context)
+        parts.append("")
+
+    # Scratchpad
+    if scratchpad_text or any(name in {"append_scratchpad", "replace_scratchpad"} for name in active_tool_names):
+        parts.append("## Scratchpad (AI Persistent Memory)")
+        parts.append("*This section is your complete scratchpad — you can read it directly here without calling any tool.*\n")
+        if scratchpad_text:
+            parts.append(scratchpad_text)
+        else:
+            parts.append("(Empty)")
+        if any(name in {"append_scratchpad", "replace_scratchpad"} for name in active_tool_names):
+            parts.append(
+                "\n### Memory Write Policy\n"
+                "- **DO save**: Only durable, high-signal facts that are likely to change future answers or actions. Examples: stable user preferences, long-lived constraints, confirmed identity details, and recurring requirements.\n"
+                "- **DO NOT save**: One-off tasks, transient project state, raw tool outputs, web/search results, speculative inferences, broad summaries, or details already obvious from the current chat.\n"
+                "- **Before saving**: Ask whether this information will still matter in a future conversation and whether it is specific enough to be useful as a single short note. If not, do not save it.\n"
+                "- **Web findings**: Do not turn search/news/URL results into scratchpad entries unless the result is clearly durable and the user would reasonably expect it to be remembered later. Never save them just because they were requested.\n"
+                "- **Style**: Each `notes` item must be one single short standalone fact. Never put multiple facts in one item. Call `append_scratchpad` once per batch of facts instead of once per fact."
+            )
+        parts.append("")
+
+    # Policies
+    policies = []
+    clarification_policy = _build_clarification_policy_payload(active_tool_names)
+    if clarification_policy:
+        policies.append(f"**Clarification**: {clarification_policy['guidance']}")
+    image_policy = _build_image_policy_payload(active_tool_names)
+    if image_policy:
+        policies.append(f"**Image Follow-up**: {image_policy['guidance']}")
+    
+    if policies:
+        parts.append("## Important Policies\n" + "\n".join(f"- {p}" for p in policies) + "\n")
+
+    normalized_workspace_root = str(workspace_root or "").strip()
+    if normalized_workspace_root:
+        parts.append("## Workspace Sandbox")
+        parts.append(f"- Root: {normalized_workspace_root}")
+        parts.append("- Scope: All workspace file tools must stay inside this root.")
+        parts.append("- Safety: If a batch write tool returns needs_confirmation, wait for explicit user approval before re-running with confirm=true.\n")
+        parts.append("- Review: Prefer returned unified diffs or preview_workspace_changes before high-impact rewrites, and use workspace undo/redo tools for recovery.\n")
+
+    canvas_payload = _build_canvas_prompt_payload(
+        canvas_documents,
+        active_document_id=canvas_active_document_id,
+        max_lines=canvas_prompt_max_lines or CANVAS_PROMPT_MAX_LINES,
+    )
     canvas_editing_guidance = _build_canvas_editing_guidance(active_tool_names, canvas_payload)
     if canvas_editing_guidance:
         parts.extend(canvas_editing_guidance)
@@ -742,9 +838,23 @@ def build_runtime_system_message(
             parts.append(f"- {rule}")
         parts.append("")
 
-    parts.extend(volatile_parts)
-
-    if include_time_context:
+    if include_volatile_context:
+        parts.extend(
+            _build_runtime_volatile_parts(
+                active_tool_names=active_tool_names,
+                retrieved_context=retrieved_context,
+                tool_trace_context=tool_trace_context,
+                tool_memory_context=tool_memory_context,
+                now=now,
+                canvas_documents=canvas_documents,
+                canvas_active_document_id=canvas_active_document_id,
+                canvas_prompt_max_lines=canvas_prompt_max_lines,
+                project_workflow=project_workflow,
+                summary_count=summary_count,
+                include_time_context=include_time_context,
+            )
+        )
+    elif include_time_context:
         parts.append(_build_current_time_context(now))
 
     return {
@@ -767,8 +877,9 @@ def prepend_runtime_context(
     canvas_prompt_max_lines: int | None = None,
     workspace_root: str | None = None,
     project_workflow: dict | None = None,
+    current_context_injection: str | None = None,
+    summary_count: int | None = None,
 ):
-    summary_count = sum(1 for message in messages if message.get("role") == "summary")
     runtime_message = build_runtime_system_message(
         user_preferences,
         active_tool_names or [],
@@ -783,19 +894,40 @@ def prepend_runtime_context(
         workspace_root=workspace_root,
         project_workflow=project_workflow,
         include_time_context=False,
+        include_volatile_context=False,
     )
-    
-    system_content = runtime_message["content"]
-    
-    if summary_count:
-        system_content += f"\n\n## Conversation Summaries\nCount: {summary_count}\n*Guidance: Summary-role messages compress earlier deleted conversation turns and should be treated as authoritative context.*"
 
-    system_content += "\n\n" + _build_current_time_context(datetime.now().astimezone()).strip()
+    normalized_summary_count = summary_count if summary_count is not None else _count_summary_messages(messages)
+    injection_content = str(current_context_injection or "").strip()
+    if not injection_content:
+        injection_content = build_runtime_context_injection(
+            active_tool_names=active_tool_names or [],
+            retrieved_context=retrieved_context,
+            tool_trace_context=tool_trace_context,
+            tool_memory_context=tool_memory_context,
+            canvas_documents=canvas_documents,
+            canvas_active_document_id=canvas_active_document_id,
+            canvas_prompt_max_lines=canvas_prompt_max_lines,
+            project_workflow=project_workflow,
+            summary_count=normalized_summary_count,
+            include_time_context=True,
+        )
+
+    if not injection_content:
+        return [runtime_message, *messages]
+
+    insertion_index = len(messages)
+    for index in range(len(messages) - 1, -1, -1):
+        if str(messages[index].get("role") or "").strip() == "user":
+            insertion_index = index
+            break
 
     return [
+        runtime_message,
+        *messages[:insertion_index],
         {
             "role": "system",
-            "content": system_content,
+            "content": injection_content,
         },
-        *messages,
+        *messages[insertion_index:],
     ]

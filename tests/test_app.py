@@ -62,6 +62,7 @@ from db import (
     get_user_profile_entries,
     insert_message,
     normalize_active_tool_names,
+    parse_message_tool_calls,
     parse_message_metadata,
     save_app_settings,
     serialize_message_metadata,
@@ -1093,7 +1094,8 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(message["role"], "system")
         content = message["content"]
         self.assertIn("## Current Date and Time", content)
-        self.assertIn("2026-03-15T21:42:05+03:00", content)
+        self.assertIn("2026-03-15T21:40:00+03:00", content)
+        self.assertIn("- Time: 21:40", content)
         self.assertIn("User Preferences\nKeep answers short.", content)
         self.assertIn("Scratchpad (AI Persistent Memory)", content)
         self.assertIn("The user is 22 years old.", content)
@@ -1534,7 +1536,7 @@ class AppRoutesTestCase(unittest.TestCase):
         ])
 
         rules_text = "\n".join(contract["rules"])
-        self.assertIn("execute those safe tools in parallel", rules_text)
+        self.assertIn("Concurrently executed (I/O runs in parallel)", rules_text)
         self.assertIn("search_web, fetch_url, image_explain", rules_text)
         self.assertIn("search_tool_memory", rules_text)
 
@@ -1651,14 +1653,17 @@ class AppRoutesTestCase(unittest.TestCase):
         )
 
         self.assertEqual(messages[0]["role"], "system")
-        
-        content = messages[0]["content"]
+        self.assertEqual(messages[1]["role"], "system")
+
+        stable_content = messages[0]["content"]
+        content = messages[1]["content"]
+        self.assertNotIn("Current Date and Time", stable_content)
+        self.assertIn("Persistent note", stable_content)
         self.assertIn("Current Date and Time", content)
-        self.assertIn("Persistent note", content)
         self.assertNotIn("User Preferences", content)
         self.assertIn("Date: ", content)
         self.assertIn("Time: ", content)
-        self.assertEqual(messages[1]["role"], "user")
+        self.assertEqual(messages[2]["role"], "user")
 
     def test_prepend_runtime_context_places_datetime_after_conversation_summaries(self):
         messages = prepend_runtime_context(
@@ -1670,7 +1675,9 @@ class AppRoutesTestCase(unittest.TestCase):
             active_tool_names=[],
         )
 
-        content = messages[0]["content"]
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertEqual(messages[2]["role"], "system")
+        content = messages[2]["content"]
         self.assertIn("## Conversation Summaries", content)
         self.assertIn("## Current Date and Time", content)
         self.assertLess(content.index("## Conversation Summaries"), content.index("## Current Date and Time"))
@@ -2946,7 +2953,7 @@ class AppRoutesTestCase(unittest.TestCase):
     def test_settings_ui_exposes_fetch_threshold_input(self):
         html = self.client.get("/settings").get_data(as_text=True)
         self.assertIn("Tool step budget", html)
-        self.assertIn("Tool step limit (1-10)", html)
+        self.assertIn("Tool step limit (1-50)", html)
         self.assertIn('value="append_scratchpad"', html)
         self.assertIn('value="ask_clarifying_question"', html)
         self.assertIn('id="scratchpad-list"', html)
@@ -3485,6 +3492,34 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual([message["role"] for message in messages], ["user", "assistant", "tool", "assistant"])
         self.assertEqual(messages[1]["tool_calls"][0]["function"]["name"], "search_web")
         self.assertEqual(messages[2]["tool_call_id"], "call-1")
+
+    def test_parse_message_tool_calls_compacts_large_canvas_payloads(self):
+        large_content = "\n".join(f"print({index})" for index in range(200))
+        raw_tool_calls = [
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                    "name": "create_canvas_document",
+                    "arguments": json.dumps(
+                        {
+                            "title": "draft.py",
+                            "content": large_content,
+                            "symbols": [f"symbol_{index}" for index in range(40)],
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            }
+        ]
+
+        normalized = parse_message_tool_calls(raw_tool_calls)
+
+        self.assertEqual(len(normalized), 1)
+        arguments = json.loads(normalized[0]["function"]["arguments"])
+        self.assertIn("[TRIMMED canvas content:", arguments["content"])
+        self.assertLess(len(arguments["content"]), len(large_content))
+        self.assertIn("[TRIMMED symbols:", arguments["symbols"][-1])
 
     def test_serialize_message_metadata_keeps_tool_trace(self):
         payload = serialize_message_metadata(
@@ -4526,7 +4561,7 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertGreater(usage_event["configured_prompt_max_input_tokens"], 0)
         self.assertGreater(usage_event["input_breakdown"]["user_messages"], 0)
         self.assertGreater(usage_event["input_breakdown"]["tool_results"], 0)
-        self.assertEqual(usage_event["input_breakdown"]["assistant_history"], 0)
+        self.assertEqual(usage_event["input_breakdown"].get("assistant_history", 0), 0)
         self.assertEqual(usage_event["model_call_count"], 2)
         self.assertEqual(len(usage_event["model_calls"]), 2)
         self.assertEqual(usage_event["model_calls"][0]["call_type"], "agent_step")
@@ -4553,6 +4588,89 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIsNotNone(tool_history_event)
         self.assertEqual(tool_history_event["messages"][0]["role"], "assistant")
         self.assertEqual(tool_history_event["messages"][1]["role"], "tool")
+
+    def test_run_agent_stream_compacts_canvas_tool_call_history(self):
+        large_content = "\n".join(f"value_{index} = {index}" for index in range(400))
+        original_arguments = {
+            "title": "draft.py",
+            "content": large_content,
+            "format": "code",
+            "language": "python",
+        }
+        responses = [
+            iter(
+                [
+                    self._stream_chunk(
+                        tool_calls=[
+                            {
+                                "index": 0,
+                                "id": "tool-call-1",
+                                "function": {
+                                    "name": "create_canvas_document",
+                                    "arguments": json.dumps(original_arguments, ensure_ascii=False),
+                                },
+                            }
+                        ]
+                    ),
+                    self._stream_chunk(
+                        usage=SimpleNamespace(
+                            prompt_tokens=5,
+                            prompt_cache_hit_tokens=0,
+                            prompt_cache_miss_tokens=5,
+                            completion_tokens=4,
+                            total_tokens=9,
+                        )
+                    ),
+                ]
+            ),
+            iter(
+                [
+                    self._stream_chunk(content="Canvas hazır."),
+                    self._stream_chunk(
+                        usage=SimpleNamespace(
+                            prompt_tokens=4,
+                            prompt_cache_hit_tokens=0,
+                            prompt_cache_miss_tokens=4,
+                            completion_tokens=3,
+                            total_tokens=7,
+                        )
+                    ),
+                ]
+            ),
+        ]
+
+        with patch("agent.client.chat.completions.create", side_effect=responses) as mocked_create:
+            list(run_agent_stream([{"role": "user", "content": "Bir canvas taslağı oluştur."}], "deepseek-chat", 2, ["create_canvas_document"]))
+
+        second_call_messages = mocked_create.call_args_list[1].kwargs["messages"]
+        assistant_tool_call = second_call_messages[1]["tool_calls"][0]
+        self.assertEqual(assistant_tool_call["function"]["name"], "create_canvas_document")
+        compacted_arguments_text = assistant_tool_call["function"]["arguments"]
+        compacted_arguments = json.loads(compacted_arguments_text)
+        self.assertIn("[TRIMMED canvas content:", compacted_arguments["content"])
+        self.assertLess(
+            len(compacted_arguments_text),
+            len(json.dumps(original_arguments, ensure_ascii=False)),
+        )
+
+    def test_execute_create_canvas_document_returns_lightweight_document_snapshot(self):
+        runtime_state = {"canvas": create_canvas_runtime_state([])}
+        result, summary = _execute_tool(
+            "create_canvas_document",
+            {
+                "title": "draft.py",
+                "content": "\n".join(f"print({index})" for index in range(400)),
+                "format": "code",
+                "language": "python",
+            },
+            runtime_state=runtime_state,
+        )
+
+        self.assertEqual(summary, "Canvas created: draft.py")
+        self.assertEqual(result["document"]["title"], "draft.py")
+        self.assertEqual(result["document"]["format"], "code")
+        self.assertNotIn("content", result["document"])
+        self.assertTrue(result["content_truncated"])
 
     def test_build_api_messages_preserves_tool_history_fields(self):
         normalized = normalize_chat_messages(
@@ -4592,6 +4710,69 @@ class AppRoutesTestCase(unittest.TestCase):
 
         self.assertEqual(api_messages[0]["role"], "assistant")
         self.assertIn("Conversation summary", api_messages[0]["content"])
+
+    def test_build_api_messages_injects_persisted_context_before_user_message(self):
+        normalized = normalize_chat_messages(
+            [
+                {
+                    "role": "user",
+                    "content": "Hello",
+                    "metadata": parse_message_metadata(
+                        serialize_message_metadata(
+                            {
+                                "context_injection": "## Current Date and Time\n- Time: 21:40",
+                            }
+                        )
+                    ),
+                },
+            ]
+        )
+
+        api_messages = build_api_messages(normalized)
+
+        self.assertEqual(api_messages[0]["role"], "system")
+        self.assertIn("## Current Date and Time", api_messages[0]["content"])
+        self.assertEqual(api_messages[1]["role"], "user")
+        self.assertEqual(api_messages[1]["content"], "Hello")
+
+    def test_build_api_messages_ignores_stale_context_injection_on_history(self):
+        normalized = normalize_chat_messages(
+            [
+                {
+                    "role": "user",
+                    "content": "First",
+                    "metadata": parse_message_metadata(
+                        serialize_message_metadata(
+                            {
+                                "context_injection": "## Current Date and Time\n- Time: 21:35",
+                            }
+                        )
+                    ),
+                },
+                {
+                    "role": "assistant",
+                    "content": "Reply",
+                },
+                {
+                    "role": "user",
+                    "content": "Second",
+                    "metadata": parse_message_metadata(
+                        serialize_message_metadata(
+                            {
+                                "context_injection": "## Current Date and Time\n- Time: 21:40",
+                            }
+                        )
+                    ),
+                },
+            ]
+        )
+
+        api_messages = build_api_messages(normalized)
+
+        system_messages = [message for message in api_messages if message["role"] == "system"]
+        self.assertEqual(len(system_messages), 1)
+        self.assertIn("21:40", system_messages[0]["content"])
+        self.assertNotIn("21:35", system_messages[0]["content"])
 
     def test_run_agent_stream_retries_until_content_final_answer_arrives(self):
         responses = [

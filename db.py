@@ -85,6 +85,19 @@ MESSAGE_USAGE_BREAKDOWN_PROTECTED_KEYS = (
     "user_messages",
     "tool_results",
 )
+CONTENT_HEAVY_CANVAS_TOOL_NAMES = {
+    "create_canvas_document",
+    "rewrite_canvas_document",
+    "replace_canvas_lines",
+    "insert_canvas_lines",
+}
+TOOL_CALL_CONTENT_PREVIEW_MAX_CHARS = 1_000
+TOOL_CALL_CONTENT_PREVIEW_MAX_LINES = 48
+TOOL_CALL_LINES_PREVIEW_MAX_ITEMS = 24
+TOOL_CALL_LINE_PREVIEW_MAX_CHARS = 240
+TOOL_CALL_LINES_PREVIEW_MAX_TOTAL_CHARS = 1_000
+TOOL_CALL_METADATA_LIST_PREVIEW_MAX_ITEMS = 12
+TOOL_CALL_METADATA_ITEM_PREVIEW_MAX_CHARS = 120
 LEGACY_MESSAGE_USAGE_BREAKDOWN_KEYS = {
     "core_instructions": ("system_prompt", "final_instruction"),
 }
@@ -947,7 +960,7 @@ def _normalize_message_tool_calls(raw_tool_calls) -> list[dict]:
         tool_type = str(entry.get("type") or "function").strip()[:40] or "function"
         function = entry.get("function") if isinstance(entry.get("function"), dict) else {}
         function_name = str(function.get("name") or "").strip()[:80]
-        raw_arguments = function.get("arguments")
+        raw_arguments = _compact_canvas_tool_call_arguments(function_name, function.get("arguments"))
         if isinstance(raw_arguments, (dict, list)):
             arguments = json.dumps(raw_arguments, ensure_ascii=False)
         else:
@@ -965,6 +978,106 @@ def _normalize_message_tool_calls(raw_tool_calls) -> list[dict]:
             }
         )
     return normalized
+
+
+def _parse_tool_call_arguments_payload(raw_arguments):
+    if isinstance(raw_arguments, (dict, list)):
+        return raw_arguments
+    if not isinstance(raw_arguments, str):
+        return raw_arguments
+
+    normalized = raw_arguments.strip()
+    if not normalized:
+        return ""
+
+    try:
+        return json.loads(normalized)
+    except Exception:
+        return raw_arguments
+
+
+def _trim_tool_call_argument_text(value, *, label: str) -> str:
+    normalized = str(value or "")
+    if not normalized:
+        return ""
+
+    lines = normalized.splitlines() or [normalized]
+    if len(normalized) <= TOOL_CALL_CONTENT_PREVIEW_MAX_CHARS and len(lines) <= TOOL_CALL_CONTENT_PREVIEW_MAX_LINES:
+        return normalized
+
+    preview = "\n".join(lines[:TOOL_CALL_CONTENT_PREVIEW_MAX_LINES])
+    if len(preview) > TOOL_CALL_CONTENT_PREVIEW_MAX_CHARS:
+        preview = preview[:TOOL_CALL_CONTENT_PREVIEW_MAX_CHARS].rstrip()
+    if not preview:
+        return f"[TRIMMED {label}: original {len(lines)} lines, {len(normalized)} chars]"
+    return f"{preview}… [TRIMMED {label}: original {len(lines)} lines, {len(normalized)} chars]"
+
+
+def _trim_tool_call_argument_lines(raw_lines) -> list[str]:
+    if not isinstance(raw_lines, list):
+        return []
+
+    normalized_lines = [str(item or "") for item in raw_lines]
+    serialized = json.dumps(normalized_lines, ensure_ascii=False)
+    if (
+        len(normalized_lines) <= TOOL_CALL_LINES_PREVIEW_MAX_ITEMS
+        and len(serialized) <= TOOL_CALL_LINES_PREVIEW_MAX_TOTAL_CHARS
+    ):
+        return normalized_lines
+
+    preview_lines: list[str] = []
+    preview_chars = 0
+    for line in normalized_lines[:TOOL_CALL_LINES_PREVIEW_MAX_ITEMS]:
+        clipped_line = str(line or "")
+        if len(clipped_line) > TOOL_CALL_LINE_PREVIEW_MAX_CHARS:
+            clipped_line = clipped_line[:TOOL_CALL_LINE_PREVIEW_MAX_CHARS].rstrip() + "…"
+        projected = preview_chars + len(clipped_line)
+        if preview_lines and projected > TOOL_CALL_LINES_PREVIEW_MAX_TOTAL_CHARS:
+            break
+        preview_lines.append(clipped_line)
+        preview_chars = projected
+
+    total_chars = sum(len(line) for line in normalized_lines)
+    preview_lines.append(f"[TRIMMED canvas lines: original {len(normalized_lines)} lines, {total_chars} chars]")
+    return preview_lines
+
+
+def _trim_tool_call_argument_items(raw_values, *, label: str) -> list[str]:
+    if not isinstance(raw_values, list):
+        return []
+
+    normalized_values = [str(item or "") for item in raw_values]
+    if len(normalized_values) <= TOOL_CALL_METADATA_LIST_PREVIEW_MAX_ITEMS and all(
+        len(value) <= TOOL_CALL_METADATA_ITEM_PREVIEW_MAX_CHARS for value in normalized_values
+    ):
+        return normalized_values
+
+    preview_values = []
+    for value in normalized_values[:TOOL_CALL_METADATA_LIST_PREVIEW_MAX_ITEMS]:
+        if len(value) > TOOL_CALL_METADATA_ITEM_PREVIEW_MAX_CHARS:
+            value = value[:TOOL_CALL_METADATA_ITEM_PREVIEW_MAX_CHARS].rstrip() + "…"
+        preview_values.append(value)
+    preview_values.append(f"[TRIMMED {label}: original {len(normalized_values)} items]")
+    return preview_values
+
+
+def _compact_canvas_tool_call_arguments(function_name: str, raw_arguments):
+    if function_name not in CONTENT_HEAVY_CANVAS_TOOL_NAMES:
+        return raw_arguments
+
+    parsed_arguments = _parse_tool_call_arguments_payload(raw_arguments)
+    if not isinstance(parsed_arguments, dict):
+        return raw_arguments
+
+    compacted = dict(parsed_arguments)
+    if "content" in compacted:
+        compacted["content"] = _trim_tool_call_argument_text(compacted.get("content"), label="canvas content")
+    if "lines" in compacted:
+        compacted["lines"] = _trim_tool_call_argument_lines(compacted.get("lines"))
+    for key in ("imports", "exports", "symbols", "dependencies"):
+        if key in compacted:
+            compacted[key] = _trim_tool_call_argument_items(compacted.get(key), label=key)
+    return compacted
 
 
 def parse_message_tool_calls(raw_tool_calls) -> list[dict]:
@@ -1423,6 +1536,7 @@ def extract_clarification_response(metadata: dict | None) -> dict | None:
 def serialize_message_metadata(metadata: dict | None) -> str | None:
     metadata = metadata if isinstance(metadata, dict) else {}
     cleaned = {}
+    context_injection = str(metadata.get("context_injection") or "").strip()
 
     attachments = extract_message_attachments(metadata)
     primary_image = next((entry for entry in attachments if entry.get("kind") == "image"), None)
@@ -1477,6 +1591,8 @@ def serialize_message_metadata(metadata: dict | None) -> str | None:
         cleaned["summary_source"] = summary_source[:120]
     if generated_at:
         cleaned["generated_at"] = generated_at[:80]
+    if context_injection:
+        cleaned["context_injection"] = context_injection[:CONTENT_MAX_CHARS]
 
     for key in (
         "covers_from_position",
@@ -2144,6 +2260,30 @@ def insert_message(
         ),
     )
     return int(cursor.lastrowid)
+
+
+def update_message_metadata(message_id: int, metadata_updates: dict | None) -> None:
+    normalized_message_id = int(message_id or 0)
+    if normalized_message_id <= 0:
+        return
+
+    updates = metadata_updates if isinstance(metadata_updates, dict) else {}
+    with get_db() as conn:
+        row = conn.execute("SELECT metadata FROM messages WHERE id = ?", (normalized_message_id,)).fetchone()
+        if row is None:
+            return
+
+        merged = parse_message_metadata(row["metadata"])
+        for key, value in updates.items():
+            if value in (None, "", [], {}):
+                merged.pop(key, None)
+                continue
+            merged[key] = value
+
+        conn.execute(
+            "UPDATE messages SET metadata = ? WHERE id = ?",
+            (serialize_message_metadata(merged), normalized_message_id),
+        )
 
 
 def get_conversation_message_rows(
