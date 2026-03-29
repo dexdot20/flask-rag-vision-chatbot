@@ -322,20 +322,9 @@
               <p>Only enabled tools are exposed to the assistant and allowed to execute.</p>
             </div>
             <div class="tool-toggles tool-toggles--page" id="tool-toggles">
-              <label class="tool-toggle"><input type="checkbox" value="append_scratchpad" /> <span>Append persistent scratchpad</span></label>
-              <label class="tool-toggle"><input type="checkbox" value="ask_clarifying_question" /> <span>Ask interactive clarification questions</span></label>
-              <label class="tool-toggle"><input type="checkbox" value="image_explain" /> <span>Follow up on stored images</span></label>
-              <label class="tool-toggle"><input type="checkbox" value="search_knowledge_base" /> <span>Knowledge base search</span></label>
-              <label class="tool-toggle"><input type="checkbox" value="search_tool_memory" /> <span>Search tool memory</span></label>
-              <label class="tool-toggle"><input type="checkbox" value="search_web" /> <span>Web search</span></label>
-              <label class="tool-toggle"><input type="checkbox" value="fetch_url" /> <span>Read URL content</span></label>
-              <label class="tool-toggle"><input type="checkbox" value="search_news_ddgs" /> <span>Search news (DDGS)</span></label>
-              <label class="tool-toggle"><input type="checkbox" value="search_news_google" /> <span>Search news (Google)</span></label>
-              <label class="tool-toggle"><input type="checkbox" value="create_canvas_document" /> <span>Create canvas document</span></label>
-              <label class="tool-toggle"><input type="checkbox" value="rewrite_canvas_document" /> <span>Rewrite canvas document</span></label>
-              <label class="tool-toggle"><input type="checkbox" value="replace_canvas_lines" /> <span>Replace canvas lines</span></label>
-              <label class="tool-toggle"><input type="checkbox" value="insert_canvas_lines" /> <span>Insert canvas lines</span></label>
-              <label class="tool-toggle"><input type="checkbox" value="delete_canvas_lines" /> <span>Delete canvas lines</span></label>
+              {% for tool in tool_options %}
+              <label class="tool-toggle"><input type="checkbox" value="{{ tool.name }}" /> <span>{{ tool.label }}</span></label>
+              {% endfor %}
             </div>
           </div>
         </section>

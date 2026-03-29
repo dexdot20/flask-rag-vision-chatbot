@@ -7,6 +7,7 @@ from flask import jsonify, render_template, request
 from config import (
     AVAILABLE_MODELS,
     CHAT_SUMMARY_ALLOWED_MODES,
+    DEFAULT_ACTIVE_TOOL_NAMES,
     DEFAULT_SETTINGS,
     MAX_USER_PREFERENCES_LENGTH,
     RAG_CONTEXT_SIZE_PRESETS,
@@ -41,6 +42,57 @@ from db import (
     normalize_scratchpad_text,
     save_app_settings,
 )
+
+
+TOOL_PERMISSION_LABELS = {
+    "append_scratchpad": "Append persistent scratchpad",
+    "ask_clarifying_question": "Ask interactive clarification questions",
+    "image_explain": "Follow up on stored images",
+    "search_knowledge_base": "Knowledge base search",
+    "search_tool_memory": "Search tool memory",
+    "search_web": "Web search",
+    "fetch_url": "Read URL content",
+    "search_news_ddgs": "Search news (DDGS)",
+    "search_news_google": "Search news (Google)",
+    "create_canvas_document": "Create canvas document",
+    "expand_canvas_document": "Expand canvas document",
+    "scroll_canvas_document": "Scroll canvas document",
+    "plan_project_workspace": "Plan project workspace",
+    "get_project_workflow_status": "Get project workflow status",
+    "rewrite_canvas_document": "Rewrite canvas document",
+    "replace_canvas_lines": "Replace canvas lines",
+    "insert_canvas_lines": "Insert canvas lines",
+    "delete_canvas_lines": "Delete canvas lines",
+    "create_directory": "Create directory",
+    "create_file": "Create file",
+    "update_file": "Update file",
+    "read_file": "Read file",
+    "list_dir": "List directory",
+    "search_files": "Search files",
+    "preview_workspace_changes": "Preview workspace changes",
+    "get_workspace_file_history": "Get workspace file history",
+    "undo_workspace_file_change": "Undo workspace file change",
+    "redo_workspace_file_change": "Redo workspace file change",
+    "create_project_scaffold": "Create project scaffold",
+    "write_project_tree": "Write project tree",
+    "bulk_update_workspace_files": "Bulk update workspace files",
+    "validate_project_workspace": "Validate project workspace",
+}
+TOOL_PERMISSION_HIDDEN_NAMES = {"replace_scratchpad"}
+
+
+def build_tool_permission_options() -> list[dict[str, str]]:
+    options: list[dict[str, str]] = []
+    for name in DEFAULT_ACTIVE_TOOL_NAMES:
+        if name in TOOL_PERMISSION_HIDDEN_NAMES:
+            continue
+        options.append(
+            {
+                "name": name,
+                "label": TOOL_PERMISSION_LABELS.get(name, name.replace("_", " ").title()),
+            }
+        )
+    return options
 
 
 def build_settings_payload() -> dict:
@@ -86,7 +138,12 @@ def register_page_routes(app) -> None:
     @app.route("/settings")
     def settings_page():
         settings = build_settings_payload()
-        return render_template("settings.html", settings=settings, auth_enabled=is_login_pin_enabled())
+        return render_template(
+            "settings.html",
+            settings=settings,
+            tool_options=build_tool_permission_options(),
+            auth_enabled=is_login_pin_enabled(),
+        )
 
     @app.route("/api/settings", methods=["GET"])
     def get_settings():

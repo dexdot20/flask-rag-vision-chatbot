@@ -978,6 +978,16 @@ class AppRoutesTestCase(unittest.TestCase):
         settings = {"active_tools": json.dumps(["append_scratchpad", "search_web"]) }
         self.assertIn("replace_scratchpad", get_active_tool_names(settings))
 
+    def test_active_tools_backfill_canvas_inspection_tools_for_legacy_canvas_edit_mode(self):
+        settings = {"active_tools": json.dumps(["rewrite_canvas_document", "replace_canvas_lines"])}
+
+        active_tool_names = get_active_tool_names(settings)
+
+        self.assertIn("rewrite_canvas_document", active_tool_names)
+        self.assertIn("replace_canvas_lines", active_tool_names)
+        self.assertIn("expand_canvas_document", active_tool_names)
+        self.assertIn("scroll_canvas_document", active_tool_names)
+
     def test_db_connections_enable_busy_timeout_and_wal_mode(self):
         with get_db() as conn:
             busy_timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
@@ -3093,6 +3103,14 @@ class AppRoutesTestCase(unittest.TestCase):
 
         self.assertEqual(first_count, 1)
         self.assertEqual(second_count, 1)
+
+    def test_settings_page_lists_canvas_inspection_tool_toggles(self):
+        response = self.client.get("/settings")
+
+        self.assertEqual(response.status_code, 200)
+        html = response.get_data(as_text=True)
+        self.assertIn('value="expand_canvas_document"', html)
+        self.assertIn('value="scroll_canvas_document"', html)
 
     def test_conversation_crud_flow(self):
         conversation_id = self._create_conversation()

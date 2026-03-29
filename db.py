@@ -1985,6 +1985,25 @@ def _ensure_tool(name: str, names: list[str]) -> list[str]:
     return [*names, name]
 
 
+_CANVAS_EDIT_TOOL_NAMES = {
+    "rewrite_canvas_document",
+    "replace_canvas_lines",
+    "insert_canvas_lines",
+    "delete_canvas_lines",
+    "delete_canvas_document",
+    "clear_canvas",
+}
+_CANVAS_INSPECTION_TOOL_NAMES = ("expand_canvas_document", "scroll_canvas_document")
+
+
+def _ensure_canvas_inspection_tools(names: list[str]) -> list[str]:
+    if not any(name in _CANVAS_EDIT_TOOL_NAMES for name in names):
+        return names
+    for tool_name in _CANVAS_INSPECTION_TOOL_NAMES:
+        names = _ensure_tool(tool_name, names)
+    return names
+
+
 def get_active_tool_names(settings: dict | None = None) -> list[str]:
     source = settings if settings is not None else get_app_settings()
     names = normalize_active_tool_names(source.get("active_tools"))
@@ -1995,6 +2014,7 @@ def get_active_tool_names(settings: dict | None = None) -> list[str]:
     if names:
         if "append_scratchpad" in names:
             names = _ensure_tool("replace_scratchpad", names)
+        names = _ensure_canvas_inspection_tools(names)
         return names
     if source.get("active_tools") is None:
         names = normalize_active_tool_names(DEFAULT_SETTINGS["active_tools"])
@@ -2004,6 +2024,7 @@ def get_active_tool_names(settings: dict | None = None) -> list[str]:
             names = [name for name in names if name != "image_explain"]
         if "append_scratchpad" in names:
             names = _ensure_tool("replace_scratchpad", names)
+        names = _ensure_canvas_inspection_tools(names)
         return names
     return []
 
