@@ -1783,7 +1783,7 @@ const INPUT_BREAKDOWN_LABELS = {
 const INPUT_BREAKDOWN_HELP_TEXT = {
   tool_specs: "Prompt tool list plus API function schema sent with the request.",
   internal_state: "Short internal working-memory instructions added during blocker handling or recovery.",
-  unknown_provider_overhead: "The remaining billed prompt tokens that could not be attributed confidently to a measured source.",
+  unknown_provider_overhead: "The remaining billed prompt tokens left after local content, tool, and request-framing estimates are aligned to the provider total.",
 };
 
 const BREAKDOWN_WARNING_RATIO = 0.03;
@@ -1791,17 +1791,19 @@ const BREAKDOWN_WARNING_RATIO = 0.03;
 const BREAKDOWN_REDUCTION_ORDER = [
   "tool_specs",
   "internal_state",
-  "assistant_tool_calls",
-  "tool_results",
   "canvas",
   "scratchpad",
   "tool_trace",
   "tool_memory",
   "rag_context",
+  "assistant_tool_calls",
+  "tool_results",
   "assistant_history",
   "user_messages",
   "core_instructions",
 ];
+
+const BREAKDOWN_FLOOR_KEYS = ["user_messages", "tool_results"];
 
 const MODEL_CALL_TYPE_LABELS = {
   agent_step: "Agent step",
@@ -1832,6 +1834,16 @@ function toNonNegativeIntOrNull(value) {
   return Math.max(0, Math.round(normalized));
 }
 
+function getProtectedBreakdownKeys(breakdown, targetTotal) {
+  const parsedTarget = toNonNegativeIntOrNull(targetTotal);
+  if (parsedTarget === null || parsedTarget <= 0) {
+    return new Set();
+  }
+
+  const presentKeys = BREAKDOWN_FLOOR_KEYS.filter((key) => toFiniteNumber(breakdown[key], 0) > 0);
+  return new Set(presentKeys.slice(0, Math.min(presentKeys.length, parsedTarget)));
+}
+
 function alignBreakdownToTotal(breakdown, targetTotal) {
   const normalized = createEmptyBreakdown();
   INPUT_BREAKDOWN_ORDER.forEach((key) => {
@@ -1854,16 +1866,19 @@ function alignBreakdownToTotal(breakdown, targetTotal) {
     return normalized;
   }
 
+  const protectedKeys = getProtectedBreakdownKeys(normalized, parsedTarget);
+
   BREAKDOWN_REDUCTION_ORDER.forEach((key) => {
     if (overflow <= 0) {
       return;
     }
-    const available = normalized[key] || 0;
+    const floor = protectedKeys.has(key) ? 1 : 0;
+    const available = (normalized[key] || 0) - floor;
     if (available <= 0) {
       return;
     }
     const reduction = Math.min(available, overflow);
-    normalized[key] -= reduction;
+    normalized[key] = available - reduction + floor;
     overflow -= reduction;
   });
 
@@ -1875,12 +1890,13 @@ function alignBreakdownToTotal(breakdown, targetTotal) {
         if (overflow <= 0) {
           return;
         }
-        const available = normalized[key] || 0;
+        const floor = protectedKeys.has(key) ? 1 : 0;
+        const available = (normalized[key] || 0) - floor;
         if (available <= 0) {
           return;
         }
         const reduction = Math.min(available, overflow);
-        normalized[key] -= reduction;
+        normalized[key] = available - reduction + floor;
         overflow -= reduction;
       });
   }

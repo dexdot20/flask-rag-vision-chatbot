@@ -63,7 +63,14 @@ from config import (
     RAG_TOOL_RESULT_SUMMARY_MAX_CHARS,
     client,
 )
-from db import append_to_scratchpad, read_image_asset_bytes, replace_scratchpad
+from db import (
+    MESSAGE_USAGE_BREAKDOWN_PROTECTED_KEYS,
+    MESSAGE_USAGE_BREAKDOWN_REDUCTION_ORDER,
+    append_to_scratchpad,
+    get_rag_source_types,
+    read_image_asset_bytes,
+    replace_scratchpad,
+)
 from rag_service import get_exact_tool_memory_match, search_knowledge_base_tool, search_tool_memory, upsert_tool_memory_result
 from tool_registry import TOOL_SPEC_BY_NAME, get_openai_tool_specs
 from token_utils import estimate_text_tokens
@@ -150,20 +157,7 @@ SYSTEM_BREAKDOWN_SECTION_KEY_BY_HEADING = {
     "## Other Canvas Documents": "canvas",
     "## Available Tools": "tool_specs",
 }
-SYSTEM_BREAKDOWN_REDUCTION_ORDER = (
-    "tool_specs",
-    "internal_state",
-    "canvas",
-    "scratchpad",
-    "tool_trace",
-    "tool_memory",
-    "rag_context",
-    "assistant_tool_calls",
-    "tool_results",
-    "assistant_history",
-    "user_messages",
-    "core_instructions",
-)
+SYSTEM_BREAKDOWN_REDUCTION_ORDER = MESSAGE_USAGE_BREAKDOWN_REDUCTION_ORDER
 _AGENT_TRACE_LOGGER = None
 
 
@@ -212,6 +206,56 @@ def _estimate_serialized_tokens(value) -> int:
     return _estimate_text_tokens(serialized)
 
 
+def _estimate_message_wrapper_tokens(role: str, *, include_tool_calls: bool = False) -> int:
+    payload = {
+        "role": str(role or ""),
+        "content": "",
+    }
+    if include_tool_calls:
+        payload["tool_calls"] = []
+    return _estimate_serialized_tokens(payload)
+
+
+def _estimate_request_tools_tokens(request_tools: list[dict] | None) -> int:
+    if not request_tools:
+        return 0
+    return _estimate_serialized_tokens({"tools": request_tools, "tool_choice": "auto"})
+
+
+def _distribute_overhead_tokens(
+    breakdown: dict[str, int],
+    overhead_tokens: int,
+    recipients: tuple[str, ...],
+) -> dict[str, int]:
+    remaining = max(0, int(overhead_tokens or 0))
+    if remaining <= 0:
+        return breakdown
+
+    target_keys = [key for key in recipients if breakdown.get(key, 0) > 0]
+    if not target_keys and recipients:
+        target_keys = [recipients[0]]
+    if not target_keys:
+        target_keys = ["core_instructions"]
+
+    weighted_total = sum(max(0, int(breakdown.get(key, 0))) for key in target_keys)
+    if weighted_total <= 0:
+        breakdown[target_keys[0]] = breakdown.get(target_keys[0], 0) + remaining
+        return breakdown
+
+    for index, key in enumerate(target_keys):
+        if remaining <= 0:
+            break
+        if index == len(target_keys) - 1:
+            share = remaining
+        else:
+            weight = max(0, int(breakdown.get(key, 0)))
+            share = min(remaining, int((overhead_tokens * weight) / weighted_total))
+        breakdown[key] = breakdown.get(key, 0) + share
+        remaining -= share
+
+    return breakdown
+
+
 def _rebalance_breakdown_to_total(breakdown: dict[str, int], total_tokens: int) -> dict[str, int]:
     adjusted = {key: max(0, int(value)) for key, value in breakdown.items() if value and value > 0}
     current_total = sum(adjusted.values())
@@ -258,23 +302,31 @@ def _align_breakdown_to_provider_total(breakdown: dict[str, int], total_tokens: 
     if overflow <= 0:
         return adjusted
 
+    protected_floor_keys = set()
+    if target_total > 0:
+        protected_candidates = [key for key in MESSAGE_USAGE_BREAKDOWN_PROTECTED_KEYS if adjusted.get(key, 0) > 0]
+        protected_floor_keys = set(protected_candidates[: min(len(protected_candidates), target_total)])
+
     for key in SYSTEM_BREAKDOWN_REDUCTION_ORDER:
         if overflow <= 0:
             break
-        available = adjusted.get(key, 0)
+        floor = 1 if key in protected_floor_keys else 0
+        available = adjusted.get(key, 0) - floor
         if available <= 0:
             continue
         reduction = min(available, overflow)
-        adjusted[key] = available - reduction
+        adjusted[key] = available - reduction + floor
         overflow -= reduction
 
     if overflow > 0:
         for key, available in sorted(adjusted.items(), key=lambda item: item[1], reverse=True):
             if overflow <= 0:
                 break
-            if available <= 0:
+            floor = 1 if key in protected_floor_keys else 0
+            reducible = available - floor
+            if reducible <= 0:
                 continue
-            reduction = min(available, overflow)
+            reduction = min(reducible, overflow)
             adjusted[key] = available - reduction
             overflow -= reduction
 
@@ -316,7 +368,8 @@ def _estimate_message_breakdown(message: dict) -> dict[str, int]:
         return {}
 
     if role == "user":
-        return {"user_messages": total_tokens}
+        breakdown = {"user_messages": total_tokens}
+        return _distribute_overhead_tokens(breakdown, _estimate_message_wrapper_tokens(role), ("user_messages",))
     if role == "assistant":
         breakdown = {}
         if total_tokens > 0:
@@ -325,15 +378,23 @@ def _estimate_message_breakdown(message: dict) -> dict[str, int]:
         tool_call_tokens = _estimate_serialized_tokens(tool_calls)
         if tool_call_tokens > 0:
             breakdown["assistant_tool_calls"] = tool_call_tokens
-        return breakdown
+        return _distribute_overhead_tokens(
+            breakdown,
+            _estimate_message_wrapper_tokens(role, include_tool_calls=bool(tool_calls)),
+            ("assistant_history", "assistant_tool_calls"),
+        )
     if role == "tool":
         tool_call_id = str(message.get("tool_call_id") or "").strip()
         payload_tokens = total_tokens
         if tool_call_id:
             payload_tokens += _estimate_serialized_tokens({"tool_call_id": tool_call_id})
-        return {"tool_results": payload_tokens} if payload_tokens > 0 else {}
+        if payload_tokens <= 0:
+            return {}
+        breakdown = {"tool_results": payload_tokens}
+        return _distribute_overhead_tokens(breakdown, _estimate_message_wrapper_tokens(role), ("tool_results",))
     if role != "system":
-        return {"core_instructions": total_tokens}
+        breakdown = {"core_instructions": total_tokens}
+        return _distribute_overhead_tokens(breakdown, _estimate_message_wrapper_tokens(role), ("core_instructions",))
 
     # Classify system messages by their distinctive markers
     if content.startswith(TOOL_EXECUTION_RESULTS_MARKER):
@@ -347,8 +408,12 @@ def _estimate_message_breakdown(message: dict) -> dict[str, int]:
     if content.startswith("[INSTRUCTION: MISSING FINAL ANSWER"):
         return {"core_instructions": total_tokens}
 
-    breakdown = _estimate_system_message_breakdown(content, total_tokens)
-    return breakdown or {"core_instructions": total_tokens}
+    breakdown = _estimate_system_message_breakdown(content, total_tokens) or {"core_instructions": total_tokens}
+    return _distribute_overhead_tokens(
+        breakdown,
+        _estimate_message_wrapper_tokens(role),
+        tuple(key for key, value in breakdown.items() if value > 0) or ("core_instructions",),
+    )
 
 
 def _estimate_input_breakdown(
@@ -363,7 +428,7 @@ def _estimate_input_breakdown(
             if key in breakdown and value > 0:
                 breakdown[key] += value
 
-    tool_schema_tokens = _estimate_serialized_tokens(request_tools)
+    tool_schema_tokens = _estimate_request_tools_tokens(request_tools)
     if tool_schema_tokens > 0:
         breakdown["tool_specs"] += tool_schema_tokens
 
@@ -1553,6 +1618,7 @@ def _run_search_knowledge_base(tool_args: dict, runtime_state: dict):
         tool_args.get("query", ""),
         category=tool_args.get("category"),
         top_k=tool_args.get("top_k", RAG_SEARCH_DEFAULT_TOP_K),
+        allowed_source_types=get_rag_source_types(),
     )
     return result, f"{result.get('count', 0)} knowledge chunks found"
 

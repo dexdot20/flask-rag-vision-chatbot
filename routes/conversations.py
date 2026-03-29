@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 import re
 
 from flask import Response, jsonify, request
@@ -25,7 +27,6 @@ from conversation_export import (
 from config import (
     AVAILABLE_MODEL_IDS,
     RAG_DISABLED_FEATURE_ERROR,
-    RAG_DISABLED_INGEST_ERROR,
     RAG_ENABLED,
     RAG_SEARCH_DEFAULT_TOP_K,
     RAG_SOURCE_CONVERSATION,
@@ -34,14 +35,17 @@ from config import (
 from db import (
     delete_conversation_file_assets,
     delete_conversation_image_assets,
+    get_rag_source_types,
     get_conversation_message_rows,
     get_conversation_messages,
     get_db,
     insert_message,
     message_row_to_dict,
+    normalize_rag_source_types,
     parse_message_metadata,
     serialize_message_metadata,
 )
+from doc_service import extract_document_text, read_uploaded_document
 from prune_service import prune_message, prune_conversation_batch
 from rag import delete_source as rag_delete_source
 from rag_service import (
@@ -50,6 +54,7 @@ from rag_service import (
     delete_rag_source_record,
     ensure_supported_rag_sources,
     get_rag_document_record,
+    ingest_uploaded_rag_document,
     list_rag_documents_db,
     search_knowledge_base_tool,
     sync_conversations_to_rag_safe,
@@ -73,6 +78,52 @@ def _load_conversation_payload(conv_id: int):
             return None, None
         messages = [message_row_to_dict(message) for message in get_conversation_message_rows(conn, conv_id)]
     return conversation, messages
+
+
+def _parse_truthy_form_value(value, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    normalized = str(value or "").strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _parse_rag_source_type_filter(raw_value):
+    if raw_value is None:
+        return None, []
+
+    if isinstance(raw_value, list):
+        values = raw_value
+    elif isinstance(raw_value, str):
+        stripped = raw_value.strip()
+        if not stripped:
+            values = []
+        else:
+            try:
+                parsed = json.loads(stripped)
+            except Exception:
+                parsed = [part.strip() for part in stripped.split(",") if part.strip()]
+            values = parsed if isinstance(parsed, list) else [stripped]
+    else:
+        values = [raw_value]
+
+    incoming = []
+    for value in values:
+        raw_text = str(value or "").strip().lower()
+        if not raw_text:
+            continue
+        if "," in raw_text:
+            incoming.extend(part.strip() for part in raw_text.split(",") if part.strip())
+        else:
+            incoming.append(raw_text)
+    normalized = normalize_rag_source_types(incoming)
+    invalid = [value for value in incoming if value not in normalized]
+    return normalized, invalid
 
 
 def register_conversation_routes(app) -> None:
@@ -443,13 +494,29 @@ def register_conversation_routes(app) -> None:
             return jsonify({"error": RAG_DISABLED_FEATURE_ERROR}), 410
         query = (request.args.get("q") or "").strip()
         category = (request.args.get("category") or "").strip() or None
+        raw_source_types = request.args.getlist("source_type") or request.args.get("source_types")
         try:
             top_k = int(request.args.get("top_k") or RAG_SEARCH_DEFAULT_TOP_K)
         except (TypeError, ValueError):
             top_k = RAG_SEARCH_DEFAULT_TOP_K
 
+        selected_source_types, invalid_source_types = _parse_rag_source_type_filter(raw_source_types)
+        if invalid_source_types:
+            return jsonify({"error": "source_types contains unsupported source types."}), 400
+
+        allowed_source_types = selected_source_types
+        if raw_source_types is None:
+            allowed_source_types = get_rag_source_types()
+
         try:
-            return jsonify(search_knowledge_base_tool(query, category=category, top_k=top_k))
+            return jsonify(
+                search_knowledge_base_tool(
+                    query,
+                    category=category,
+                    top_k=top_k,
+                    allowed_source_types=allowed_source_types,
+                )
+            )
         except Exception as exc:
             return jsonify({"error": str(exc)}), 500
 
@@ -457,7 +524,67 @@ def register_conversation_routes(app) -> None:
     def ingest_rag_document():
         if not RAG_ENABLED:
             return jsonify({"error": RAG_DISABLED_FEATURE_ERROR}), 410
-        return jsonify({"error": RAG_DISABLED_INGEST_ERROR}), 410
+
+        source_name = ""
+        description = ""
+        auto_inject_enabled = True
+        text = ""
+        filename = "uploaded.txt"
+        mime_type = "text/plain"
+
+        try:
+            if request.mimetype and request.mimetype.startswith("multipart/form-data"):
+                uploaded_document = request.files.get("document")
+                source_name = str(request.form.get("source_name") or "").strip()
+                description = str(request.form.get("description") or "").strip()
+                auto_inject_enabled = _parse_truthy_form_value(
+                    request.form.get("auto_inject_enabled"),
+                    default=True,
+                )
+                raw_text = request.form.get("text")
+
+                if uploaded_document and getattr(uploaded_document, "filename", ""):
+                    filename, mime_type, doc_bytes = read_uploaded_document(uploaded_document)
+                    text = extract_document_text(doc_bytes, mime_type)
+                else:
+                    text = str(raw_text or "")
+                    filename = os.path.basename(str(request.form.get("filename") or "uploaded.txt").strip()) or "uploaded.txt"
+                    mime_type = "text/plain"
+            else:
+                data = request.get_json(silent=True) or {}
+                source_name = str(data.get("source_name") or "").strip()
+                description = str(data.get("description") or "").strip()
+                auto_inject_enabled = _parse_truthy_form_value(data.get("auto_inject_enabled"), default=True)
+                text = str(data.get("text") or "")
+                filename = os.path.basename(str(data.get("filename") or "uploaded.txt").strip()) or "uploaded.txt"
+                mime_type = str(data.get("mime_type") or "text/plain").strip() or "text/plain"
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+        if not text.strip():
+            return jsonify({"error": "Provide a document upload or non-empty text."}), 400
+
+        try:
+            document = ingest_uploaded_rag_document(
+                filename,
+                text,
+                source_name=source_name or None,
+                description=description,
+                auto_inject_enabled=auto_inject_enabled,
+            )
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 500
+
+        return jsonify(
+            {
+                "document": document,
+                "file_name": filename,
+                "mime_type": mime_type,
+                "text_length": len(text),
+            }
+        ), 201
 
     @app.route("/api/rag/sync-conversations", methods=["POST"])
     def sync_rag_conversations():

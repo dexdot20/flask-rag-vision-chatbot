@@ -2957,6 +2957,15 @@ kbd {
   .summary-inspector {
     padding: 14px;
   }
+
+  .rag-source-type-list {
+    grid-template-columns: 1fr;
+  }
+
+  .kb-doc-item {
+    flex-direction: column;
+    align-items: stretch;
+  }
 }
 
 .kb-inline-form {
@@ -2980,9 +2989,15 @@ kbd {
   gap: 8px;
 }
 
+.kb-upload-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
 .kb-doc-item {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 10px;
   padding: 10px 12px;
@@ -3012,6 +3027,43 @@ kbd {
   color: var(--text-secondary);
 }
 
+.kb-doc-description {
+  font-size: 0.76rem;
+  line-height: 1.5;
+  color: var(--text-primary);
+}
+
+.kb-doc-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.kb-doc-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 0 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.kb-doc-badge[data-tone="success"] {
+  color: #8fd19e;
+  border-color: rgba(143, 209, 158, 0.28);
+  background: rgba(143, 209, 158, 0.08);
+}
+
+.kb-doc-badge[data-tone="muted"] {
+  color: var(--text-secondary);
+}
+
 .kb-doc-delete {
   background: transparent;
   border: 1px solid var(--border);
@@ -3037,6 +3089,49 @@ kbd {
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+
+.rag-source-type-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.rag-source-toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.03);
+  cursor: pointer;
+}
+
+.rag-source-toggle:hover {
+  border-color: rgba(79, 110, 247, 0.28);
+  background: rgba(79, 110, 247, 0.05);
+}
+
+.rag-source-toggle input {
+  margin-top: 2px;
+}
+
+.rag-source-toggle__body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.rag-source-toggle__body strong {
+  font-size: 0.83rem;
+  color: var(--text-primary);
+}
+
+.rag-source-toggle__body small {
+  font-size: 0.74rem;
+  line-height: 1.45;
+  color: var(--text-secondary);
 }
 
 .rag-settings-grid.is-disabled {
@@ -3696,6 +3791,7 @@ kbd {
 }
 
 /* ── Settings Number Input ───────────────────────────────── */
+.settings-text,
 .settings-number {
   width: 80px;
   background: var(--surface-hi);
@@ -3709,6 +3805,11 @@ kbd {
   transition: border-color 0.15s;
 }
 
+.settings-text {
+  width: 100%;
+}
+
+.settings-text:focus,
 .settings-number:focus {
   border-color: var(--border-focus);
   box-shadow: 0 0 0 3px rgba(79, 110, 247, 0.12);
@@ -4123,6 +4224,7 @@ kbd {
   border-radius: 14px;
 }
 
+.settings-text,
 .settings-number,
 .settings-select,
 .settings-page-section-card textarea {

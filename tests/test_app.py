@@ -177,6 +177,10 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(payload["fetch_url_clip_aggressiveness"], 50)
         self.assertEqual(payload["rag_sensitivity"], "strict")
         self.assertEqual(payload["rag_context_size"], "small")
+        self.assertEqual(
+            payload["rag_source_types"],
+            ["conversation", "tool_result", "tool_memory", "uploaded_document"],
+        )
         self.assertTrue(payload["tool_memory_auto_inject"])
         self.assertIn("features", payload)
         self.assertTrue(payload["features"]["rag_enabled"])
@@ -201,6 +205,7 @@ class AppRoutesTestCase(unittest.TestCase):
                 "rag_auto_inject": False,
                 "rag_sensitivity": "strict",
                 "rag_context_size": "large",
+                "rag_source_types": ["tool_memory", "uploaded_document"],
                 "tool_memory_auto_inject": False,
             },
         )
@@ -223,6 +228,7 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertFalse(payload["rag_auto_inject"])
         self.assertEqual(payload["rag_sensitivity"], "strict")
         self.assertEqual(payload["rag_context_size"], "large")
+        self.assertEqual(payload["rag_source_types"], ["tool_memory", "uploaded_document"])
         self.assertFalse(payload["tool_memory_auto_inject"])
 
     def test_settings_patch_rejects_invalid_rag_presets(self):
@@ -241,6 +247,23 @@ class AppRoutesTestCase(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertIn("rag_context_size", response.get_json()["error"])
+
+    def test_settings_patch_rejects_invalid_rag_source_types(self):
+        response = self.client.patch(
+            "/api/settings",
+            json={"rag_source_types": "conversation"},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("rag_source_types", response.get_json()["error"])
+
+        response = self.client.patch(
+            "/api/settings",
+            json={"rag_source_types": ["conversation", "invalid_source"]},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("rag_source_types", response.get_json()["error"])
 
     def test_settings_patch_rejects_invalid_pruning_values(self):
         response = self.client.patch(
@@ -1148,6 +1171,60 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(result["count"], 2)
         self.assertEqual([match["id"] for match in result["matches"]], ["chunk-1", "chunk-2"])
 
+    def test_build_rag_auto_context_respects_allowed_source_types(self):
+        fake_hits = [
+            {
+                "id": "upload-disabled",
+                "text": "manual memory disabled",
+                "metadata": {
+                    "source_key": "upload-1",
+                    "source_name": "Manual disabled",
+                    "source_type": "uploaded_document",
+                    "category": "uploaded_document",
+                    "chunk_index": 0,
+                    "auto_inject_enabled": False,
+                },
+                "similarity": 0.93,
+            },
+            {
+                "id": "tool-hit",
+                "text": "tool memory",
+                "metadata": {
+                    "source_key": "tool-1",
+                    "source_name": "Tool memory",
+                    "source_type": "tool_memory",
+                    "category": "tool_memory",
+                    "chunk_index": 0,
+                },
+                "similarity": 0.92,
+            },
+            {
+                "id": "upload-enabled",
+                "text": "manual memory enabled",
+                "metadata": {
+                    "source_key": "upload-2",
+                    "source_name": "Manual enabled",
+                    "source_type": "uploaded_document",
+                    "category": "uploaded_document",
+                    "chunk_index": 0,
+                    "auto_inject_enabled": True,
+                },
+                "similarity": 0.91,
+            },
+        ]
+
+        with patch("rag_service.ensure_supported_rag_sources"), patch("rag_service.rag_query_chunks", return_value=fake_hits):
+            result = build_rag_auto_context(
+                "manual memory",
+                True,
+                threshold=0.1,
+                top_k=5,
+                allowed_source_types={"uploaded_document"},
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual([match["source_name"] for match in result["matches"]], ["Manual enabled"])
+
     def test_build_rag_auto_context_prefers_recent_hits_with_temporal_decay(self):
         old_timestamp = int((datetime.now(timezone.utc) - timedelta(days=60)).timestamp())
         new_timestamp = int(datetime.now(timezone.utc).timestamp())
@@ -1170,8 +1247,10 @@ class AppRoutesTestCase(unittest.TestCase):
             result = build_rag_auto_context("recent memory", True, threshold=0.1, top_k=5)
 
         self.assertIsNotNone(result)
-        self.assertEqual(result["matches"][0]["id"], "new-hit")
+        self.assertEqual(result["matches"][0]["source_name"], "New")
         self.assertGreater(result["matches"][0]["similarity"], result["matches"][1]["similarity"])
+        self.assertNotIn("id", result["matches"][0])
+        self.assertNotIn("source_key", result["matches"][0])
 
     def test_build_rag_auto_context_excludes_current_conversation_sources(self):
         fake_hits = [
@@ -1205,7 +1284,53 @@ class AppRoutesTestCase(unittest.TestCase):
             )
 
         self.assertIsNotNone(result)
-        self.assertEqual([match["id"] for match in result["matches"]], ["other-hit"])
+        self.assertEqual([match["source_name"] for match in result["matches"]], ["Other"])
+
+    def test_rag_search_route_uses_saved_source_type_settings(self):
+        settings = get_app_settings()
+        settings["rag_source_types"] = json.dumps(["uploaded_document"], ensure_ascii=False)
+        save_app_settings(settings)
+
+        with patch("routes.conversations.search_knowledge_base_tool", return_value={"query": "memory", "count": 0, "matches": []}) as mocked_search:
+            response = self.client.get("/api/rag/search?q=memory")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(mocked_search.call_args.kwargs["allowed_source_types"], ["uploaded_document"])
+
+        with patch("routes.conversations.search_knowledge_base_tool", return_value={"query": "memory", "count": 0, "matches": []}) as mocked_search:
+            response = self.client.get("/api/rag/search?q=memory&source_types=conversation,tool_memory")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(mocked_search.call_args.kwargs["allowed_source_types"], ["conversation", "tool_memory"])
+
+        with patch("routes.conversations.search_knowledge_base_tool", return_value={"query": "memory", "count": 0, "matches": []}) as mocked_search:
+            response = self.client.get("/api/rag/search?q=memory&source_type=conversation,tool_memory")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(mocked_search.call_args.kwargs["allowed_source_types"], ["conversation", "tool_memory"])
+
+    def test_build_runtime_system_message_formats_compact_auto_injected_rag_context(self):
+        message = build_runtime_system_message(
+            active_tool_names=["search_knowledge_base"],
+            retrieved_context={
+                "query": "release notes",
+                "count": 1,
+                "matches": [
+                    {
+                        "source_name": "Product changelog",
+                        "similarity": 0.87,
+                        "text": "The April release adds export support and fixes sync drift.",
+                        "source_key": "secret-source-key",
+                    }
+                ],
+            },
+        )
+
+        self.assertIn("Auto-injected query: release notes", message["content"])
+        self.assertIn("Source: Product changelog", message["content"])
+        self.assertIn("The April release adds export support", message["content"])
+        self.assertNotIn("secret-source-key", message["content"])
+        self.assertNotIn('"source_name"', message["content"])
 
     def test_runtime_system_message_hides_canvas_edit_tools_without_canvas_document(self):
         message = build_runtime_system_message(
@@ -2338,7 +2463,7 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertGreater(breakdown["rag_context"], 0)
         self.assertNotIn("tool_specs", breakdown)
         self.assertNotIn("Available Tools", message["content"])
-        self.assertEqual(sum(breakdown.values()), estimate_text_tokens(message["content"]))
+        self.assertGreater(sum(breakdown.values()), estimate_text_tokens(message["content"]))
 
     def test_estimate_input_breakdown_counts_native_tool_schemas(self):
         message = build_runtime_system_message(active_tool_names=["search_web"])
@@ -2352,6 +2477,13 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertNotIn("Available Tools", message["content"])
         self.assertGreater(tool_schema_tokens, 0)
         self.assertEqual(breakdown["tool_specs"], tool_schema_tokens)
+
+    def test_estimate_input_breakdown_includes_message_wrapper_overhead(self):
+        message = {"role": "user", "content": "Find the release notes."}
+
+        breakdown, _total_tokens, _tool_schema_tokens = _estimate_input_breakdown([message])
+
+        self.assertGreater(breakdown["user_messages"], estimate_text_tokens(message["content"]))
 
     def test_extract_message_usage_maps_legacy_system_prompt_breakdown(self):
         usage = extract_message_usage(
@@ -2659,14 +2791,35 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.get_json()["error"], "Title required.")
 
-    def test_rag_endpoints_safe_defaults(self):
+    def test_rag_endpoints_support_manual_document_ingest(self):
         response = self.client.get("/api/rag/documents")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json(), [])
 
-        response = self.client.post("/api/rag/ingest", json={"text": "ignored"})
-        self.assertEqual(response.status_code, 410)
-        self.assertIn("disabled", response.get_json()["error"].lower())
+        response = self.client.post(
+            "/api/rag/ingest",
+            data={
+                "document": (io.BytesIO(b"Alpha\nBeta\nGamma"), "ops-notes.txt", "text/plain"),
+                "source_name": "Ops Notes",
+                "description": "Use when answering operations questions.",
+                "auto_inject_enabled": "false",
+            },
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(response.status_code, 201)
+        payload = response.get_json()
+        self.assertEqual(payload["file_name"], "ops-notes.txt")
+        self.assertEqual(payload["document"]["source_type"], "uploaded_document")
+        self.assertEqual(payload["document"]["source_name"], "Ops Notes")
+        self.assertGreater(payload["document"]["chunk_count"], 0)
+
+        response = self.client.get("/api/rag/documents")
+        self.assertEqual(response.status_code, 200)
+        documents = response.get_json()
+        self.assertEqual(len(documents), 1)
+        self.assertEqual(documents[0]["source_type"], "uploaded_document")
+        self.assertEqual(documents[0]["metadata"]["description"], "Use when answering operations questions.")
+        self.assertFalse(documents[0]["metadata"]["auto_inject_enabled"])
 
     def test_fix_text_endpoint(self):
         fake_result = {

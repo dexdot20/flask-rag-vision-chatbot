@@ -30,11 +30,13 @@ from db import (
     get_pruning_token_threshold,
     get_rag_auto_inject_enabled,
     get_rag_context_size,
+    get_rag_source_types,
     get_rag_sensitivity,
     get_summary_skip_first,
     get_summary_skip_last,
     get_tool_memory_auto_inject_enabled,
     normalize_active_tool_names,
+    normalize_rag_source_types,
     normalize_scratchpad_text,
     save_app_settings,
 )
@@ -50,6 +52,7 @@ def build_settings_payload() -> dict:
         "rag_auto_inject": get_rag_auto_inject_enabled(raw),
         "rag_sensitivity": get_rag_sensitivity(raw),
         "rag_context_size": get_rag_context_size(raw),
+        "rag_source_types": get_rag_source_types(raw),
         "tool_memory_auto_inject": get_tool_memory_auto_inject_enabled(raw),
         "canvas_prompt_max_lines": get_canvas_prompt_max_lines(raw),
         "canvas_expand_max_lines": get_canvas_expand_max_lines(raw),
@@ -96,6 +99,7 @@ def register_page_routes(app) -> None:
         rag_auto_inject = data.get("rag_auto_inject")
         rag_sensitivity = data.get("rag_sensitivity")
         rag_context_size = data.get("rag_context_size")
+        rag_source_types = data.get("rag_source_types")
         tool_memory_auto_inject = data.get("tool_memory_auto_inject")
         chat_summary_mode_raw = data.get("chat_summary_mode")
         chat_summary_trigger_raw = data.get("chat_summary_trigger_token_count")
@@ -119,6 +123,7 @@ def register_page_routes(app) -> None:
             and rag_auto_inject is None
             and rag_sensitivity is None
             and rag_context_size is None
+            and rag_source_types is None
             and tool_memory_auto_inject is None
             and chat_summary_mode_raw is None
             and chat_summary_trigger_raw is None
@@ -185,6 +190,15 @@ def register_page_routes(app) -> None:
             if normalized_rag_context_size not in RAG_CONTEXT_SIZE_PRESETS:
                 return jsonify({"error": "rag_context_size must be one of small, medium, or large."}), 400
             settings["rag_context_size"] = normalized_rag_context_size
+
+        if rag_source_types is not None:
+            if not isinstance(rag_source_types, list):
+                return jsonify({"error": "rag_source_types must be an array."}), 400
+            normalized_rag_source_types = normalize_rag_source_types(rag_source_types)
+            incoming_source_types = [str(value or "").strip().lower() for value in rag_source_types]
+            if any(source_type not in normalized_rag_source_types for source_type in incoming_source_types):
+                return jsonify({"error": "rag_source_types contains unsupported source types."}), 400
+            settings["rag_source_types"] = json.dumps(normalized_rag_source_types, ensure_ascii=False)
 
         if tool_memory_auto_inject is not None and RAG_ENABLED:
             if isinstance(tool_memory_auto_inject, bool):
@@ -310,6 +324,7 @@ def register_page_routes(app) -> None:
                 "rag_auto_inject": get_rag_auto_inject_enabled(settings),
                 "rag_sensitivity": get_rag_sensitivity(settings),
                 "rag_context_size": get_rag_context_size(settings),
+                "rag_source_types": get_rag_source_types(settings),
                 "tool_memory_auto_inject": get_tool_memory_auto_inject_enabled(settings),
                 "canvas_prompt_max_lines": get_canvas_prompt_max_lines(settings),
                 "canvas_expand_max_lines": get_canvas_expand_max_lines(settings),

@@ -21,6 +21,7 @@ from canvas_service import (
 )
 from config import (
     CHAT_SUMMARY_MODEL,
+    PROMPT_RAG_AUTO_MAX_TOKENS,
     RAG_ENABLED,
     RAG_SENSITIVITY_PRESETS,
     RAG_SOURCE_CONVERSATION,
@@ -62,6 +63,7 @@ from db import (
     get_prompt_tool_memory_max_tokens,
     get_rag_auto_inject_enabled,
     get_rag_auto_inject_top_k,
+    get_rag_source_types,
     get_rag_sensitivity,
     get_summary_retry_min_source_tokens,
     get_summary_source_target_tokens,
@@ -92,6 +94,7 @@ from messages import (
     SUMMARY_LABEL,
     build_api_messages,
     build_user_message_for_model,
+    format_knowledge_base_auto_context,
     normalize_chat_messages,
     prepend_runtime_context,
 )
@@ -810,7 +813,7 @@ def _trim_rag_context_to_token_budget(retrieved_context: dict | None, max_tokens
             "count": len(trimmed_matches) + 1,
             "matches": [*trimmed_matches, match],
         }
-        if estimate_text_tokens(json.dumps(candidate, ensure_ascii=False)) > max_tokens:
+        if estimate_text_tokens(format_knowledge_base_auto_context(candidate)) > max_tokens:
             break
         trimmed_matches.append(match)
     if not trimmed_matches:
@@ -961,9 +964,9 @@ def _build_budgeted_prompt_messages(
 
     rag_context = _trim_rag_context_to_token_budget(
         retrieved_context,
-        min(get_prompt_rag_max_tokens(settings), remaining_context_budget),
+        min(get_prompt_rag_max_tokens(settings), PROMPT_RAG_AUTO_MAX_TOKENS, remaining_context_budget),
     )
-    rag_tokens = estimate_text_tokens(json.dumps(rag_context, ensure_ascii=False)) if rag_context else 0
+    rag_tokens = estimate_text_tokens(format_knowledge_base_auto_context(rag_context)) if rag_context else 0
     remaining_context_budget = max(0, remaining_context_budget - rag_tokens)
     tool_memory_budget_cap = get_prompt_tool_memory_max_tokens(settings)
     trimmed_tool_trace = _trim_text_sections_to_token_budget(
@@ -1889,6 +1892,7 @@ def register_chat_routes(app) -> None:
             threshold=RAG_SENSITIVITY_PRESETS[get_rag_sensitivity(settings)],
             top_k=get_rag_auto_inject_top_k(settings),
             exclude_source_keys=rag_exclude_source_keys,
+            allowed_source_types=set(get_rag_source_types(settings)),
         )
         tool_memory_context = (
             build_tool_memory_auto_context(
@@ -1946,6 +1950,7 @@ def register_chat_routes(app) -> None:
             project_workflow=initial_project_workflow,
         )
 
+        app_obj = current_app._get_current_object()
         defer_post_response_tasks = not current_app.testing
 
         def generate():
@@ -2105,168 +2110,169 @@ def register_chat_routes(app) -> None:
                     continue
                 yield json.dumps(event, ensure_ascii=False) + "\n"
 
-            if conv_id and persisted_tool_history:
-                persist_tool_history_rows(conv_id, persisted_tool_history)
+            with app_obj.app_context():
+                if conv_id and persisted_tool_history:
+                    persist_tool_history_rows(conv_id, persisted_tool_history)
 
-            if conv_id and (full_response or full_reasoning or pending_clarification or canvas_documents or canvas_cleared or project_workflow):
-                prompt_tokens = usage_data.get("prompt_tokens") if usage_data else None
-                completion_tokens = usage_data.get("completion_tokens") if usage_data else None
-                total_tokens = usage_data.get("total_tokens") if usage_data else None
-                assistant_message_metadata = serialize_message_metadata(
-                    {
-                        "tool_results": stored_tool_results,
-                        "canvas_documents": canvas_documents,
-                        "active_document_id": active_document_id,
-                        "canvas_cleared": canvas_cleared,
-                        "project_workflow": project_workflow,
-                        "tool_trace": tool_trace_entries,
-                        "reasoning_content": full_reasoning,
-                        "pending_clarification": pending_clarification,
-                        "usage": usage_data,
-                    }
-                )
-                with get_db() as conn:
-                    persisted_assistant_message_id = insert_message(
-                        conn,
-                        conv_id,
-                        "assistant",
-                        full_response,
-                        metadata=assistant_message_metadata,
-                        prompt_tokens=prompt_tokens,
-                        completion_tokens=completion_tokens,
-                        total_tokens=total_tokens,
+                if conv_id and (full_response or full_reasoning or pending_clarification or canvas_documents or canvas_cleared or project_workflow):
+                    prompt_tokens = usage_data.get("prompt_tokens") if usage_data else None
+                    completion_tokens = usage_data.get("completion_tokens") if usage_data else None
+                    total_tokens = usage_data.get("total_tokens") if usage_data else None
+                    assistant_message_metadata = serialize_message_metadata(
+                        {
+                            "tool_results": stored_tool_results,
+                            "canvas_documents": canvas_documents,
+                            "active_document_id": active_document_id,
+                            "canvas_cleared": canvas_cleared,
+                            "project_workflow": project_workflow,
+                            "tool_trace": tool_trace_entries,
+                            "reasoning_content": full_reasoning,
+                            "pending_clarification": pending_clarification,
+                            "usage": usage_data,
+                        }
                     )
-                    conn.execute(
-                        "UPDATE conversations SET updated_at = datetime('now') WHERE id = ?",
-                        (conv_id,),
-                    )
+                    with get_db() as conn:
+                        persisted_assistant_message_id = insert_message(
+                            conn,
+                            conv_id,
+                            "assistant",
+                            full_response,
+                            metadata=assistant_message_metadata,
+                            prompt_tokens=prompt_tokens,
+                            completion_tokens=completion_tokens,
+                            total_tokens=total_tokens,
+                        )
+                        conn.execute(
+                            "UPDATE conversations SET updated_at = datetime('now') WHERE id = ?",
+                            (conv_id,),
+                        )
 
-            if persisted_user_message_id is not None or persisted_assistant_message_id is not None:
-                yield json.dumps(
-                    {
-                        "type": "message_ids",
-                        "user_message_id": persisted_user_message_id,
-                        "assistant_message_id": persisted_assistant_message_id,
-                    },
-                    ensure_ascii=False,
-                ) + "\n"
-
-            if conv_id and (persisted_user_message_id is not None or persisted_assistant_message_id is not None):
-                current_turn_ids = {
-                    i for i in [persisted_user_message_id, persisted_assistant_message_id]
-                    if i is not None
-                }
-                yield json.dumps(
-                    {
-                        "type": "history_sync",
-                        "messages": get_conversation_messages(conv_id),
-                    },
-                    ensure_ascii=False,
-                ) + "\n"
-
-                preflight_summary_applied = bool(preflight_summary_outcome and preflight_summary_outcome.get("applied"))
-
-                if defer_post_response_tasks and not preflight_summary_applied:
-                    POST_RESPONSE_EXECUTOR.submit(
-                        _run_chat_post_response_tasks,
-                        conv_id,
-                        model,
-                        dict(settings),
-                        fetch_url_token_threshold,
-                        fetch_url_clip_aggressiveness,
-                        current_turn_ids,
-                    )
-                elif not preflight_summary_applied:
-                    summary_future = SUMMARY_EXECUTOR.submit(
-                        maybe_create_conversation_summary,
-                        conv_id,
-                        model,
-                        settings,
-                        fetch_url_token_threshold,
-                        fetch_url_clip_aggressiveness,
-                        current_turn_ids,
-                    )
-
-            if summary_future is not None:
-                try:
-                    summary_outcome = summary_future.result()
-                except Exception:
-                    summary_outcome = {
-                        "applied": False,
-                        "reason": "internal_error",
-                        "error": "summary_future_failed",
-                        "failure_stage": "internal_error",
-                        "failure_detail": "The background summary task failed before it returned a result.",
-                    }
-
-                if summary_outcome.get("applied"):
-                    if RAG_ENABLED:
-                        sync_conversations_to_rag_safe(conversation_id=conv_id)
+                if persisted_user_message_id is not None or persisted_assistant_message_id is not None:
                     yield json.dumps(
                         {
-                            "type": "conversation_summary_applied",
-                            "summary_message_id": summary_outcome.get("summary_message_id"),
-                            "covered_message_count": summary_outcome.get("covered_message_count", 0),
-                            "covered_tool_message_count": summary_outcome.get("covered_tool_message_count", 0),
-                            "mode": summary_outcome.get("mode") or get_chat_summary_mode(settings),
-                            "trigger_token_count": summary_outcome.get("trigger_token_count"),
-                            "visible_token_count": summary_outcome.get("visible_token_count"),
-                            "summary_model": summary_outcome.get("summary_model") or _resolve_summary_model(),
-                            "checked_at": summary_outcome.get("checked_at"),
-                            "candidate_message_count": summary_outcome.get("candidate_message_count"),
-                            "excluded_message_count": summary_outcome.get("excluded_message_count"),
-                            "prompt_message_count": summary_outcome.get("prompt_message_count"),
-                            "empty_message_count": summary_outcome.get("empty_message_count"),
-                            "merged_assistant_message_count": summary_outcome.get("merged_assistant_message_count"),
-                            "skipped_error_message_count": summary_outcome.get("skipped_error_message_count"),
-                            "returned_text_length": summary_outcome.get("returned_text_length"),
-                            "user_assistant_token_count": summary_outcome.get("user_assistant_token_count"),
-                            "tool_token_count": summary_outcome.get("tool_token_count"),
-                            "tool_message_count": summary_outcome.get("tool_message_count"),
+                            "type": "message_ids",
+                            "user_message_id": persisted_user_message_id,
+                            "assistant_message_id": persisted_assistant_message_id,
                         },
                         ensure_ascii=False,
                     ) + "\n"
+
+                if conv_id and (persisted_user_message_id is not None or persisted_assistant_message_id is not None):
+                    current_turn_ids = {
+                        i for i in [persisted_user_message_id, persisted_assistant_message_id]
+                        if i is not None
+                    }
                     yield json.dumps(
                         {
                             "type": "history_sync",
-                            "messages": summary_outcome.get("messages") or get_conversation_messages(conv_id),
+                            "messages": get_conversation_messages(conv_id),
                         },
                         ensure_ascii=False,
                     ) + "\n"
-                else:
-                    yield json.dumps(
-                        {
-                            "type": "conversation_summary_status",
-                            "applied": False,
-                            "reason": summary_outcome.get("reason") or ("locked" if summary_outcome.get("locked") else "skipped"),
-                            "error": summary_outcome.get("error"),
-                            "mode": summary_outcome.get("mode") or get_chat_summary_mode(settings),
-                            "trigger_token_count": summary_outcome.get("trigger_token_count"),
-                            "visible_token_count": summary_outcome.get("visible_token_count"),
-                            "summary_model": summary_outcome.get("summary_model") or _resolve_summary_model(),
-                            "checked_at": summary_outcome.get("checked_at"),
-                            "failure_stage": summary_outcome.get("failure_stage"),
-                            "failure_detail": summary_outcome.get("failure_detail"),
-                            "token_gap": summary_outcome.get("token_gap"),
-                            "candidate_message_count": summary_outcome.get("candidate_message_count"),
-                            "excluded_message_count": summary_outcome.get("excluded_message_count"),
-                            "prompt_message_count": summary_outcome.get("prompt_message_count"),
-                            "empty_message_count": summary_outcome.get("empty_message_count"),
-                            "merged_assistant_message_count": summary_outcome.get("merged_assistant_message_count"),
-                            "skipped_error_message_count": summary_outcome.get("skipped_error_message_count"),
-                            "returned_text_length": summary_outcome.get("returned_text_length"),
-                            "summary_error_count": summary_outcome.get("summary_error_count"),
-                            "used_max_steps": summary_outcome.get("used_max_steps"),
-                            "user_assistant_token_count": summary_outcome.get("user_assistant_token_count"),
-                            "tool_token_count": summary_outcome.get("tool_token_count"),
-                            "tool_message_count": summary_outcome.get("tool_message_count"),
-                        },
-                        ensure_ascii=False,
-                    ) + "\n"
-                    if RAG_ENABLED and conv_id:
-                        sync_conversations_to_rag_safe(conversation_id=conv_id)
 
-                _maybe_run_conversation_pruning(conv_id, settings)
+                    preflight_summary_applied = bool(preflight_summary_outcome and preflight_summary_outcome.get("applied"))
+
+                    if defer_post_response_tasks and not preflight_summary_applied:
+                        POST_RESPONSE_EXECUTOR.submit(
+                            _run_chat_post_response_tasks,
+                            conv_id,
+                            model,
+                            dict(settings),
+                            fetch_url_token_threshold,
+                            fetch_url_clip_aggressiveness,
+                            current_turn_ids,
+                        )
+                    elif not preflight_summary_applied:
+                        summary_future = SUMMARY_EXECUTOR.submit(
+                            maybe_create_conversation_summary,
+                            conv_id,
+                            model,
+                            settings,
+                            fetch_url_token_threshold,
+                            fetch_url_clip_aggressiveness,
+                            current_turn_ids,
+                        )
+
+                if summary_future is not None:
+                    try:
+                        summary_outcome = summary_future.result()
+                    except Exception:
+                        summary_outcome = {
+                            "applied": False,
+                            "reason": "internal_error",
+                            "error": "summary_future_failed",
+                            "failure_stage": "internal_error",
+                            "failure_detail": "The background summary task failed before it returned a result.",
+                        }
+
+                    if summary_outcome.get("applied"):
+                        if RAG_ENABLED:
+                            sync_conversations_to_rag_safe(conversation_id=conv_id)
+                        yield json.dumps(
+                            {
+                                "type": "conversation_summary_applied",
+                                "summary_message_id": summary_outcome.get("summary_message_id"),
+                                "covered_message_count": summary_outcome.get("covered_message_count", 0),
+                                "covered_tool_message_count": summary_outcome.get("covered_tool_message_count", 0),
+                                "mode": summary_outcome.get("mode") or get_chat_summary_mode(settings),
+                                "trigger_token_count": summary_outcome.get("trigger_token_count"),
+                                "visible_token_count": summary_outcome.get("visible_token_count"),
+                                "summary_model": summary_outcome.get("summary_model") or _resolve_summary_model(),
+                                "checked_at": summary_outcome.get("checked_at"),
+                                "candidate_message_count": summary_outcome.get("candidate_message_count"),
+                                "excluded_message_count": summary_outcome.get("excluded_message_count"),
+                                "prompt_message_count": summary_outcome.get("prompt_message_count"),
+                                "empty_message_count": summary_outcome.get("empty_message_count"),
+                                "merged_assistant_message_count": summary_outcome.get("merged_assistant_message_count"),
+                                "skipped_error_message_count": summary_outcome.get("skipped_error_message_count"),
+                                "returned_text_length": summary_outcome.get("returned_text_length"),
+                                "user_assistant_token_count": summary_outcome.get("user_assistant_token_count"),
+                                "tool_token_count": summary_outcome.get("tool_token_count"),
+                                "tool_message_count": summary_outcome.get("tool_message_count"),
+                            },
+                            ensure_ascii=False,
+                        ) + "\n"
+                        yield json.dumps(
+                            {
+                                "type": "history_sync",
+                                "messages": summary_outcome.get("messages") or get_conversation_messages(conv_id),
+                            },
+                            ensure_ascii=False,
+                        ) + "\n"
+                    else:
+                        yield json.dumps(
+                            {
+                                "type": "conversation_summary_status",
+                                "applied": False,
+                                "reason": summary_outcome.get("reason") or ("locked" if summary_outcome.get("locked") else "skipped"),
+                                "error": summary_outcome.get("error"),
+                                "mode": summary_outcome.get("mode") or get_chat_summary_mode(settings),
+                                "trigger_token_count": summary_outcome.get("trigger_token_count"),
+                                "visible_token_count": summary_outcome.get("visible_token_count"),
+                                "summary_model": summary_outcome.get("summary_model") or _resolve_summary_model(),
+                                "checked_at": summary_outcome.get("checked_at"),
+                                "failure_stage": summary_outcome.get("failure_stage"),
+                                "failure_detail": summary_outcome.get("failure_detail"),
+                                "token_gap": summary_outcome.get("token_gap"),
+                                "candidate_message_count": summary_outcome.get("candidate_message_count"),
+                                "excluded_message_count": summary_outcome.get("excluded_message_count"),
+                                "prompt_message_count": summary_outcome.get("prompt_message_count"),
+                                "empty_message_count": summary_outcome.get("empty_message_count"),
+                                "merged_assistant_message_count": summary_outcome.get("merged_assistant_message_count"),
+                                "skipped_error_message_count": summary_outcome.get("skipped_error_message_count"),
+                                "returned_text_length": summary_outcome.get("returned_text_length"),
+                                "summary_error_count": summary_outcome.get("summary_error_count"),
+                                "used_max_steps": summary_outcome.get("used_max_steps"),
+                                "user_assistant_token_count": summary_outcome.get("user_assistant_token_count"),
+                                "tool_token_count": summary_outcome.get("tool_token_count"),
+                                "tool_message_count": summary_outcome.get("tool_message_count"),
+                            },
+                            ensure_ascii=False,
+                        ) + "\n"
+                        if RAG_ENABLED and conv_id:
+                            sync_conversations_to_rag_safe(conversation_id=conv_id)
+
+                    _maybe_run_conversation_pruning(conv_id, settings)
 
         return Response(
             stream_with_context(generate()),

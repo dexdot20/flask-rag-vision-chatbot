@@ -246,6 +246,41 @@
                     </select>
                     <p class="settings-copy">Limits how many retrieved chunks can be added to a single turn.</p>
                   </div>
+
+                  <div class="rag-setting-group">
+                    <div class="settings-label">Allowed RAG source pools</div>
+                    <div id="rag-source-types" class="rag-source-type-list">
+                      <label class="rag-source-toggle">
+                        <input type="checkbox" name="rag-source-type" value="conversation" />
+                        <span class="rag-source-toggle__body">
+                          <strong>Chats</strong>
+                          <small>Earlier user and assistant messages indexed from conversations.</small>
+                        </span>
+                      </label>
+                      <label class="rag-source-toggle">
+                        <input type="checkbox" name="rag-source-type" value="tool_result" />
+                        <span class="rag-source-toggle__body">
+                          <strong>Tool results</strong>
+                          <small>Structured outputs captured from executed tools.</small>
+                        </span>
+                      </label>
+                      <label class="rag-source-toggle">
+                        <input type="checkbox" name="rag-source-type" value="tool_memory" />
+                        <span class="rag-source-toggle__body">
+                          <strong>Tool memory</strong>
+                          <small>Previously remembered web and fetch results.</small>
+                        </span>
+                      </label>
+                      <label class="rag-source-toggle">
+                        <input type="checkbox" name="rag-source-type" value="uploaded_document" />
+                        <span class="rag-source-toggle__body">
+                          <strong>Uploaded documents</strong>
+                          <small>Manual files or notes added from the settings page.</small>
+                        </span>
+                      </label>
+                    </div>
+                    <p id="rag-source-summary" class="settings-copy">Choose which RAG memory pools the assistant can search and auto-inject.</p>
+                  </div>
                 </div>
               </div>
 
@@ -303,21 +338,61 @@
         </section>
 
         <section class="settings-tab-panel" data-settings-panel="knowledge" aria-labelledby="knowledge-tab">
-          <div class="settings-page-section-card">
-            <div class="settings-page-section-card__header">
-              <div>
-                <span class="settings-section-kicker">RAG maintenance</span>
-                <h3>Knowledge base</h3>
+          <div class="settings-page-grid settings-page-grid--two">
+            <div class="settings-page-section-card">
+              <div class="settings-page-section-card__header">
+                <div>
+                  <span class="settings-section-kicker">Manual knowledge</span>
+                  <h3>Upload document</h3>
+                </div>
+                <p>Add a file to RAG and attach a short explanation so retrieval stays targeted.</p>
               </div>
-              <p>Sync conversation history into RAG and manage indexed sources.</p>
+              <div class="kb-upload-form">
+                <div>
+                  <label class="settings-label" for="kb-upload-file">File</label>
+                  <input
+                    id="kb-upload-file"
+                    class="settings-text"
+                    type="file"
+                    accept=".txt,.md,.csv,.pdf,.docx,.py,.js,.ts,.tsx,.jsx,.json,.html,.css,.scss,.sh,.sql,.yaml,.yml"
+                  />
+                  <p class="settings-copy">Text, markdown, CSV, PDF, DOCX, and common code files are supported.</p>
+                </div>
+                <div>
+                  <label class="settings-label" for="kb-upload-title">Title</label>
+                  <input id="kb-upload-title" class="settings-text" type="text" placeholder="Short source name" />
+                </div>
+                <div>
+                  <label class="settings-label" for="kb-upload-description">Description</label>
+                  <textarea id="kb-upload-description" rows="4" placeholder="Why should the assistant use this source?"></textarea>
+                </div>
+                <label class="tool-toggle">
+                  <input type="checkbox" id="kb-upload-auto-inject-toggle" checked />
+                  <span>Allow this document in automatic RAG injection</span>
+                </label>
+                <div class="kb-actions-row">
+                  <button class="btn-primary" id="kb-upload-btn" type="button">Upload to knowledge base</button>
+                  <span id="kb-upload-status" class="settings-status">Ready to upload</span>
+                </div>
+              </div>
             </div>
-            <div class="kb-actions-row">
-              <button class="btn-primary" id="kb-sync-btn" type="button">Sync chats</button>
-              <span id="kb-status" class="settings-status">Knowledge base idle</span>
-            </div>
-            <div class="kb-documents-block">
-              <div class="settings-label">Indexed sources</div>
-              <div id="kb-documents-list" class="kb-documents-list"></div>
+
+            <div class="settings-page-section-card">
+              <div class="settings-page-section-card__header">
+                <div>
+                  <span class="settings-section-kicker">RAG maintenance</span>
+                  <h3>Knowledge base</h3>
+                </div>
+                <p>Sync conversation history into RAG and manage indexed sources.</p>
+              </div>
+              <div class="kb-actions-row">
+                <button class="btn-primary" id="kb-sync-btn" type="button">Sync chats</button>
+                <span id="kb-status" class="settings-status">Knowledge base idle</span>
+              </div>
+              <div class="kb-documents-block">
+                <div class="settings-label">Indexed sources</div>
+                <div id="kb-documents-list" class="kb-documents-list"></div>
+              </div>
             </div>
           </div>
         </section>

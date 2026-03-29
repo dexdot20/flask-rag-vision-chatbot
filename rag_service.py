@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import re
 import time
 from datetime import datetime, timezone
@@ -18,6 +19,7 @@ from config import (
     RAG_SOURCE_CONVERSATION,
     RAG_SOURCE_TOOL_MEMORY,
     RAG_SOURCE_TOOL_RESULT,
+    RAG_SOURCE_UPLOADED_DOCUMENT,
     RAG_SUPPORTED_CATEGORIES,
     RAG_SUPPORTED_SOURCE_TYPES,
     RAG_TEMPORAL_DECAY_ALPHA,
@@ -26,10 +28,18 @@ from config import (
     TOOL_MEMORY_TTL_NEWS_SECONDS,
     TOOL_MEMORY_TTL_WEB_SECONDS,
 )
-from db import delete_rag_document_records, extract_message_tool_results, get_db, get_expired_rag_document_source_keys, parse_message_metadata
+from db import (
+    delete_rag_document_records,
+    extract_message_tool_results,
+    get_db,
+    get_expired_rag_document_source_keys,
+    get_rag_source_types,
+    parse_message_metadata,
+)
 from messages import build_user_message_for_model
 from rag import (
     chunks_from_records,
+    chunks_from_text,
     normalize_category,
 )
 from rag import (
@@ -48,6 +58,9 @@ from rag import (
 _rag_sources_verified = False
 CATEGORY_TOOL_MEMORY = RAG_SOURCE_TOOL_MEMORY
 DYNAMIC_RAG_CATEGORIES = {RAG_SOURCE_CONVERSATION, RAG_SOURCE_TOOL_MEMORY, RAG_SOURCE_TOOL_RESULT}
+AUTO_INJECT_EXCERPT_LIMIT = 560
+AUTO_INJECT_STRONG_MATCH_MARGIN = 0.12
+MANUAL_UPLOAD_DESCRIPTION_LIMIT = 1_200
 logger = logging.getLogger(__name__)
 
 
@@ -61,6 +74,33 @@ def _clean_rag_text_block(text: str, limit: int | None = None) -> str:
     if limit and len(cleaned) > limit:
         return cleaned[:limit].rstrip() + "…"
     return cleaned
+
+
+def _normalize_allowed_source_types(
+    allowed_source_types: set[str] | list[str] | tuple[str, ...] | None,
+) -> set[str] | None:
+    if allowed_source_types is None:
+        return set(get_rag_source_types())
+    return {
+        normalize_category(value)
+        for value in allowed_source_types
+        if normalize_category(value) in RAG_SUPPORTED_SOURCE_TYPES
+    }
+
+
+def _coerce_metadata_bool(metadata: dict | None, key: str, default: bool = True) -> bool:
+    source = metadata if isinstance(metadata, dict) else {}
+    value = source.get(key)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    normalized = str(value or "").strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
 
 
 def normalize_rag_category(category: str | None, default: str | None = RAG_SOURCE_CONVERSATION) -> str | None:
@@ -125,7 +165,7 @@ def serialize_rag_metadata(metadata: dict | None) -> str | None:
     for key, value in metadata.items():
         if value in (None, ""):
             continue
-        if isinstance(value, (dict, list)):
+        if isinstance(value, (dict, list, bool, int, float)):
             cleaned[str(key)] = value
         else:
             cleaned[str(key)] = str(value)
@@ -413,14 +453,68 @@ def _dedupe_rag_hits(hits: list[dict]) -> list[dict]:
     return [deduped[key] for key in ordered_keys]
 
 
-def _query_rag_hits(query: str, top_k: int, category: str | None = None) -> list[dict]:
+def _query_rag_hits(query: str, top_k: int, category: str | None = None, *, expand_query: bool = True) -> list[dict]:
     collected_hits: list[dict] = []
-    for variant in _expand_query_variants(query):
+    normalized_query = re.sub(r"\s+", " ", str(query or "").strip())
+    variants = _expand_query_variants(normalized_query) if expand_query else ([normalized_query] if normalized_query else [])
+    for variant in variants:
         collected_hits.extend(rag_query_chunks(variant, top_k=top_k, category=category))
     return _dedupe_rag_hits(collected_hits)
 
 
-def _normalize_rag_hits(query: str, hits: list[dict], threshold: float) -> list[dict]:
+def _query_auto_injected_rag_hits(
+    query: str,
+    top_k: int,
+    threshold: float,
+    allowed_source_types: set[str] | list[str] | tuple[str, ...] | None = None,
+) -> list[dict]:
+    normalized_top_k = max(1, int(top_k))
+    base_hits = _query_rag_hits(query, top_k=normalized_top_k, expand_query=False)
+    base_matches = _normalize_rag_hits(
+        query,
+        base_hits,
+        threshold,
+        allowed_source_types=allowed_source_types,
+        auto_inject_only=True,
+    )
+    strong_threshold = min(1.0, float(threshold) + AUTO_INJECT_STRONG_MATCH_MARGIN)
+    strong_match_count = sum(
+        1
+        for match in base_matches
+        if isinstance(match.get("similarity"), (int, float)) and float(match["similarity"]) >= strong_threshold
+    )
+    if strong_match_count >= (1 if normalized_top_k == 1 else 2):
+        return base_hits
+    return _query_rag_hits(query, top_k=normalized_top_k)
+
+
+def _compact_auto_injected_rag_match(match: dict) -> dict | None:
+    if not isinstance(match, dict):
+        return None
+    excerpt = _clip_rag_excerpt(match.get("text", ""), limit=AUTO_INJECT_EXCERPT_LIMIT)
+    if not excerpt:
+        return None
+    source_name = str(match.get("source_name") or match.get("source_type") or "Knowledge base").strip() or "Knowledge base"
+    compact_match = {
+        "source_name": source_name,
+        "text": excerpt,
+    }
+    similarity = match.get("similarity")
+    if isinstance(similarity, (int, float)):
+        compact_match["similarity"] = round(float(similarity), 4)
+    return compact_match
+
+
+def _normalize_rag_hits(
+    query: str,
+    hits: list[dict],
+    threshold: float,
+    *,
+    allowed_source_types: set[str] | list[str] | tuple[str, ...] | None = None,
+    auto_inject_only: bool = False,
+) -> list[dict]:
+    del query
+    allowed_types = _normalize_allowed_source_types(allowed_source_types)
     matches = []
     for hit in hits:
         metadata = hit.get("metadata") or {}
@@ -429,6 +523,10 @@ def _normalize_rag_hits(query: str, hits: list[dict], threshold: float) -> list[
             continue
         source_type = normalize_category(metadata.get("source_type"))
         if source_type not in RAG_SUPPORTED_SOURCE_TYPES:
+            continue
+        if allowed_types is not None and source_type not in allowed_types:
+            continue
+        if auto_inject_only and not _coerce_metadata_bool(metadata, "auto_inject_enabled", default=True):
             continue
         matches.append(
             {
@@ -446,7 +544,12 @@ def _normalize_rag_hits(query: str, hits: list[dict], threshold: float) -> list[
     return matches
 
 
-def search_knowledge_base_tool(query: str, category: str | None = None, top_k: int = RAG_SEARCH_DEFAULT_TOP_K) -> dict:
+def search_knowledge_base_tool(
+    query: str,
+    category: str | None = None,
+    top_k: int = RAG_SEARCH_DEFAULT_TOP_K,
+    allowed_source_types: set[str] | list[str] | tuple[str, ...] | None = None,
+) -> dict:
     _require_rag_enabled()
     query = str(query or "").strip()
     if not query:
@@ -455,7 +558,12 @@ def search_knowledge_base_tool(query: str, category: str | None = None, top_k: i
     ensure_supported_rag_sources()
     normalized_category = normalize_rag_category(category, default=None) if category else None
     hits = _query_rag_hits(query, top_k=top_k, category=normalized_category)
-    matches = _normalize_rag_hits(query, hits, RAG_SEARCH_MIN_SIMILARITY)
+    matches = _normalize_rag_hits(
+        query,
+        hits,
+        RAG_SEARCH_MIN_SIMILARITY,
+        allowed_source_types=allowed_source_types,
+    )
     return {
         "query": query,
         "category": normalized_category,
@@ -596,27 +704,101 @@ def build_rag_auto_context(
     threshold: float,
     top_k: int,
     exclude_source_keys: set[str] | None = None,
+    allowed_source_types: set[str] | list[str] | tuple[str, ...] | None = None,
 ) -> dict | None:
     query = str(query or "").strip()
     if not RAG_ENABLED or not enabled or not query:
         return None
     try:
         ensure_supported_rag_sources()
-        hits = _query_rag_hits(query, top_k=max(1, int(top_k)))
+        normalized_top_k = max(1, int(top_k))
+        hits = _query_auto_injected_rag_hits(
+            query,
+            top_k=normalized_top_k,
+            threshold=max(0.0, min(1.0, float(threshold))),
+            allowed_source_types=allowed_source_types,
+        )
     except Exception:
         return None
 
-    matches = _normalize_rag_hits(query, hits, max(0.0, min(1.0, float(threshold))))
+    matches = _normalize_rag_hits(
+        query,
+        hits,
+        max(0.0, min(1.0, float(threshold))),
+        allowed_source_types=allowed_source_types,
+        auto_inject_only=True,
+    )
     if exclude_source_keys:
         matches = [m for m in matches if m.get("source_key") not in exclude_source_keys]
     if not matches:
         return None
 
+    compact_matches = []
+    for match in matches[:normalized_top_k]:
+        compact_match = _compact_auto_injected_rag_match(match)
+        if compact_match is not None:
+            compact_matches.append(compact_match)
+    if not compact_matches:
+        return None
+
     return {
         "query": query,
-        "count": len(matches[: max(1, int(top_k))]),
-        "matches": matches[: max(1, int(top_k))],
+        "count": len(compact_matches),
+        "matches": compact_matches,
     }
+
+
+def ingest_uploaded_rag_document(
+    filename: str,
+    text: str,
+    *,
+    source_name: str | None = None,
+    description: str = "",
+    auto_inject_enabled: bool = True,
+) -> dict:
+    _require_rag_enabled()
+    cleaned_filename = os.path.basename(str(filename or "").strip())[:255] or "uploaded.txt"
+    cleaned_source_name = _clean_rag_text_block(source_name or cleaned_filename, limit=120) or cleaned_filename
+    cleaned_description = _clean_rag_text_block(description, limit=MANUAL_UPLOAD_DESCRIPTION_LIMIT)
+    cleaned_text = _clean_rag_text_block(text)
+    if not cleaned_text:
+        raise ValueError("Uploaded document is empty after text extraction.")
+
+    source_key = build_rag_source_key(RAG_SOURCE_UPLOADED_DOCUMENT, f"{cleaned_source_name}|{cleaned_filename}")
+    metadata = {
+        "source_key": source_key,
+        "title": cleaned_source_name,
+        "file_name": cleaned_filename,
+        "description": cleaned_description,
+        "auto_inject_enabled": bool(auto_inject_enabled),
+        "source_type": RAG_SOURCE_UPLOADED_DOCUMENT,
+        "created_at_ts": int(time.time()),
+    }
+    parts = [f"Title: {cleaned_source_name}"]
+    if cleaned_filename and cleaned_filename != cleaned_source_name:
+        parts.append(f"File: {cleaned_filename}")
+    if cleaned_description:
+        parts.append(f"Relevance note: {cleaned_description}")
+    parts.append(cleaned_text)
+
+    chunks = chunks_from_text(
+        text="\n\n".join(parts),
+        source_name=cleaned_source_name,
+        source_type=RAG_SOURCE_UPLOADED_DOCUMENT,
+        category=RAG_SOURCE_UPLOADED_DOCUMENT,
+        metadata=metadata,
+    )
+    if not chunks:
+        raise ValueError("Uploaded document did not produce any RAG chunks.")
+
+    return ingest_rag_chunks(
+        source_key=source_key,
+        source_name=cleaned_source_name,
+        source_type=RAG_SOURCE_UPLOADED_DOCUMENT,
+        category=RAG_SOURCE_UPLOADED_DOCUMENT,
+        chunks=chunks,
+        metadata=metadata,
+    )
 
 
 def ingest_rag_chunks(

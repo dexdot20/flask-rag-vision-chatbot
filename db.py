@@ -38,6 +38,10 @@ from config import (
     RAG_DEFAULT_CONTEXT_SIZE_PRESET,
     RAG_DEFAULT_SENSITIVITY_PRESET,
     RAG_ENABLED,
+    RAG_SOURCE_CONVERSATION,
+    RAG_SOURCE_TOOL_MEMORY,
+    RAG_SOURCE_TOOL_RESULT,
+    RAG_SOURCE_UPLOADED_DOCUMENT,
     RAG_SENSITIVITY_PRESETS,
     RAG_TOOL_RESULT_MAX_TEXT_CHARS,
     RAG_TOOL_RESULT_SUMMARY_MAX_CHARS,
@@ -62,12 +66,36 @@ MESSAGE_USAGE_BREAKDOWN_KEYS = (
     "tool_results",
     "unknown_provider_overhead",
 )
+MESSAGE_USAGE_BREAKDOWN_REDUCTION_ORDER = (
+    "tool_specs",
+    "internal_state",
+    "canvas",
+    "scratchpad",
+    "tool_trace",
+    "tool_memory",
+    "rag_context",
+    "assistant_tool_calls",
+    "tool_results",
+    "assistant_history",
+    "user_messages",
+    "core_instructions",
+)
+MESSAGE_USAGE_BREAKDOWN_PROTECTED_KEYS = (
+    "user_messages",
+    "tool_results",
+)
 LEGACY_MESSAGE_USAGE_BREAKDOWN_KEYS = {
     "core_instructions": ("system_prompt", "final_instruction"),
 }
 MESSAGE_TOOL_TRACE_STATES = {"running", "done", "error"}
 VISIBLE_CHAT_ROLES = {"user", "assistant", "summary"}
 SUMMARY_TRIGGER_TOKEN_ROLES = {"user", "assistant", "tool"}
+RAG_SOURCE_TYPE_SETTING_OPTIONS = (
+    RAG_SOURCE_CONVERSATION,
+    RAG_SOURCE_TOOL_RESULT,
+    RAG_SOURCE_TOOL_MEMORY,
+    RAG_SOURCE_UPLOADED_DOCUMENT,
+)
 
 
 def configure_db_path(path: str | None = None) -> str:
@@ -82,8 +110,8 @@ def get_configured_db_path() -> str:
     return _db_path
 
 
-def get_db():
-    db_path = get_configured_db_path()
+def get_db(database_path: str | None = None):
+    db_path = str(database_path or get_configured_db_path()).strip() or get_configured_db_path()
     db_dir = os.path.dirname(db_path)
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
@@ -959,6 +987,15 @@ def _coerce_non_negative_int(value) -> int | None:
     return max(0, normalized)
 
 
+def _protected_breakdown_floor_keys(adjusted: dict[str, int], target_total: int) -> set[str]:
+    if target_total <= 0:
+        return set()
+    present_keys = [key for key in MESSAGE_USAGE_BREAKDOWN_PROTECTED_KEYS if adjusted.get(key, 0) > 0]
+    if not present_keys:
+        return set()
+    return set(present_keys[: min(len(present_keys), target_total)])
+
+
 def _normalize_usage_breakdown(breakdown: dict | None, target_total: int | None = None) -> dict | None:
     if not isinstance(breakdown, dict):
         return None
@@ -1003,37 +1040,27 @@ def _normalize_usage_breakdown(breakdown: dict | None, target_total: int | None 
     if overflow <= 0:
         return adjusted
 
-    reduction_order = (
-        "tool_specs",
-        "internal_state",
-        "assistant_tool_calls",
-        "tool_results",
-        "canvas",
-        "scratchpad",
-        "tool_trace",
-        "tool_memory",
-        "rag_context",
-        "assistant_history",
-        "user_messages",
-        "core_instructions",
-    )
-    for key in reduction_order:
+    protected_floor_keys = _protected_breakdown_floor_keys(adjusted, target_total)
+    for key in MESSAGE_USAGE_BREAKDOWN_REDUCTION_ORDER:
         if overflow <= 0:
             break
-        available = adjusted.get(key, 0)
+        floor = 1 if key in protected_floor_keys else 0
+        available = adjusted.get(key, 0) - floor
         if available <= 0:
             continue
         reduction = min(available, overflow)
-        adjusted[key] = available - reduction
+        adjusted[key] = available - reduction + floor
         overflow -= reduction
 
     if overflow > 0:
         for key, available in sorted(adjusted.items(), key=lambda item: item[1], reverse=True):
             if overflow <= 0:
                 break
-            if available <= 0:
+            floor = 1 if key in protected_floor_keys else 0
+            reducible = available - floor
+            if reducible <= 0:
                 continue
-            reduction = min(available, overflow)
+            reduction = min(reducible, overflow)
             adjusted[key] = available - reduction
             overflow -= reduction
 
@@ -1807,6 +1834,30 @@ def normalize_active_tool_names(raw_value) -> list[str]:
     return normalized
 
 
+def normalize_rag_source_types(raw_value) -> list[str]:
+    if raw_value in (None, ""):
+        return list(RAG_SOURCE_TYPE_SETTING_OPTIONS)
+
+    if isinstance(raw_value, list):
+        values = raw_value
+    else:
+        parsed = None
+        if isinstance(raw_value, str):
+            try:
+                parsed = json.loads(raw_value or "[]")
+            except Exception:
+                parsed = [part.strip() for part in raw_value.split(",") if part.strip()]
+        values = parsed if isinstance(parsed, list) else []
+
+    normalized: list[str] = []
+    for value in values:
+        candidate = str(value or "").strip().lower()
+        if candidate in RAG_SOURCE_TYPE_SETTING_OPTIONS and candidate not in normalized:
+            normalized.append(candidate)
+
+    return normalized
+
+
 def _ensure_tool(name: str, names: list[str]) -> list[str]:
     if name in names:
         return names
@@ -1854,6 +1905,14 @@ def get_rag_context_size(settings: dict | None = None) -> str:
     if raw_value in RAG_CONTEXT_SIZE_PRESETS:
         return raw_value
     return RAG_DEFAULT_CONTEXT_SIZE_PRESET
+
+
+def get_rag_source_types(settings: dict | None = None) -> list[str]:
+    if not RAG_ENABLED:
+        return []
+    source = settings if settings is not None else get_app_settings()
+    raw_value = source.get("rag_source_types", DEFAULT_SETTINGS["rag_source_types"])
+    return normalize_rag_source_types(raw_value)
 
 
 def get_rag_auto_inject_top_k(settings: dict | None = None) -> int:

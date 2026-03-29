@@ -39,6 +39,36 @@ def _build_clarification_policy_payload(active_tool_names: list[str]) -> dict | 
     }
 
 
+def format_knowledge_base_auto_context(retrieved_context) -> str:
+    normalized = str(retrieved_context or "").strip()
+    if isinstance(retrieved_context, str):
+        return normalized
+    if not isinstance(retrieved_context, dict):
+        return normalized
+
+    matches = retrieved_context.get("matches") if isinstance(retrieved_context.get("matches"), list) else []
+    if not matches:
+        return ""
+
+    query = str(retrieved_context.get("query") or "").strip()
+    sections: list[str] = []
+    if query:
+        sections.append(f"Auto-injected query: {query}")
+
+    for index, match in enumerate(matches, start=1):
+        if not isinstance(match, dict):
+            continue
+        source_name = str(match.get("source_name") or match.get("source") or f"Match {index}").strip() or f"Match {index}"
+        similarity = match.get("similarity")
+        heading = f"[{index}] Source: {source_name}"
+        if isinstance(similarity, (int, float)):
+            heading += f" | similarity {float(similarity):.2f}"
+        excerpt = str(match.get("text") or match.get("excerpt") or "").strip()
+        sections.append("\n".join(part for part in (heading, excerpt) if part))
+
+    return "\n\n".join(section for section in sections if section).strip()
+
+
 def _build_knowledge_base_payload(retrieved_context, active_tool_names: list[str]) -> dict | None:
     if not RAG_ENABLED:
         return None
@@ -49,7 +79,9 @@ def _build_knowledge_base_payload(retrieved_context, active_tool_names: list[str
 
     payload = {}
     if retrieved_context:
-        payload["auto_injected_context"] = retrieved_context
+        formatted_context = format_knowledge_base_auto_context(retrieved_context)
+        if formatted_context:
+            payload["auto_injected_context"] = formatted_context
     if search_enabled:
         payload["guidance"] = "Use retrieved context directly when sufficient, and avoid redundant knowledge-base searches."
     return payload or None

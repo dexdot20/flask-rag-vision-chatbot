@@ -36,6 +36,8 @@ const ragInjectOptionsEl = document.getElementById("rag-inject-options");
 const ragSensitivityEl = document.getElementById("rag-sensitivity-select");
 const ragSensitivityHintEl = document.getElementById("rag-sensitivity-hint");
 const ragContextSizeEl = document.getElementById("rag-context-size-select");
+const ragSourceTypeEls = Array.from(document.querySelectorAll("input[name='rag-source-type']"));
+const ragSourceSummaryEl = document.getElementById("rag-source-summary");
 const toolMemoryAutoInjectEl = document.getElementById("tool-memory-auto-inject-toggle");
 const toolMemoryDisabledNoteEl = document.getElementById("tool-memory-disabled-note");
 const ragDisabledNoteEl = document.getElementById("rag-disabled-note");
@@ -43,6 +45,12 @@ const toolToggleEls = Array.from(document.querySelectorAll("#tool-toggles input[
 const kbSyncBtn = document.getElementById("kb-sync-btn");
 const kbStatusEl = document.getElementById("kb-status");
 const kbDocumentsListEl = document.getElementById("kb-documents-list");
+const kbUploadFileEl = document.getElementById("kb-upload-file");
+const kbUploadTitleEl = document.getElementById("kb-upload-title");
+const kbUploadDescriptionEl = document.getElementById("kb-upload-description");
+const kbUploadAutoInjectEl = document.getElementById("kb-upload-auto-inject-toggle");
+const kbUploadBtn = document.getElementById("kb-upload-btn");
+const kbUploadStatusEl = document.getElementById("kb-upload-status");
 const settingsStatus = document.getElementById("settings-status");
 const saveButtons = Array.from(document.querySelectorAll(".settings-save-trigger"));
 const dirtyPillEl = document.getElementById("settings-dirty-pill");
@@ -56,6 +64,13 @@ const RAG_SENSITIVITY_HINTS = {
   flexible: "Flexible: lower threshold around 0.20, so the system injects broader matches.",
   normal: "Normal: balanced matching with an approximate threshold of 0.35.",
   strict: "Strict: higher threshold around 0.55, so only stronger matches are injected.",
+};
+
+const RAG_SOURCE_TYPE_LABELS = {
+  conversation: "Chats",
+  tool_result: "Tool results",
+  tool_memory: "Tool memory",
+  uploaded_document: "Uploaded documents",
 };
 
 let hasUnsavedChanges = false;
@@ -268,11 +283,43 @@ function getSelectedTools() {
   return toolToggleEls.filter((element) => element.checked).map((element) => element.value);
 }
 
+function getSelectedRagSourceTypes() {
+  return ragSourceTypeEls.filter((element) => element.checked).map((element) => element.value);
+}
+
 function applySelectedTools(selected) {
   const active = new Set(Array.isArray(selected) ? selected : []);
   toolToggleEls.forEach((element) => {
     element.checked = active.has(element.value);
   });
+}
+
+function applySelectedRagSourceTypes(selected) {
+  const active = new Set(Array.isArray(selected) ? selected : []);
+  ragSourceTypeEls.forEach((element) => {
+    element.checked = active.has(element.value);
+  });
+  updateRagSourceSummary();
+}
+
+function updateRagSourceSummary() {
+  if (!ragSourceSummaryEl) {
+    return;
+  }
+
+  if (!Boolean(featureFlags.rag_enabled)) {
+    ragSourceSummaryEl.textContent = "RAG is disabled in .env, so source pool selection is inactive.";
+    return;
+  }
+
+  const selected = getSelectedRagSourceTypes();
+  if (!selected.length) {
+    ragSourceSummaryEl.textContent = "No RAG source pool is selected. The assistant will not retrieve memory context.";
+    return;
+  }
+
+  const labels = selected.map((value) => RAG_SOURCE_TYPE_LABELS[value] || value).join(", ");
+  ragSourceSummaryEl.textContent = `Assistant can search and auto-inject: ${labels}.`;
 }
 
 function syncOverviewStats() {
@@ -287,7 +334,12 @@ function syncOverviewStats() {
   }
 
   if (statRagEl) {
-    statRagEl.textContent = featureFlags.rag_enabled ? "Enabled" : "Disabled";
+    if (!featureFlags.rag_enabled) {
+      statRagEl.textContent = "Disabled";
+    } else {
+      const sourceCount = getSelectedRagSourceTypes().length;
+      statRagEl.textContent = sourceCount === 1 ? "1 source" : `${sourceCount} sources`;
+    }
   }
 }
 
@@ -321,6 +373,7 @@ function applySettingsToForm() {
   if (ragContextSizeEl) {
     ragContextSizeEl.value = appSettings.rag_context_size || "medium";
   }
+  applySelectedRagSourceTypes(appSettings.rag_source_types || []);
   if (toolMemoryAutoInjectEl) {
     toolMemoryAutoInjectEl.checked = Boolean(featureFlags.rag_enabled ? appSettings.tool_memory_auto_inject : false);
   }
@@ -342,8 +395,16 @@ function applyFeatureAvailability() {
   if (ragAutoInjectEl) ragAutoInjectEl.disabled = !ragEnabled;
   if (ragSensitivityEl) ragSensitivityEl.disabled = !ragEnabled;
   if (ragContextSizeEl) ragContextSizeEl.disabled = !ragEnabled;
+  ragSourceTypeEls.forEach((element) => {
+    element.disabled = !ragEnabled;
+  });
   if (kbSyncBtn) kbSyncBtn.disabled = !ragEnabled;
   if (toolMemoryAutoInjectEl) toolMemoryAutoInjectEl.disabled = !ragEnabled;
+  if (kbUploadFileEl) kbUploadFileEl.disabled = !ragEnabled;
+  if (kbUploadTitleEl) kbUploadTitleEl.disabled = !ragEnabled;
+  if (kbUploadDescriptionEl) kbUploadDescriptionEl.disabled = !ragEnabled;
+  if (kbUploadAutoInjectEl) kbUploadAutoInjectEl.disabled = !ragEnabled;
+  if (kbUploadBtn) kbUploadBtn.disabled = !ragEnabled;
   if (ragInjectOptionsEl) {
     ragInjectOptionsEl.classList.toggle("is-disabled", !ragEnabled);
   }
@@ -361,7 +422,11 @@ function applyFeatureAvailability() {
   }
   if (!ragEnabled) {
     setKbStatus("RAG disabled in .env", "warning");
+    setKbUploadStatus("Upload disabled because RAG is off", "warning");
+  } else {
+    setKbUploadStatus("Ready to upload", "muted");
   }
+  updateRagSourceSummary();
   syncOverviewStats();
 }
 
@@ -392,6 +457,7 @@ async function refreshSettings() {
     appSettings.rag_auto_inject = Boolean(data.rag_auto_inject);
     appSettings.rag_sensitivity = data.rag_sensitivity || "normal";
     appSettings.rag_context_size = data.rag_context_size || "medium";
+    appSettings.rag_source_types = Array.isArray(data.rag_source_types) ? data.rag_source_types : [];
     appSettings.tool_memory_auto_inject = Boolean(data.tool_memory_auto_inject);
     if (data.features && typeof data.features === "object") {
       Object.assign(featureFlags, data.features);
@@ -428,6 +494,7 @@ async function saveSettings() {
     rag_auto_inject: featureFlags.rag_enabled ? Boolean(ragAutoInjectEl?.checked) : false,
     rag_sensitivity: ragSensitivityEl?.value || "normal",
     rag_context_size: ragContextSizeEl?.value || "medium",
+    rag_source_types: featureFlags.rag_enabled ? getSelectedRagSourceTypes() : [],
     tool_memory_auto_inject: featureFlags.rag_enabled ? Boolean(toolMemoryAutoInjectEl?.checked) : false,
   };
 
@@ -471,6 +538,7 @@ async function saveSettings() {
     appSettings.rag_auto_inject = Boolean(data.rag_auto_inject);
     appSettings.rag_sensitivity = data.rag_sensitivity || "normal";
     appSettings.rag_context_size = data.rag_context_size || "medium";
+    appSettings.rag_source_types = Array.isArray(data.rag_source_types) ? data.rag_source_types : [];
     appSettings.tool_memory_auto_inject = Boolean(data.tool_memory_auto_inject);
     if (data.features && typeof data.features === "object") {
       Object.assign(featureFlags, data.features);
@@ -497,6 +565,27 @@ function setKbStatus(message, tone = "muted") {
   kbStatusEl.dataset.tone = tone;
 }
 
+function setKbUploadStatus(message, tone = "muted") {
+  if (!kbUploadStatusEl) {
+    return;
+  }
+  kbUploadStatusEl.textContent = message;
+  kbUploadStatusEl.dataset.tone = tone;
+}
+
+function summarizeKbDocument(doc) {
+  const metadata = doc && typeof doc.metadata === "object" ? doc.metadata : {};
+  const parts = [RAG_SOURCE_TYPE_LABELS[doc.source_type] || doc.source_type || "Document"];
+  if (doc.category) {
+    parts.push(doc.category);
+  }
+  parts.push(`${doc.chunk_count || 0} chunks`);
+  if (metadata.file_name) {
+    parts.unshift(metadata.file_name);
+  }
+  return parts.join(" · ");
+}
+
 function renderKnowledgeBaseDocuments(docs) {
   if (!kbDocumentsListEl) {
     return;
@@ -521,9 +610,33 @@ function renderKnowledgeBaseDocuments(docs) {
 
     const sub = document.createElement("div");
     sub.className = "kb-doc-subtitle";
-    sub.textContent = `${doc.source_type || "document"} · ${doc.category || "general"} · ${doc.chunk_count || 0} chunks`;
+    sub.textContent = summarizeKbDocument(doc);
 
     meta.append(title, sub);
+
+    const metadata = doc && typeof doc.metadata === "object" ? doc.metadata : {};
+    const description = String(metadata.description || "").trim();
+    if (description) {
+      const descriptionEl = document.createElement("div");
+      descriptionEl.className = "kb-doc-description";
+      descriptionEl.textContent = description;
+      meta.append(descriptionEl);
+    }
+
+    const badges = document.createElement("div");
+    badges.className = "kb-doc-badges";
+    if (doc.source_type === "uploaded_document") {
+      const uploadBadge = document.createElement("span");
+      uploadBadge.className = "kb-doc-badge";
+      uploadBadge.textContent = "manual upload";
+      badges.append(uploadBadge);
+    }
+    const autoInjectBadge = document.createElement("span");
+    autoInjectBadge.className = "kb-doc-badge";
+    autoInjectBadge.dataset.tone = metadata.auto_inject_enabled === false ? "muted" : "success";
+    autoInjectBadge.textContent = metadata.auto_inject_enabled === false ? "manual only" : "auto inject on";
+    badges.append(autoInjectBadge);
+    meta.append(badges);
 
     const del = document.createElement("button");
     del.type = "button";
@@ -575,6 +688,65 @@ async function deleteKnowledgeBaseDocument(sourceKey) {
     await loadKnowledgeBaseDocuments();
   } catch (error) {
     setKbStatus(error.message || "Delete failed.", "error");
+  }
+}
+
+async function uploadKnowledgeBaseDocument() {
+  if (!Boolean(featureFlags.rag_enabled)) {
+    setKbUploadStatus("RAG disabled in .env", "warning");
+    return;
+  }
+
+  const file = kbUploadFileEl?.files?.[0];
+  if (!file) {
+    setKbUploadStatus("Choose a document to upload.", "warning");
+    return;
+  }
+
+  const formData = new FormData();
+  formData.append("document", file);
+  formData.append("source_name", kbUploadTitleEl?.value.trim() || "");
+  formData.append("description", kbUploadDescriptionEl?.value.trim() || "");
+  formData.append("auto_inject_enabled", kbUploadAutoInjectEl?.checked ? "true" : "false");
+
+  if (kbUploadBtn) {
+    kbUploadBtn.disabled = true;
+  }
+  setKbUploadStatus("Uploading document...");
+
+  try {
+    const response = await fetch("/api/rag/ingest", {
+      method: "POST",
+      body: formData,
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(data.error || "Upload failed.");
+    }
+
+    if (kbUploadFileEl) {
+      kbUploadFileEl.value = "";
+    }
+    if (kbUploadTitleEl) {
+      kbUploadTitleEl.value = "";
+    }
+    if (kbUploadDescriptionEl) {
+      kbUploadDescriptionEl.value = "";
+      autoResize(kbUploadDescriptionEl);
+    }
+    if (kbUploadAutoInjectEl) {
+      kbUploadAutoInjectEl.checked = true;
+    }
+
+    const sourceName = data.document?.source_name || data.file_name || "Document";
+    setKbUploadStatus(`${sourceName} indexed`, "success");
+    await loadKnowledgeBaseDocuments();
+  } catch (error) {
+    setKbUploadStatus(error.message || "Upload failed.", "error");
+  } finally {
+    if (kbUploadBtn) {
+      kbUploadBtn.disabled = !Boolean(featureFlags.rag_enabled);
+    }
   }
 }
 
@@ -664,6 +836,13 @@ function registerDirtyListeners() {
     markDirty();
   });
   ragContextSizeEl?.addEventListener("change", markDirty);
+  ragSourceTypeEls.forEach((element) => {
+    element.addEventListener("change", () => {
+      updateRagSourceSummary();
+      syncOverviewStats();
+      markDirty();
+    });
+  });
   toolMemoryAutoInjectEl?.addEventListener("change", markDirty);
   toolToggleEls.forEach((element) => {
     element.addEventListener("change", () => {
@@ -674,6 +853,16 @@ function registerDirtyListeners() {
 }
 
 scratchpadAddBtn?.addEventListener("click", () => addScratchpadNote());
+kbUploadFileEl?.addEventListener("change", () => {
+  const filename = kbUploadFileEl.files?.[0]?.name || "";
+  if (filename && kbUploadTitleEl && !kbUploadTitleEl.value.trim()) {
+    kbUploadTitleEl.value = filename.replace(/\.[^.]+$/, "");
+  }
+});
+kbUploadDescriptionEl?.addEventListener("input", () => autoResize(kbUploadDescriptionEl));
+kbUploadBtn?.addEventListener("click", () => {
+  void uploadKnowledgeBaseDocument();
+});
 kbSyncBtn?.addEventListener("click", () => {
   void syncKnowledgeBaseConversations();
 });
