@@ -16,12 +16,30 @@ SUMMARY_LABEL = "Conversation summary (generated from deleted messages):"
 CANVAS_PROMPT_MAX_CHARS = 12_000
 CANVAS_PROMPT_MAX_LINES = 400
 PARALLEL_SAFE_READ_ONLY_TOOL_NAMES = (
+    # Web / fetch
     "search_web",
     "fetch_url",
     "search_news_ddgs",
     "search_news_google",
     "image_explain",
+    # RAG / memory reads
+    "search_knowledge_base",
+    "search_tool_memory",
+    # Workspace reads
+    "read_file",
+    "list_dir",
+    "search_files",
+    "get_project_workflow_status",
+    "validate_project_workspace",
+    "get_workspace_file_history",
+    "preview_workspace_changes",
+    # Canvas inspection (non-mutating)
+    "expand_canvas_document",
+    "scroll_canvas_document",
 )
+# Tools whose results may still be inputs for other calls in the same batch;
+# they are parallel-safe among themselves but must not be batched with any
+# call that depends on their output.
 DEPENDENT_TOOL_NAMES = (
     "search_knowledge_base",
     "search_tool_memory",
@@ -484,17 +502,39 @@ def build_tool_call_contract(active_tool_names: list[str], canvas_documents=None
         "Use only the tools exposed by the API for this turn, and provide arguments matching the documented types.",
     ]
 
-    parallel_safe_tools = [name for name in PARALLEL_SAFE_READ_ONLY_TOOL_NAMES if name in runtime_tool_names]
-    if parallel_safe_tools:
+    parallel_safe_in_use = [name for name in PARALLEL_SAFE_READ_ONLY_TOOL_NAMES if name in runtime_tool_names]
+    if parallel_safe_in_use:
         rules.append(
-            "If you need multiple independent read-only lookups using "
-            + ", ".join(parallel_safe_tools)
-            + ", emit them together in one assistant turn so the runtime can execute those safe tools in parallel."
+            "## Parallel and Batched Tool Calls\n"
+            "Batching independent tool calls into one assistant turn reduces LLM round trips and saves tokens. "
+            "Prefer this pattern aggressively.\n\n"
+            "**GATHER → REASON → ACT** — the core pattern:\n"
+            "  1. Issue ALL independent reads in one turn (gather phase).\n"
+            "  2. Reason over all returned results together.\n"
+            "  3. Issue writes / mutations based on what you learned.\n\n"
+            "**Concurrently executed (I/O runs in parallel):** "
+            + ", ".join(parallel_safe_in_use)
+            + ".\n"
+            "Emitting multiple calls to these tools in one turn causes them to run at the same time — "
+            "use this whenever you need several independent lookups.\n\n"
+            "**All other tools** run sequentially within a turn, but batching them still saves a full LLM "
+            "round trip. Batch independent writes together when their inputs do not depend on each other "
+            "(e.g. creating two unrelated files, updating two different canvas documents).\n\n"
+            "**Examples of correct batching:**\n"
+            "  - Read three files at once: emit read_file × 3 in one turn.\n"
+            "  - Explore a directory and search for a keyword simultaneously: list_dir + search_files in one turn.\n"
+            "  - Search the web and the knowledge base for the same topic simultaneously: search_web + search_knowledge_base in one turn.\n"
+            "  - Write two independent new files in one turn: create_file × 2.\n\n"
+            "**When NOT to batch (data dependency requires two turns):**\n"
+            "  - fetch_url X → then parse X's result to decide the next tool call.\n"
+            "  - search_knowledge_base → then use the returned chunk IDs to call another tool.\n"
+            "  - Any case where tool B needs the output of tool A as its input."
         )
 
     if any(name in runtime_tool_names for name in DEPENDENT_TOOL_NAMES):
         rules.append(
-            "Do not batch search_knowledge_base or search_tool_memory with tool calls whose results they depend on. Run those dependent searches after the prerequisite results are available."
+            "search_knowledge_base and search_tool_memory may be batched freely with other independent reads "
+            "(they run concurrently), but must not be batched with any tool call whose input depends on their output."
         )
 
     if "ask_clarifying_question" in runtime_tool_names:

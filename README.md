@@ -45,7 +45,7 @@ It is not a minimal prompt/response demo. The app keeps conversation history in 
 - Validates tool names and tool argument schemas before execution
 - Supports native function calls from the model
 - Supports model-emitted tool JSON fallback handling
-- Limits tool rounds with configurable `max_steps` from 1 to 10
+- Limits tool rounds with configurable `max_steps` from 1 to 50
 - Forces a final-answer phase when the tool budget is exhausted
 - Tracks estimated prompt composition locally across runtime instructions, tool specs, canvas context, scratchpad, tool trace, tool memory, RAG context, message history, tool calls, tool results, and provider overhead
 - Estimates per-turn and session cost with the app's configured DeepSeek pricing logic

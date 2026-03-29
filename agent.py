@@ -143,6 +143,20 @@ WEB_TOOL_NAMES = {
 }
 PARALLEL_SAFE_TOOL_NAMES = WEB_TOOL_NAMES | {
     "image_explain",
+    # RAG / memory reads
+    "search_knowledge_base",
+    "search_tool_memory",
+    # Workspace reads
+    "read_file",
+    "list_dir",
+    "search_files",
+    "get_project_workflow_status",
+    "validate_project_workspace",
+    "get_workspace_file_history",
+    "preview_workspace_changes",
+    # Canvas inspection (non-mutating)
+    "expand_canvas_document",
+    "scroll_canvas_document",
 }
 INPUT_BREAKDOWN_KEYS = (
     "core_instructions",

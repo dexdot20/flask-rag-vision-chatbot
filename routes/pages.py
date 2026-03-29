@@ -160,8 +160,8 @@ def register_page_routes(app) -> None:
                 max_steps = int(max_steps_raw)
             except (TypeError, ValueError):
                 return jsonify({"error": "max_steps must be an integer."}), 400
-            if not (1 <= max_steps <= 10):
-                return jsonify({"error": "max_steps must be between 1 and 10."}), 400
+            if not (1 <= max_steps <= 50):
+                return jsonify({"error": "max_steps must be between 1 and 50."}), 400
             settings["max_steps"] = str(max_steps)
 
         if active_tools_raw is not None:
