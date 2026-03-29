@@ -8,6 +8,10 @@ import html
 import json
 import logging
 import os
+try:
+    from json_repair import repair_json as _repair_json
+except ImportError:  # pragma: no cover
+    _repair_json = None
 import re
 import string
 from logging.handlers import RotatingFileHandler
@@ -1050,10 +1054,22 @@ def _parse_json_like_text(text: str):
     try:
         return json.loads(raw_text)
     except Exception:
+        pass
+
+    try:
+        return ast.literal_eval(raw_text)
+    except Exception:
+        pass
+
+    if _repair_json is not None:
         try:
-            return ast.literal_eval(raw_text)
+            repaired = _repair_json(raw_text, return_objects=True, ensure_ascii=False)
+            if isinstance(repaired, (dict, list)):
+                return repaired
         except Exception:
-            return None
+            pass
+
+    return None
 
 
 def _strip_tool_argument_code_fence(text: str) -> str | None:
