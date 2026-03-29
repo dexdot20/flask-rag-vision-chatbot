@@ -4,6 +4,7 @@ import ast
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import html
 import json
 import logging
 import os
@@ -128,6 +129,11 @@ DSML_PARAMETER_TAG_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 DSML_STRING_ATTR_RE = re.compile(r'\bstring\s*=\s*["\']true["\']', re.IGNORECASE)
+TOOL_ARGUMENT_CODE_FENCE_RE = re.compile(
+    r'^\s*```(?:json|javascript|js|python|py)?\s*(?P<body>.*?)\s*```\s*$',
+    re.IGNORECASE | re.DOTALL,
+)
+TOOL_ARGUMENT_LANGUAGE_LABELS = {"json", "javascript", "js", "python", "py"}
 WEB_TOOL_NAMES = {
     "search_web",
     "fetch_url",
@@ -1035,6 +1041,156 @@ def _parse_json_like_text(text: str):
             return None
 
 
+def _strip_tool_argument_code_fence(text: str) -> str | None:
+    match = TOOL_ARGUMENT_CODE_FENCE_RE.match(str(text or ""))
+    if not match:
+        return None
+    return str(match.group("body") or "").strip()
+
+
+def _strip_tool_argument_language_label(text: str) -> str | None:
+    raw_text = str(text or "").strip()
+    if not raw_text or "\n" not in raw_text:
+        return None
+
+    first_line, remainder = raw_text.split("\n", 1)
+    if first_line.strip().lower() not in TOOL_ARGUMENT_LANGUAGE_LABELS:
+        return None
+
+    cleaned_remainder = remainder.strip()
+    if not cleaned_remainder.startswith(("{", "[", "<")):
+        return None
+    return cleaned_remainder
+
+
+def _extract_first_balanced_json_like_object(text: str) -> str | None:
+    raw_text = str(text or "")
+    start_index = raw_text.find("{")
+    if start_index < 0:
+        return None
+
+    depth = 0
+    quote_char = ""
+    escape_next = False
+
+    for index in range(start_index, len(raw_text)):
+        char = raw_text[index]
+        if quote_char:
+            if escape_next:
+                escape_next = False
+                continue
+            if char == "\\":
+                escape_next = True
+                continue
+            if char == quote_char:
+                quote_char = ""
+            continue
+
+        if char in {'"', "'"}:
+            quote_char = char
+            continue
+        if char == "{":
+            depth += 1
+            continue
+        if char == "}":
+            depth -= 1
+            if depth == 0:
+                return raw_text[start_index:index + 1]
+
+    return None
+
+
+def _close_unbalanced_json_like_object(text: str) -> str | None:
+    raw_text = str(text or "").strip()
+    if not raw_text:
+        return None
+
+    object_text = raw_text
+    if not object_text.startswith("{"):
+        brace_index = object_text.find("{")
+        if brace_index < 0:
+            return None
+        object_text = object_text[brace_index:].strip()
+
+    stack: list[str] = []
+    quote_char = ""
+    escape_next = False
+
+    for char in object_text:
+        if quote_char:
+            if escape_next:
+                escape_next = False
+                continue
+            if char == "\\":
+                escape_next = True
+                continue
+            if char == quote_char:
+                quote_char = ""
+            continue
+
+        if char in {'"', "'"}:
+            quote_char = char
+            continue
+        if char in "[{":
+            stack.append(char)
+            continue
+        if char == "]":
+            if not stack or stack[-1] != "[":
+                return None
+            stack.pop()
+            continue
+        if char == "}":
+            if not stack or stack[-1] != "{":
+                return None
+            stack.pop()
+
+    if quote_char or escape_next or not stack:
+        return None
+
+    closing_suffix = "".join(
+        "}" if opener == "{" else "]"
+        for opener in reversed(stack)
+    )
+    return f"{object_text}{closing_suffix}"
+
+
+def _iter_tool_argument_text_candidates(arguments_text: str):
+    raw_text = str(arguments_text or "").strip()
+    if not raw_text:
+        return
+
+    pending = [raw_text]
+    seen = set()
+
+    while pending:
+        candidate = str(pending.pop(0) or "").strip()
+        if not candidate or candidate in seen:
+            continue
+
+        seen.add(candidate)
+        yield candidate
+
+        html_unescaped = html.unescape(candidate).strip()
+        if html_unescaped and html_unescaped not in seen and html_unescaped != candidate:
+            pending.append(html_unescaped)
+
+        fence_inner = _strip_tool_argument_code_fence(candidate)
+        if fence_inner and fence_inner not in seen:
+            pending.append(fence_inner)
+
+        unlabeled = _strip_tool_argument_language_label(candidate)
+        if unlabeled and unlabeled not in seen:
+            pending.append(unlabeled)
+
+        object_text = _extract_first_balanced_json_like_object(candidate)
+        if object_text and object_text not in seen:
+            pending.append(object_text)
+
+        repaired_object = _close_unbalanced_json_like_object(candidate)
+        if repaired_object and repaired_object not in seen:
+            pending.append(repaired_object)
+
+
 def _parse_dsml_argument_value(value_text: str, attrs_text: str = ""):
     raw_value = str(value_text or "")
     if DSML_STRING_ATTR_RE.search(str(attrs_text or "")):
@@ -1103,27 +1259,54 @@ def _extract_dsml_tool_calls_from_content(content_text: str) -> tuple[str, list[
     return raw_content[:dsml_start].strip(), tool_calls
 
 
+def _prefer_content_dsml_tool_calls(
+    content_text: str,
+    tool_calls: list[dict] | None,
+    tool_call_error: str | None,
+) -> tuple[str, list[dict] | None, str | None]:
+    normalized_content, content_tool_calls = _extract_dsml_tool_calls_from_content(content_text)
+    if content_tool_calls:
+        return normalized_content, content_tool_calls, None
+    return content_text, tool_calls, tool_call_error
+
+
 def _parse_tool_call_arguments(arguments_text: str, label: str) -> tuple[dict | None, str | None]:
     raw_arguments = str(arguments_text or "").strip()
     if not raw_arguments:
         return {}, None
 
-    parsed_arguments = None
     json_error = None
     try:
-        parsed_arguments = json.loads(raw_arguments)
+        json.loads(raw_arguments)
     except json.JSONDecodeError as exc:
         json_error = exc.msg
 
-    if parsed_arguments is None:
-        parsed_arguments = _parse_json_like_text(raw_arguments)
-    if parsed_arguments is None:
-        parsed_arguments = _parse_dsml_argument_object(raw_arguments)
-    if parsed_arguments is None:
-        return None, f"Invalid tool arguments JSON for {label}: {json_error or 'Could not parse arguments'}"
-    if not isinstance(parsed_arguments, dict):
+    saw_non_object_candidate = False
+    for candidate in _iter_tool_argument_text_candidates(raw_arguments):
+        parsed_arguments = _parse_json_like_text(candidate)
+        if parsed_arguments is None:
+            parsed_arguments = _parse_dsml_argument_object(candidate)
+        if parsed_arguments is None:
+            continue
+        if isinstance(parsed_arguments, dict):
+            return parsed_arguments, None
+        saw_non_object_candidate = True
+
+    if saw_non_object_candidate:
         return None, f"Tool arguments for {label} must be an object"
-    return parsed_arguments, None
+
+    if raw_arguments.startswith("<"):
+        return None, f"Invalid tool arguments JSON for {label}: {json_error or 'Could not parse arguments'}"
+
+    repaired_arguments = _close_unbalanced_json_like_object(raw_arguments)
+    if repaired_arguments is not None:
+        parsed_arguments = _parse_json_like_text(repaired_arguments)
+        if isinstance(parsed_arguments, dict):
+            return parsed_arguments, None
+
+    if raw_arguments.lstrip().startswith("{"):
+        return None, f"Invalid tool arguments JSON for {label}: {json_error or 'Could not parse arguments'}"
+    return None, f"Invalid tool arguments JSON for {label}: {json_error or 'Could not parse arguments'}"
 
 
 def _extract_native_tool_calls(message) -> tuple[list[dict] | None, str | None]:
@@ -2942,10 +3125,11 @@ def run_agent_stream(
             message = response.choices[0].message
             reasoning_text, content_text = _extract_reasoning_and_content(message)
             tool_calls, tool_call_error = _extract_native_tool_calls(message)
-            if not tool_calls and not tool_call_error:
-                content_text, content_tool_calls = _extract_dsml_tool_calls_from_content(content_text)
-                if content_tool_calls:
-                    tool_calls = content_tool_calls
+            content_text, tool_calls, tool_call_error = _prefer_content_dsml_tool_calls(
+                content_text,
+                tool_calls,
+                tool_call_error,
+            )
             _trace_agent_event(
                 "model_turn_completed",
                 trace_id=trace_id,
@@ -3044,10 +3228,11 @@ def run_agent_stream(
         final_reasoning = "".join(reasoning_parts).strip()
         final_content = "".join(content_parts).strip()
         tool_calls, tool_call_error = _finalize_stream_tool_calls(tool_call_parts)
-        if not tool_calls and not tool_call_error:
-            final_content, content_tool_calls = _extract_dsml_tool_calls_from_content(final_content)
-            if content_tool_calls:
-                tool_calls = content_tool_calls
+        final_content, tool_calls, tool_call_error = _prefer_content_dsml_tool_calls(
+            final_content,
+            tool_calls,
+            tool_call_error,
+        )
         finalize_call_usage()
         if buffered_content_deltas and not tool_calls and not tool_call_error:
             for pending_delta in buffered_content_deltas:

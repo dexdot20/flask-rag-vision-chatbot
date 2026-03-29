@@ -27,6 +27,7 @@ from agent import (
     _extract_partial_json_string_value,
     _is_context_overflow_error,
     _iter_agent_exchange_blocks,
+    _parse_tool_call_arguments,
     _prepare_tool_result_for_transcript,
     _summarize_model_call_usage,
     _try_compact_messages,
@@ -489,6 +490,38 @@ class AppRoutesTestCase(unittest.TestCase):
         extracted = _extract_partial_json_string_value(arguments_text, "content")
 
         self.assertEqual(extracted, 'Line 1\nLine 2ç ve "quote"')
+
+    def test_parse_tool_call_arguments_accepts_markdown_fenced_json(self):
+        tool_args, parse_error = _parse_tool_call_arguments(
+            "```json\n{\"start_line\": 12, \"end_line\": 14, \"lines\": [\"socket_client = None\"]}\n```",
+            "replace_canvas_lines",
+        )
+
+        self.assertIsNone(parse_error)
+        self.assertEqual(
+            tool_args,
+            {
+                "start_line": 12,
+                "end_line": 14,
+                "lines": ["socket_client = None"],
+            },
+        )
+
+    def test_parse_tool_call_arguments_repairs_truncated_json_object(self):
+        tool_args, parse_error = _parse_tool_call_arguments(
+            '{"start_line": 12, "end_line": 14, "lines": ["socket_client = None"]',
+            "replace_canvas_lines",
+        )
+
+        self.assertIsNone(parse_error)
+        self.assertEqual(
+            tool_args,
+            {
+                "start_line": 12,
+                "end_line": 14,
+                "lines": ["socket_client = None"],
+            },
+        )
 
     def test_build_streaming_canvas_tool_preview_reads_partial_canvas_args(self):
         tool_call_parts = [
@@ -4684,6 +4717,61 @@ class AppRoutesTestCase(unittest.TestCase):
         tool_capture_event = next(event for event in events if event["type"] == "tool_capture")
         self.assertEqual([doc["title"] for doc in tool_capture_event["canvas_documents"]], ["Arduino Kodu - RobotBeyni.ino"])
         self.assertEqual(tool_capture_event["canvas_documents"][0]["content"], "// test\nint led = 13;")
+
+    def test_run_agent_stream_prefers_content_dsml_when_native_tool_args_are_invalid(self):
+        dsml_content = (
+            "<｜DSML｜function_calls>\n"
+            "<｜DSML｜invoke name=\"create_canvas_document\">\n"
+            "<｜DSML｜parameter name=\"title\" string=\"true\">Robot Plan</｜DSML｜parameter>\n"
+            "<｜DSML｜parameter name=\"content\" string=\"true\"># Notes</｜DSML｜parameter>\n"
+            "</｜DSML｜invoke>\n"
+            "</｜DSML｜function_calls>"
+        )
+        responses = [
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            reasoning_content="",
+                            content=dsml_content,
+                            tool_calls=[
+                                {
+                                    "id": "call-1",
+                                    "function": {
+                                        "name": "replace_canvas_lines",
+                                        "arguments": "not valid json at all",
+                                    },
+                                }
+                            ],
+                        )
+                    )
+                ],
+                usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+            ),
+            iter(
+                [
+                    self._stream_chunk(content="Bitti."),
+                    self._stream_chunk(usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2)),
+                ]
+            ),
+        ]
+
+        with patch("agent.client.chat.completions.create", side_effect=responses):
+            events = list(
+                run_agent_stream(
+                    [{"role": "user", "content": "Canvas oluştur"}],
+                    "deepseek-reasoner",
+                    2,
+                    ["create_canvas_document", "replace_canvas_lines"],
+                )
+            )
+
+        self.assertIn({"type": "answer_delta", "text": "Bitti."}, events)
+        parser_errors = [event for event in events if event["type"] == "tool_error" and event["tool"] == "parser"]
+        self.assertEqual(parser_errors, [])
+        tool_capture_event = next(event for event in events if event["type"] == "tool_capture")
+        self.assertEqual([doc["title"] for doc in tool_capture_event["canvas_documents"]], ["Robot Plan"])
+        self.assertEqual(tool_capture_event["canvas_documents"][0]["content"], "# Notes")
 
     def test_context_overflow_error_detection(self):
         self.assertTrue(_is_context_overflow_error("context_length_exceeded: requested 200000 tokens"))
