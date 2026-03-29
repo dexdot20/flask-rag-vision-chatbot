@@ -67,6 +67,32 @@ def _build_paddleocr_engine() -> dict:
     }
 
 
+def _build_ocr_engine(provider: str) -> dict:
+    if provider == "easyocr":
+        return _build_easyocr_engine()
+    if provider == "paddleocr":
+        return _build_paddleocr_engine()
+
+    supported = ", ".join(sorted(OCR_SUPPORTED_PROVIDERS))
+    raise RuntimeError(f"Unsupported OCR provider: {provider or 'empty'}. Supported providers: {supported}.")
+
+
+def _iter_provider_candidates(preferred: str):
+    yield preferred
+    for provider in sorted(OCR_SUPPORTED_PROVIDERS):
+        if provider != preferred:
+            yield provider
+
+
+def _is_missing_dependency_error(exc: Exception) -> bool:
+    if isinstance(exc, ImportError):
+        return True
+    if isinstance(exc.__cause__, ImportError):
+        return True
+    message = str(exc).strip().lower()
+    return "dependencies are missing" in message
+
+
 def get_ocr_engine() -> dict:
     global _ocr_engine
 
@@ -74,19 +100,33 @@ def get_ocr_engine() -> dict:
         raise RuntimeError(OCR_DISABLED_FEATURE_ERROR)
 
     provider = _resolve_provider_name()
-    if _ocr_engine is not None and _ocr_engine.get("provider") == provider:
+    if _ocr_engine is not None and _ocr_engine.get("configured_provider") == provider:
         return _ocr_engine
 
     with _ocr_engine_lock:
-        if _ocr_engine is not None and _ocr_engine.get("provider") == provider:
+        if _ocr_engine is not None and _ocr_engine.get("configured_provider") == provider:
             return _ocr_engine
 
-        if provider == "easyocr":
-            _ocr_engine = _build_easyocr_engine()
-        else:
-            _ocr_engine = _build_paddleocr_engine()
+        last_error = None
+        for candidate_provider in _iter_provider_candidates(provider):
+            try:
+                engine = _build_ocr_engine(candidate_provider)
+            except RuntimeError as exc:
+                if _is_missing_dependency_error(exc):
+                    last_error = exc
+                    continue
+                raise
 
-        return _ocr_engine
+            engine["configured_provider"] = provider
+            _ocr_engine = engine
+            return _ocr_engine
+
+        supported = ", ".join(sorted(OCR_SUPPORTED_PROVIDERS))
+        message = (
+            f"OCR provider '{provider}' could not be loaded because its dependencies are missing. "
+            f"Install the matching OCR stack ({supported}) or set OCR_ENABLED=false."
+        )
+        raise RuntimeError(message) from last_error
 
 
 def preload_ocr_engine(app) -> None:
@@ -100,8 +140,18 @@ def preload_ocr_engine(app) -> None:
 
     provider = _resolve_provider_name()
     print(f"[startup] Loading OCR engine ({provider})...")
-    get_ocr_engine()
-    print(f"[startup] OCR engine ready ({provider}).")
+    try:
+        engine = get_ocr_engine()
+    except RuntimeError as exc:
+        if not _is_missing_dependency_error(exc):
+            raise
+        print(f"[startup] OCR preload skipped: {exc}")
+        return
+
+    resolved_provider = engine.get("provider", provider)
+    if resolved_provider != provider:
+        print(f"[startup] OCR provider '{provider}' unavailable; using '{resolved_provider}' instead.")
+    print(f"[startup] OCR engine ready ({resolved_provider}).")
 
 
 def _dedupe_preserve_order(values: list[str]) -> list[str]:

@@ -14,6 +14,7 @@ import requests as http_requests
 from werkzeug.datastructures import MultiDict
 
 import web_tools
+import ocr_service
 from agent import (
     CONTEXT_OVERFLOW_RECOVERY_ERROR_TEXT,
     FINAL_ANSWER_ERROR_TEXT,
@@ -1920,6 +1921,39 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(summary, "Stored image not found")
         self.assertEqual(result["status"], "missing_image")
         self.assertIn("re-upload", result["error"])
+
+    def test_get_ocr_engine_falls_back_to_easyocr_when_paddle_dependencies_are_missing(self):
+        with patch.object(ocr_service, "OCR_ENABLED", True), patch.object(
+            ocr_service, "OCR_PROVIDER", "paddleocr"
+        ), patch.object(ocr_service, "_ocr_engine", None), patch.object(
+            ocr_service,
+            "_build_paddleocr_engine",
+            side_effect=RuntimeError(
+                "PaddleOCR dependencies are missing. Ensure paddleocr and a compatible paddlepaddle runtime are installed."
+            ),
+        ) as mocked_paddle, patch.object(
+            ocr_service,
+            "_build_easyocr_engine",
+            return_value={"provider": "easyocr", "reader": object()},
+        ) as mocked_easy:
+            engine = ocr_service.get_ocr_engine()
+
+        self.assertEqual(engine["provider"], "easyocr")
+        self.assertEqual(engine["configured_provider"], "paddleocr")
+        mocked_paddle.assert_called_once_with()
+        mocked_easy.assert_called_once_with()
+
+    def test_preload_ocr_engine_skips_missing_dependencies_without_raising(self):
+        with patch.object(ocr_service, "OCR_ENABLED", True), patch.object(
+            ocr_service, "OCR_PRELOAD_ON_STARTUP", True
+        ), patch.object(
+            ocr_service,
+            "get_ocr_engine",
+            side_effect=RuntimeError(
+                "PaddleOCR dependencies are missing. Ensure paddleocr and a compatible paddlepaddle runtime are installed."
+            ),
+        ):
+            ocr_service.preload_ocr_engine(SimpleNamespace(debug=False))
 
     def test_canvas_tools_create_and_edit_document_in_runtime_state(self):
         runtime_state = {}
