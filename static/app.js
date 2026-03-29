@@ -58,6 +58,10 @@ const canvasEmptyState = document.getElementById("canvas-empty-state");
 const canvasEditorEl = document.getElementById("canvas-editor");
 const canvasDocumentEl = document.getElementById("canvas-document");
 const canvasDocumentTabsEl = document.getElementById("canvas-document-tabs");
+const canvasMetaBar = document.getElementById("canvas-meta-bar");
+const canvasMetaChips = document.getElementById("canvas-meta-chips");
+const canvasCopyRefBtn = document.getElementById("canvas-copy-ref-btn");
+const canvasResetFiltersBtn = document.getElementById("canvas-reset-filters-btn");
 const canvasEditBtn = document.getElementById("canvas-edit-btn");
 const canvasSaveBtn = document.getElementById("canvas-save-btn");
 const canvasCancelBtn = document.getElementById("canvas-cancel-btn");
@@ -124,7 +128,8 @@ let lastCanvasTriggerEl = null;
 let lastCanvasConfirmTriggerEl = null;
 let lastExportTriggerEl = null;
 let streamingCanvasPreview = null;
-let pendingCanvasPreviewFrame = 0;
+let pendingCanvasPreviewTimer = 0;
+let lastCanvasStructureSignature = "";
 let latestSummaryStatus = null;
 let conversationRefreshGeneration = 0;
 let pendingConversationRefreshTimers = new Set();
@@ -154,6 +159,50 @@ const CANVAS_PANEL_DEFAULT_WIDTH = 620;
 const CANVAS_PANEL_MIN_WIDTH = 420;
 const CANVAS_PANEL_MAX_WIDTH = 1100;
 const CANVAS_ROOT_PATH_FILTER = "__root__";
+const CANVAS_PREVIEW_RENDER_INTERVAL_MS = 150;
+const CANVAS_CODE_FILE_EXTENSIONS = new Set([
+  ".bat",
+  ".c",
+  ".cc",
+  ".cfg",
+  ".conf",
+  ".cpp",
+  ".cs",
+  ".css",
+  ".env",
+  ".go",
+  ".h",
+  ".hpp",
+  ".html",
+  ".ini",
+  ".java",
+  ".js",
+  ".json",
+  ".jsx",
+  ".kt",
+  ".kts",
+  ".less",
+  ".lua",
+  ".mjs",
+  ".php",
+  ".ps1",
+  ".py",
+  ".rb",
+  ".rs",
+  ".sass",
+  ".scss",
+  ".sh",
+  ".sql",
+  ".swift",
+  ".toml",
+  ".ts",
+  ".tsx",
+  ".vue",
+  ".xml",
+  ".yaml",
+  ".yml",
+  ".zsh",
+]);
 
 function isDocumentFile(file) {
   if (ALLOWED_DOCUMENT_TYPES.has(file.type)) return true;
@@ -412,10 +461,45 @@ function getCanvasDocumentLabel(document) {
   return String(document.path || document.title || "").trim();
 }
 
+function getCanvasDocumentReference(document) {
+  return getCanvasDocumentLabel(document);
+}
+
 function getCanvasFileName(document) {
   const label = getCanvasDocumentLabel(document);
   const parts = label.split("/");
   return parts[parts.length - 1] || label;
+}
+
+function shouldRenderCanvasAsCode(document) {
+  if (!document || typeof document !== "object") {
+    return false;
+  }
+
+  const explicitFormat = String(document.format || "").trim().toLowerCase();
+  if (explicitFormat === "code") {
+    return true;
+  }
+
+  const language = String(document.language || "").trim().toLowerCase();
+  if (language && !["markdown", "md", "plain", "text", "txt"].includes(language)) {
+    return true;
+  }
+
+  const candidateLabel = String(document.path || document.title || "").trim().toLowerCase();
+  const extensionMatch = candidateLabel.match(/\.[^.\/]+$/);
+  return Boolean(extensionMatch && CANVAS_CODE_FILE_EXTENSIONS.has(extensionMatch[0]));
+}
+
+function normalizeStreamingCanvasPreviewDocument(document) {
+  const normalized = normalizeCanvasDocument(document);
+  if (!normalized) {
+    return null;
+  }
+  if (shouldRenderCanvasAsCode(normalized)) {
+    normalized.format = "code";
+  }
+  return normalized;
 }
 
 function getCanvasPathFilterValue() {
@@ -427,6 +511,7 @@ function resetCanvasWorkspaceState() {
   editingCanvasDocumentId = null;
   pendingCanvasDiff = null;
   resetStreamingCanvasPreview();
+  lastCanvasStructureSignature = "";
   collapsedCanvasFolders = new Set();
   setCanvasAttention(false);
   if (canvasSearchInput) {
@@ -440,9 +525,53 @@ function resetCanvasWorkspaceState() {
   }
 }
 
+function hasActiveCanvasFilters() {
+  return Boolean(
+    String(canvasSearchInput?.value || "").trim()
+    || String(canvasRoleFilter?.value || "").trim()
+    || getCanvasPathFilterValue()
+  );
+}
+
+function resetCanvasMetaBar() {
+  if (canvasMetaBar) {
+    canvasMetaBar.hidden = true;
+  }
+  if (canvasMetaChips) {
+    canvasMetaChips.innerHTML = "";
+  }
+  if (canvasCopyRefBtn) {
+    canvasCopyRefBtn.disabled = true;
+    canvasCopyRefBtn.textContent = "Copy reference";
+  }
+  if (canvasResetFiltersBtn) {
+    canvasResetFiltersBtn.disabled = true;
+  }
+}
+
+function resetCanvasFilters({ silent = false } = {}) {
+  if (canvasSearchInput) {
+    canvasSearchInput.value = "";
+  }
+  if (canvasRoleFilter) {
+    canvasRoleFilter.value = "";
+  }
+  if (canvasPathFilter) {
+    canvasPathFilter.value = "";
+  }
+  renderCanvasPanel();
+  if (!silent) {
+    setCanvasStatus("Canvas filters cleared.", "muted");
+  }
+}
+
 function documentMatchesCanvasFilters(document, searchTerm, roleValue, pathValue) {
   if (!document) {
     return false;
+  }
+
+  if (document.isStreamingPreview) {
+    return true;
   }
 
   const normalizedRole = String(roleValue || "").trim().toLowerCase();
@@ -873,19 +1002,20 @@ function getCanvasDocumentCollection(entries = history) {
 
 function resetStreamingCanvasPreview() {
   streamingCanvasPreview = null;
-  if (pendingCanvasPreviewFrame) {
-    globalThis.cancelAnimationFrame(pendingCanvasPreviewFrame);
-    pendingCanvasPreviewFrame = 0;
+  if (pendingCanvasPreviewTimer) {
+    globalThis.clearTimeout(pendingCanvasPreviewTimer);
+    pendingCanvasPreviewTimer = 0;
   }
 }
 
-function buildStreamingCanvasPreviewDocument(toolName, snapshot = {}) {
+function buildStreamingCanvasPreviewDocument(toolName, previewKey = "", snapshot = {}) {
   const normalizedToolName = String(toolName || "").trim();
+  const normalizedPreviewKey = String(previewKey || "").trim() || "canvas-call-0";
   const snapshotData = snapshot && typeof snapshot === "object" ? snapshot : {};
   const activeDocument = getActiveCanvasDocument(history);
   const isRewritePreview = normalizedToolName === "rewrite_canvas_document" && activeDocument;
-  const normalized = normalizeCanvasDocument({
-    id: isRewritePreview ? activeDocument.id : "streaming-canvas-preview",
+  const normalized = normalizeStreamingCanvasPreviewDocument({
+    id: isRewritePreview ? activeDocument.id : `streaming-canvas-preview-${normalizedPreviewKey}`,
     title: String(snapshotData.title || (isRewritePreview ? activeDocument.title : "Canvas draft")).trim() || "Canvas draft",
     path: String(snapshotData.path || (isRewritePreview ? activeDocument.path : "")).trim(),
     role: String(snapshotData.role || (isRewritePreview ? activeDocument.role : "note")).trim(),
@@ -895,38 +1025,76 @@ function buildStreamingCanvasPreviewDocument(toolName, snapshot = {}) {
     content: "",
     source_message_id: isRewritePreview ? activeDocument.source_message_id : null,
   });
-  return normalized ? { ...normalized, isStreamingPreview: true, tool: normalizedToolName } : null;
+  return normalized ? { ...normalized, isStreamingPreview: true, tool: normalizedToolName, previewKey: normalizedPreviewKey } : null;
 }
 
 function applyStreamingCanvasPreviewSnapshot(snapshot = {}) {
   if (!streamingCanvasPreview || !snapshot || typeof snapshot !== "object") {
-    return;
+    return false;
   }
+  let changed = false;
   if (typeof snapshot.title === "string" && snapshot.title.trim()) {
-    streamingCanvasPreview.title = snapshot.title.trim();
+    const nextTitle = snapshot.title.trim();
+    if (nextTitle !== streamingCanvasPreview.title) {
+      streamingCanvasPreview.title = nextTitle;
+      changed = true;
+    }
   }
   if (typeof snapshot.path === "string") {
-    streamingCanvasPreview.path = snapshot.path.trim().replace(/\\/g, "/");
+    const nextPath = snapshot.path.trim().replace(/\\/g, "/");
+    if (nextPath && nextPath !== streamingCanvasPreview.path) {
+      streamingCanvasPreview.path = nextPath;
+      changed = true;
+    }
   }
   if (typeof snapshot.role === "string") {
-    streamingCanvasPreview.role = snapshot.role.trim().toLowerCase();
+    const nextRole = snapshot.role.trim().toLowerCase();
+    if (nextRole && nextRole !== streamingCanvasPreview.role) {
+      streamingCanvasPreview.role = nextRole;
+      changed = true;
+    }
   }
   if (typeof snapshot.format === "string") {
     const normalizedFormat = snapshot.format.trim().toLowerCase();
-    streamingCanvasPreview.format = normalizedFormat === "code" ? "code" : "markdown";
+    const nextFormat = normalizedFormat === "code" ? "code" : "markdown";
+    if (nextFormat !== streamingCanvasPreview.format) {
+      streamingCanvasPreview.format = nextFormat;
+      changed = true;
+    }
   }
   if (typeof snapshot.language === "string") {
-    streamingCanvasPreview.language = snapshot.language.trim().toLowerCase();
+    const nextLanguage = snapshot.language.trim().toLowerCase();
+    if (nextLanguage && nextLanguage !== streamingCanvasPreview.language) {
+      streamingCanvasPreview.language = nextLanguage;
+      changed = true;
+    }
   }
+
+  const normalizedPreview = normalizeStreamingCanvasPreviewDocument(streamingCanvasPreview);
+  if (normalizedPreview) {
+    ["title", "path", "role", "format", "language", "summary"].forEach((key) => {
+      if (normalizedPreview[key] !== streamingCanvasPreview[key]) {
+        streamingCanvasPreview[key] = normalizedPreview[key];
+        changed = true;
+      }
+    });
+  }
+
+  return changed;
 }
 
-function ensureStreamingCanvasPreview(toolName, snapshot = {}) {
+function ensureStreamingCanvasPreview(toolName, previewKey = "", snapshot = {}) {
   const normalizedToolName = String(toolName || "").trim();
+  const normalizedPreviewKey = String(previewKey || "").trim() || "canvas-call-0";
   if (!normalizedToolName) {
     return null;
   }
-  if (!streamingCanvasPreview || streamingCanvasPreview.tool !== normalizedToolName) {
-    streamingCanvasPreview = buildStreamingCanvasPreviewDocument(normalizedToolName, snapshot);
+  if (
+    !streamingCanvasPreview
+    || streamingCanvasPreview.tool !== normalizedToolName
+    || streamingCanvasPreview.previewKey !== normalizedPreviewKey
+  ) {
+    streamingCanvasPreview = buildStreamingCanvasPreviewDocument(normalizedToolName, normalizedPreviewKey, snapshot);
   }
   if (!streamingCanvasPreview) {
     return null;
@@ -952,14 +1120,51 @@ function getCanvasRenderableDocuments(entries = history) {
   return [...documents, streamingCanvasPreview];
 }
 
+function buildCanvasStructureSignature(documents, visibleDocuments = documents) {
+  const documentSignature = (documents || []).map((document) => [
+    String(document.id || "").trim(),
+    String(document.title || "").trim(),
+    String(document.path || "").trim(),
+    String(document.role || "").trim(),
+    String(document.format || "").trim(),
+    String(document.language || "").trim(),
+    document.isStreamingPreview ? "preview" : "stored",
+  ].join("\u241f")).join("\u241e");
+  const visibleSignature = (visibleDocuments || []).map((document) => String(document.id || "").trim()).join("\u241e");
+  const filterSignature = [
+    String(canvasSearchInput?.value || "").trim(),
+    String(canvasRoleFilter?.value || "").trim(),
+    getCanvasPathFilterValue(),
+    isCanvasEditing ? "editing" : "view",
+  ].join("\u241f");
+  return [documentSignature, visibleSignature, filterSignature].join("\u241d");
+}
+
+function buildCanvasRenderState(documents = getCanvasRenderableDocuments()) {
+  const visibleDocuments = getCanvasVisibleDocuments(documents);
+  const activeDocument = visibleDocuments.length
+    ? getCanvasDocumentById(visibleDocuments, activeCanvasDocumentId) || visibleDocuments[visibleDocuments.length - 1]
+    : null;
+
+  return {
+    isCanvasPanelOpen: isCanvasOpen(),
+    documents,
+    visibleDocuments,
+    activeDocument,
+    isStreamingPreviewActive: Boolean(activeDocument?.isStreamingPreview),
+    searchTerm: String(canvasSearchInput?.value || "").trim(),
+    structureSignature: buildCanvasStructureSignature(documents, visibleDocuments),
+  };
+}
+
 function scheduleCanvasPreviewRender() {
-  if (pendingCanvasPreviewFrame) {
+  if (pendingCanvasPreviewTimer) {
     return;
   }
-  pendingCanvasPreviewFrame = globalThis.requestAnimationFrame(() => {
-    pendingCanvasPreviewFrame = 0;
-    renderCanvasPanel();
-  });
+  pendingCanvasPreviewTimer = globalThis.setTimeout(() => {
+    pendingCanvasPreviewTimer = 0;
+    renderCanvasPreviewFrame();
+  }, CANVAS_PREVIEW_RENDER_INTERVAL_MS);
 }
 
 function getActiveCanvasDocument(entries = history) {
@@ -1015,6 +1220,203 @@ function setPendingDocumentCanvasOpen(files) {
     fileCount: files.length,
     fileName: String(files[0]?.name || "Document").trim() || "Document",
   };
+}
+
+function renderCanvasMetaBar(renderState) {
+  if (!canvasMetaBar || !canvasMetaChips) {
+    return;
+  }
+
+  const { activeDocument, documents, isStreamingPreviewActive, visibleDocuments } = renderState;
+  if (!activeDocument || !(documents || []).length) {
+    resetCanvasMetaBar();
+    return;
+  }
+
+  const modeLabel = getCanvasMode(documents) === "project" ? "Project mode" : "Document mode";
+  const countLabel = visibleDocuments.length === documents.length
+    ? `${documents.length} file${documents.length === 1 ? "" : "s"}`
+    : `${visibleDocuments.length}/${documents.length} shown`;
+  const chips = [
+    { label: modeLabel, className: "canvas-meta-chip canvas-meta-chip--primary" },
+    { label: countLabel, className: "canvas-meta-chip" },
+  ];
+
+  if (isStreamingPreviewActive) {
+    chips.push({ label: "Live preview", className: "canvas-meta-chip canvas-meta-chip--live" });
+  }
+  if (activeDocument.role) {
+    chips.push({ label: activeDocument.role, className: "canvas-meta-chip" });
+  }
+  chips.push({ label: activeDocument.format === "code" ? "Code" : "Markdown", className: "canvas-meta-chip" });
+  if (activeDocument.language) {
+    chips.push({ label: activeDocument.language, className: "canvas-meta-chip" });
+  }
+
+  const reference = getCanvasDocumentReference(activeDocument);
+  if (reference) {
+    chips.push({
+      label: reference,
+      className: "canvas-meta-chip canvas-meta-chip--path",
+      title: reference,
+    });
+  }
+
+  canvasMetaChips.innerHTML = chips.map((chip) => {
+    const titleAttr = chip.title ? ` title="${escHtml(chip.title)}"` : "";
+    return `<span class="${chip.className}"${titleAttr}>${escHtml(chip.label)}</span>`;
+  }).join("");
+  canvasMetaBar.hidden = false;
+
+  if (canvasCopyRefBtn) {
+    canvasCopyRefBtn.disabled = !reference;
+    canvasCopyRefBtn.textContent = activeDocument.path ? "Copy path" : "Copy title";
+  }
+  if (canvasResetFiltersBtn) {
+    canvasResetFiltersBtn.disabled = !hasActiveCanvasFilters();
+  }
+}
+
+function renderCanvasDocumentTabs(visibleDocuments) {
+  if (!canvasDocumentTabsEl) {
+    return;
+  }
+
+  canvasDocumentTabsEl.hidden = visibleDocuments.length <= 1;
+  canvasDocumentTabsEl.innerHTML = "";
+  visibleDocuments.forEach((entry) => {
+    const button = globalThis.document.createElement("button");
+    button.type = "button";
+    button.className = `canvas-document-tab${entry.id === activeCanvasDocumentId ? " active" : ""}`;
+    button.textContent = getCanvasFileName(entry);
+    button.title = `${getCanvasDocumentLabel(entry)} · ${entry.line_count} lines`;
+    button.disabled = isCanvasEditing && entry.id !== activeCanvasDocumentId;
+    button.addEventListener("click", () => {
+      activeCanvasDocumentId = entry.id;
+      renderCanvasPanel();
+    });
+    canvasDocumentTabsEl.appendChild(button);
+  });
+}
+
+function updateCanvasActiveDocumentDisplay(renderState) {
+  const {
+    activeDocument,
+    documents,
+    isCanvasPanelOpen,
+    isStreamingPreviewActive,
+    searchTerm,
+    visibleDocuments,
+  } = renderState;
+
+  activeCanvasDocumentId = activeDocument.id;
+  const modeLabel = getCanvasMode(documents) === "project" ? "Project mode" : "Document mode";
+  const detailLabel = activeDocument.path || activeDocument.title;
+  const roleLabel = activeDocument.role ? ` · ${activeDocument.role}` : "";
+  const languageLabel = activeDocument.language ? ` · ${activeDocument.language}` : "";
+  canvasSubtitle.textContent = `${modeLabel} · ${visibleDocuments.length}/${documents.length} files · ${detailLabel} · ${activeDocument.line_count} lines${roleLabel}${languageLabel}`;
+  renderCanvasMetaBar(renderState);
+  const promptLineLimit = Number(appSettings.canvas_prompt_max_lines || 800);
+  const expandLineLimit = Number(appSettings.canvas_expand_max_lines || 1600);
+  if (Number.isFinite(activeDocument.line_count) && activeDocument.line_count > promptLineLimit) {
+    const hasExpandedRoom = activeDocument.line_count > expandLineLimit;
+    setCanvasHint(
+      hasExpandedRoom
+        ? "Large canvas detected. The default view is truncated. Use scroll_canvas_document for a targeted range or expand_canvas_document for a wider slice."
+        : `Large canvas detected. The default view is truncated to the first ${promptLineLimit} lines; use scroll_canvas_document for a targeted range.`,
+      "warning"
+    );
+  } else {
+    setCanvasHint("");
+  }
+  canvasEmptyState.hidden = true;
+  canvasEmptyState.innerHTML = "<h3>No canvas document yet</h3><p>Ask the assistant to draft something substantial, then continue refining it with line-based edits.</p>";
+  if (canvasFormatSelect) {
+    canvasFormatSelect.disabled = !isCanvasEditing || isStreamingPreviewActive;
+    canvasFormatSelect.value = activeDocument.format || "markdown";
+  }
+  if (canvasSearchInput) {
+    canvasSearchInput.disabled = isCanvasEditing || isStreamingPreviewActive;
+  }
+  if (canvasRoleFilter) {
+    canvasRoleFilter.disabled = isCanvasEditing || isStreamingPreviewActive;
+  }
+  if (canvasPathFilter) {
+    canvasPathFilter.disabled = isCanvasEditing || isStreamingPreviewActive;
+  }
+  if (canvasEditBtn) {
+    canvasEditBtn.hidden = isCanvasEditing;
+    canvasEditBtn.disabled = isStreamingPreviewActive;
+  }
+  if (canvasSaveBtn) {
+    canvasSaveBtn.hidden = !isCanvasEditing;
+    canvasSaveBtn.disabled = isStreamingPreviewActive;
+  }
+  if (canvasCancelBtn) {
+    canvasCancelBtn.hidden = !isCanvasEditing;
+    canvasCancelBtn.disabled = isStreamingPreviewActive;
+  }
+
+  if (isCanvasEditing && canvasEditorEl) {
+    if (editingCanvasDocumentId !== activeDocument.id) {
+      editingCanvasDocumentId = activeDocument.id;
+      canvasEditorEl.value = activeDocument.content || "";
+    }
+    canvasEditorEl.hidden = false;
+    canvasDocumentEl.hidden = true;
+    canvasDocumentEl.innerHTML = "";
+  } else {
+    canvasDocumentEl.hidden = false;
+    canvasDocumentEl.innerHTML = renderCanvasDocumentBody(activeDocument);
+    if (canvasEditorEl) {
+      canvasEditorEl.hidden = true;
+    }
+  }
+
+  renderCanvasDiffPreview(activeDocument);
+  const matchCount = !isCanvasEditing && !isStreamingPreviewActive ? applyCanvasSearchHighlight(searchTerm) : 0;
+  if (canvasCopyBtn) {
+    canvasCopyBtn.disabled = !String(activeDocument.content || "").length;
+    canvasCopyBtn.hidden = !isCanvasPanelOpen;
+  }
+  if (canvasDeleteBtn) {
+    canvasDeleteBtn.disabled = isStreamingPreviewActive;
+  }
+  if (canvasClearBtn) {
+    canvasClearBtn.disabled = isStreamingPreviewActive || documents.length === 0;
+  }
+  if (canvasDownloadHtmlBtn) {
+    canvasDownloadHtmlBtn.disabled = isStreamingPreviewActive;
+  }
+  if (canvasDownloadMdBtn) {
+    canvasDownloadMdBtn.disabled = isStreamingPreviewActive;
+  }
+  if (canvasDownloadPdfBtn) {
+    canvasDownloadPdfBtn.disabled = isStreamingPreviewActive;
+  }
+
+  if (searchTerm && !isCanvasEditing && !isStreamingPreviewActive) {
+    setCanvasStatus(matchCount ? `${matchCount} match${matchCount === 1 ? "" : "es"} found.` : "No matches found.", matchCount ? "muted" : "warning");
+  }
+}
+
+function renderCanvasPreviewFrame() {
+  if (!canvasDocumentEl || !canvasEmptyState || !canvasSubtitle) {
+    return;
+  }
+
+  const renderState = buildCanvasRenderState();
+  if (!renderState.documents.length || !renderState.activeDocument || isCanvasEditing || !renderState.isStreamingPreviewActive) {
+    renderCanvasPanel();
+    return;
+  }
+
+  if (renderState.structureSignature !== lastCanvasStructureSignature) {
+    renderCanvasPanel();
+    return;
+  }
+
+  updateCanvasActiveDocumentDisplay(renderState);
 }
 
 function consumePendingDocumentCanvasOpen() {
@@ -1201,19 +1603,21 @@ function renderCanvasPanel() {
     return;
   }
 
-  const isCanvasPanelOpen = Boolean(canvasPanel?.classList.contains("open"));
   const documents = getCanvasRenderableDocuments();
   syncCanvasFilterControls(documents);
-  const visibleDocuments = getCanvasVisibleDocuments(documents);
-  const activeDocument = visibleDocuments.length
-    ? getCanvasDocumentById(visibleDocuments, activeCanvasDocumentId) || visibleDocuments[visibleDocuments.length - 1]
-    : null;
-  const isStreamingPreviewActive = Boolean(activeDocument?.isStreamingPreview);
-  const searchTerm = String(canvasSearchInput?.value || "").trim();
-  renderCanvasTree(documents, activeDocument);
-  if (!documents.length) {
+  const renderState = buildCanvasRenderState(documents);
+  const {
+    activeDocument,
+    documents: renderDocuments,
+    visibleDocuments,
+  } = renderState;
+  lastCanvasStructureSignature = renderState.structureSignature;
+
+  renderCanvasTree(renderDocuments, activeDocument);
+  if (!renderDocuments.length) {
     isCanvasEditing = false;
     editingCanvasDocumentId = null;
+    resetCanvasMetaBar();
     canvasSubtitle.textContent = "No canvas document yet.";
     setCanvasHint("");
     canvasEmptyState.hidden = false;
@@ -1281,7 +1685,8 @@ function renderCanvasPanel() {
   if (!activeDocument) {
     isCanvasEditing = false;
     editingCanvasDocumentId = null;
-    canvasSubtitle.textContent = `Project mode · ${documents.length} files · no matches`;
+    resetCanvasMetaBar();
+    canvasSubtitle.textContent = `Project mode · ${renderDocuments.length} files · no matches`;
     setCanvasHint("");
     canvasEmptyState.hidden = false;
     canvasEmptyState.innerHTML = "<h3>No files match the current filters</h3><p>Adjust the search term, role, or path filter to bring files back into view.</p>";
@@ -1315,7 +1720,7 @@ function renderCanvasPanel() {
       canvasDeleteBtn.disabled = true;
     }
     if (canvasClearBtn) {
-      canvasClearBtn.disabled = documents.length === 0;
+      canvasClearBtn.disabled = renderDocuments.length === 0;
     }
     if (canvasDownloadHtmlBtn) {
       canvasDownloadHtmlBtn.disabled = true;
@@ -1335,111 +1740,8 @@ function renderCanvasPanel() {
     return;
   }
 
-  activeCanvasDocumentId = activeDocument.id;
-  const modeLabel = getCanvasMode(documents) === "project" ? "Project mode" : "Document mode";
-  const detailLabel = activeDocument.path || activeDocument.title;
-  const roleLabel = activeDocument.role ? ` · ${activeDocument.role}` : "";
-  const languageLabel = activeDocument.language ? ` · ${activeDocument.language}` : "";
-  canvasSubtitle.textContent = `${modeLabel} · ${visibleDocuments.length}/${documents.length} files · ${detailLabel} · ${activeDocument.line_count} lines${roleLabel}${languageLabel}`;
-  const promptLineLimit = Number(appSettings.canvas_prompt_max_lines || 800);
-  const expandLineLimit = Number(appSettings.canvas_expand_max_lines || 1600);
-  if (Number.isFinite(activeDocument.line_count) && activeDocument.line_count > promptLineLimit) {
-    const hasExpandedRoom = activeDocument.line_count > expandLineLimit;
-    setCanvasHint(
-      hasExpandedRoom
-        ? `Large canvas detected. The default view is truncated. Use scroll_canvas_document for a targeted range or expand_canvas_document for a wider slice.`
-        : `Large canvas detected. The default view is truncated to the first ${promptLineLimit} lines; use scroll_canvas_document for a targeted range.`,
-      "warning"
-    );
-  } else {
-    setCanvasHint("");
-  }
-  canvasEmptyState.hidden = true;
-  canvasEmptyState.innerHTML = "<h3>No canvas document yet</h3><p>Ask the assistant to draft something substantial, then continue refining it with line-based edits.</p>";
-  if (canvasFormatSelect) {
-    canvasFormatSelect.disabled = !isCanvasEditing || isStreamingPreviewActive;
-    canvasFormatSelect.value = activeDocument.format || "markdown";
-  }
-  if (canvasSearchInput) {
-    canvasSearchInput.disabled = isCanvasEditing || isStreamingPreviewActive;
-  }
-  if (canvasRoleFilter) {
-    canvasRoleFilter.disabled = isCanvasEditing || isStreamingPreviewActive;
-  }
-  if (canvasPathFilter) {
-    canvasPathFilter.disabled = isCanvasEditing || isStreamingPreviewActive;
-  }
-  if (canvasEditBtn) {
-    canvasEditBtn.hidden = isCanvasEditing;
-    canvasEditBtn.disabled = isStreamingPreviewActive;
-  }
-  if (canvasSaveBtn) {
-    canvasSaveBtn.hidden = !isCanvasEditing;
-    canvasSaveBtn.disabled = isStreamingPreviewActive;
-  }
-  if (canvasCancelBtn) {
-    canvasCancelBtn.hidden = !isCanvasEditing;
-    canvasCancelBtn.disabled = isStreamingPreviewActive;
-  }
-
-  if (isCanvasEditing && canvasEditorEl) {
-    if (editingCanvasDocumentId !== activeDocument.id) {
-      editingCanvasDocumentId = activeDocument.id;
-      canvasEditorEl.value = activeDocument.content || "";
-    }
-    canvasEditorEl.hidden = false;
-    canvasDocumentEl.hidden = true;
-    canvasDocumentEl.innerHTML = "";
-  } else {
-    canvasDocumentEl.hidden = false;
-    canvasDocumentEl.innerHTML = renderCanvasDocumentBody(activeDocument);
-    if (canvasEditorEl) {
-      canvasEditorEl.hidden = true;
-    }
-  }
-
-  if (canvasDocumentTabsEl) {
-    canvasDocumentTabsEl.hidden = visibleDocuments.length <= 1;
-    canvasDocumentTabsEl.innerHTML = "";
-    visibleDocuments.forEach((entry) => {
-      const button = globalThis.document.createElement("button");
-      button.type = "button";
-      button.className = `canvas-document-tab${entry.id === activeCanvasDocumentId ? " active" : ""}`;
-      button.textContent = getCanvasFileName(entry);
-      button.title = `${getCanvasDocumentLabel(entry)} · ${entry.line_count} lines`;
-      button.disabled = isCanvasEditing && entry.id !== activeCanvasDocumentId;
-      button.addEventListener("click", () => {
-        activeCanvasDocumentId = entry.id;
-        renderCanvasPanel();
-      });
-      canvasDocumentTabsEl.appendChild(button);
-    });
-  }
-  renderCanvasDiffPreview(activeDocument);
-  const matchCount = !isCanvasEditing && !isStreamingPreviewActive ? applyCanvasSearchHighlight(searchTerm) : 0;
-  if (canvasCopyBtn) {
-    canvasCopyBtn.disabled = !String(activeDocument.content || "").length;
-    canvasCopyBtn.hidden = !isCanvasPanelOpen;
-  }
-  if (canvasDeleteBtn) {
-    canvasDeleteBtn.disabled = isStreamingPreviewActive;
-  }
-  if (canvasClearBtn) {
-    canvasClearBtn.disabled = isStreamingPreviewActive || documents.length === 0;
-  }
-  if (canvasDownloadHtmlBtn) {
-    canvasDownloadHtmlBtn.disabled = isStreamingPreviewActive;
-  }
-  if (canvasDownloadMdBtn) {
-    canvasDownloadMdBtn.disabled = isStreamingPreviewActive;
-  }
-  if (canvasDownloadPdfBtn) {
-    canvasDownloadPdfBtn.disabled = isStreamingPreviewActive;
-  }
-
-  if (searchTerm && !isCanvasEditing && !isStreamingPreviewActive) {
-    setCanvasStatus(matchCount ? `${matchCount} match${matchCount === 1 ? "" : "es"} found.` : "No matches found.", matchCount ? "muted" : "warning");
-  }
+  updateCanvasActiveDocumentDisplay(renderState);
+  renderCanvasDocumentTabs(visibleDocuments);
 }
 
 function openCanvas(triggerEl = null) {
@@ -3261,6 +3563,25 @@ if (canvasCopyBtn) {
       setCanvasStatus("Copy failed.", "danger");
     }
   });
+}
+if (canvasCopyRefBtn) {
+  canvasCopyRefBtn.addEventListener("click", async () => {
+    const document = getCanvasDocumentById(getCanvasRenderableDocuments(), activeCanvasDocumentId) || getActiveCanvasDocument();
+    const reference = getCanvasDocumentReference(document);
+    if (!reference || !navigator.clipboard) {
+      setCanvasStatus("Reference copy is not available.", "warning");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(reference);
+      setCanvasStatus(document?.path ? "Canvas path copied." : "Canvas title copied.", "success");
+    } catch (_) {
+      setCanvasStatus("Reference copy failed.", "danger");
+    }
+  });
+}
+if (canvasResetFiltersBtn) {
+  canvasResetFiltersBtn.addEventListener("click", () => resetCanvasFilters());
 }
 if (canvasDeleteBtn) {
   canvasDeleteBtn.addEventListener("click", () => {
@@ -5397,7 +5718,7 @@ async function sendMessage(options = {}) {
           : [];
         assistantToolHistory.push(...nextToolHistory);
       } else if (event.type === "canvas_loading") {
-        ensureStreamingCanvasPreview(event.tool, event.snapshot);
+        ensureStreamingCanvasPreview(event.tool, event.preview_key, event.snapshot);
         if (!isCanvasOpen()) {
           openCanvas();
         } else {
@@ -5405,7 +5726,7 @@ async function sendMessage(options = {}) {
         }
         setCanvasStatus("Preparing canvas...", "muted");
       } else if (event.type === "canvas_content_delta") {
-        const previewDocument = ensureStreamingCanvasPreview(event.tool, event.snapshot);
+        const previewDocument = ensureStreamingCanvasPreview(event.tool, event.preview_key, event.snapshot);
         if (previewDocument) {
           previewDocument.content += String(event.delta || "");
           previewDocument.line_count = previewDocument.content ? previewDocument.content.split("\n").length : 0;

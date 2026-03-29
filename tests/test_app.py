@@ -21,8 +21,8 @@ from agent import (
     _build_compact_tool_message_content,
     _build_streaming_canvas_tool_preview,
     _estimate_input_breakdown,
-    _execute_tool,
     _estimate_message_breakdown,
+    _execute_tool,
     _extract_partial_json_string_value,
     _is_context_overflow_error,
     _iter_agent_exchange_blocks,
@@ -43,20 +43,19 @@ from canvas_service import (
     replace_canvas_lines,
     scroll_canvas_document,
 )
-from doc_service import build_canvas_markdown, infer_canvas_format, infer_canvas_language
 from db import (
-    build_user_profile_system_context,
     append_to_scratchpad,
+    build_user_profile_system_context,
     count_visible_message_tokens,
     create_image_asset,
     extract_message_usage,
-    get_file_asset,
+    get_active_tool_names,
+    get_app_settings,
     get_canvas_expand_max_lines,
     get_canvas_prompt_max_lines,
     get_canvas_scroll_window_lines,
-    get_active_tool_names,
-    get_app_settings,
     get_db,
+    get_file_asset,
     get_image_asset,
     get_user_profile_entries,
     insert_message,
@@ -66,20 +65,28 @@ from db import (
     serialize_message_metadata,
     upsert_user_profile_entry,
 )
-from prune_service import _build_pruning_messages
-from project_workspace_service import create_workspace_runtime_state
+from doc_service import build_canvas_markdown, infer_canvas_format, infer_canvas_language
 from messages import (
     SUMMARY_LABEL,
     _build_canvas_prompt_payload,
     build_api_messages,
     build_runtime_system_message,
+    build_tool_call_contract,
     build_user_message_for_model,
     normalize_chat_messages,
     prepend_runtime_context,
 )
+from project_workspace_service import create_workspace_runtime_state
+from prune_service import _build_pruning_messages
 from rag import Chunk
 from rag.store import query_chunks, upsert_chunks
-from rag_service import build_rag_auto_context, get_conversation_records_for_rag, get_exact_tool_memory_match, search_knowledge_base_tool, upsert_tool_memory_result
+from rag_service import (
+    build_rag_auto_context,
+    get_conversation_records_for_rag,
+    get_exact_tool_memory_match,
+    search_knowledge_base_tool,
+    upsert_tool_memory_result,
+)
 from routes.auth import AUTH_LAST_SEEN_KEY, AUTH_REMEMBER_KEY, AUTH_SESSION_KEY
 from routes.chat import (
     OMITTED_TOOL_OUTPUT_TEXT,
@@ -91,6 +98,7 @@ from routes.chat import (
     build_summary_prompt_messages,
     maybe_create_conversation_summary,
 )
+from token_utils import estimate_text_tokens
 from tool_registry import TOOL_SPEC_BY_NAME, get_openai_tool_specs
 from web_tools import (
     _extract_html,
@@ -100,7 +108,6 @@ from web_tools import (
     search_news_google_tool,
     search_web_tool,
 )
-from token_utils import estimate_text_tokens
 
 
 class AppRoutesTestCase(unittest.TestCase):
@@ -492,10 +499,34 @@ class AppRoutesTestCase(unittest.TestCase):
         preview = _build_streaming_canvas_tool_preview(tool_call_parts)
 
         self.assertEqual(preview["tool"], "create_canvas_document")
+        self.assertEqual(preview["preview_key"], "canvas-call-0")
         self.assertEqual(preview["snapshot"]["title"], "Spec")
         self.assertEqual(preview["snapshot"]["format"], "code")
         self.assertEqual(preview["snapshot"]["language"], "python")
         self.assertEqual(preview["content"], "print(1)\nprint(2)")
+
+    def test_build_streaming_canvas_tool_preview_uses_latest_canvas_call(self):
+        tool_call_parts = [
+            {
+                "name": "create_canvas_document",
+                "arguments_parts": [
+                    '{"title":"first.py","format":"code","language":"python","content":"print(1)"',
+                ],
+            },
+            {
+                "name": "create_canvas_document",
+                "arguments_parts": [
+                    '{"title":"second.py","format":"code","language":"python","content":"print(2)"',
+                ],
+            },
+        ]
+
+        preview = _build_streaming_canvas_tool_preview(tool_call_parts)
+
+        self.assertEqual(preview["tool"], "create_canvas_document")
+        self.assertEqual(preview["preview_key"], "canvas-call-1")
+        self.assertEqual(preview["snapshot"]["title"], "second.py")
+        self.assertEqual(preview["content"], "print(2)")
 
     def test_create_conversation_rejects_invalid_model(self):
         response = self.client.post(
@@ -1375,8 +1406,23 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn("- Language: python", content)
         self.assertIn("1: print('hello')", content)
         self.assertIn("2: print('world')", content)
+        self.assertIn("## Canvas Workflow", content)
+        self.assertIn("Create one canvas document per file or artifact.", content)
         self.assertIn("## Tool Calling", content)
         self.assertIn("Use only the tools exposed by the API for this turn", content)
+
+    def test_build_tool_call_contract_mentions_parallel_and_dependent_tools(self):
+        contract = build_tool_call_contract([
+            "search_web",
+            "fetch_url",
+            "image_explain",
+            "search_tool_memory",
+        ])
+
+        rules_text = "\n".join(contract["rules"])
+        self.assertIn("execute those safe tools in parallel", rules_text)
+        self.assertIn("search_web, fetch_url, image_explain", rules_text)
+        self.assertIn("search_tool_memory", rules_text)
 
     def test_runtime_system_message_includes_canvas_project_manifest(self):
         message = build_runtime_system_message(
@@ -2591,24 +2637,34 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn('id="canvas-clear-btn"', html_text)
         self.assertIn('id="canvas-edit-btn"', html_text)
         self.assertIn('id="canvas-save-btn"', html_text)
+        self.assertIn('id="canvas-meta-bar"', html_text)
+        self.assertIn('id="canvas-copy-ref-btn"', html_text)
+        self.assertIn('id="canvas-reset-filters-btn"', html_text)
         self.assertIn('id="canvas-format-select"', html_text)
         self.assertIn('id="canvas-diff"', html_text)
         self.assertIn('id="canvas-role-filter"', html_text)
         self.assertIn('id="canvas-path-filter"', html_text)
         self.assertIn('id="canvas-tree"', html_text)
         self.assertIn('id="canvas-resize-handle"', html_text)
+        self.assertIn('const canvasMetaBar = document.getElementById("canvas-meta-bar")', script_text)
+        self.assertIn('const canvasCopyRefBtn = document.getElementById("canvas-copy-ref-btn")', script_text)
+        self.assertIn('const canvasResetFiltersBtn = document.getElementById("canvas-reset-filters-btn")', script_text)
         self.assertIn('const canvasDeleteBtn = document.getElementById("canvas-delete-btn")', script_text)
         self.assertIn('const canvasClearBtn = document.getElementById("canvas-clear-btn")', script_text)
         self.assertIn('const canvasEditBtn = document.getElementById("canvas-edit-btn")', script_text)
         self.assertIn('const canvasSaveBtn = document.getElementById("canvas-save-btn")', script_text)
         self.assertIn('const canvasRoleFilter = document.getElementById("canvas-role-filter")', script_text)
         self.assertIn('const canvasPathFilter = document.getElementById("canvas-path-filter")', script_text)
+        self.assertIn('function renderCanvasMetaBar(renderState)', script_text)
+        self.assertIn('function resetCanvasFilters({ silent = false } = {})', script_text)
         self.assertIn('function getCanvasVisibleDocuments(documents)', script_text)
         self.assertIn('function buildCanvasTreeNodes(documents)', script_text)
         self.assertIn('function renderCanvasTree(documents, activeDocument)', script_text)
         self.assertIn('function renderHighlightedCodeBlock(codeText, rawLang = null)', script_text)
         self.assertIn('async function saveCanvasEdits()', script_text)
         self.assertIn("async function deleteCanvasDocuments(", script_text)
+        self.assertIn(".canvas-meta-bar", style_text)
+        self.assertIn(".canvas-meta-chip", style_text)
         self.assertIn('.canvas-workspace-shell', style_text)
         self.assertIn('.canvas-tree-panel', style_text)
         self.assertIn('.canvas-tree-file.active', style_text)

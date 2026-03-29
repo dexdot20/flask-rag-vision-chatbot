@@ -15,6 +15,17 @@ from tool_registry import resolve_runtime_tool_names
 SUMMARY_LABEL = "Conversation summary (generated from deleted messages):"
 CANVAS_PROMPT_MAX_CHARS = 12_000
 CANVAS_PROMPT_MAX_LINES = 400
+PARALLEL_SAFE_READ_ONLY_TOOL_NAMES = (
+    "search_web",
+    "fetch_url",
+    "search_news_ddgs",
+    "search_news_google",
+    "image_explain",
+)
+DEPENDENT_TOOL_NAMES = (
+    "search_knowledge_base",
+    "search_tool_memory",
+)
 
 
 def _build_image_policy_payload(active_tool_names: list[str]) -> dict | None:
@@ -353,18 +364,73 @@ def _build_canvas_prompt_payload(
     }
 
 
+def _build_canvas_workflow_rules(active_tool_names: list[str], canvas_payload: dict | None = None) -> list[str]:
+    active_set = set(active_tool_names or [])
+    if not active_set.intersection(
+        {
+            "create_canvas_document",
+            "rewrite_canvas_document",
+            "replace_canvas_lines",
+            "insert_canvas_lines",
+            "delete_canvas_lines",
+            "expand_canvas_document",
+            "scroll_canvas_document",
+        }
+    ):
+        return []
+
+    rules = [
+        "Create one canvas document per file or artifact. If the user asks for multiple files, create separate canvas documents instead of concatenating multiple files into one document.",
+        "Use create_canvas_document for new files or drafts. Use rewrite_canvas_document for full-document replacement. Use replace_canvas_lines, insert_canvas_lines, and delete_canvas_lines only for localized edits.",
+    ]
+
+    if canvas_payload and canvas_payload.get("mode") == "project":
+        rules.append(
+            "In project mode, target existing files with document_path when possible and include path, role, and preferably summary when creating new files so the workspace remains coherent."
+        )
+    else:
+        rules.append("When the user wants a new artifact, create it first as a canvas document before attempting line-level edits.")
+
+    if canvas_payload:
+        rules.append(
+            "For line-level edits, use only the visible 1-based line numbers from the current excerpt. If the target region is not visible or the excerpt is truncated, call scroll_canvas_document or expand_canvas_document first."
+        )
+    else:
+        rules.append(
+            "Before line-level edits, make sure the target document already exists in canvas and that you have an excerpt with exact visible 1-based line numbers."
+        )
+
+    return rules
+
+
 def build_tool_call_contract(active_tool_names: list[str], canvas_documents=None) -> dict | None:
     runtime_tool_names = resolve_runtime_tool_names(active_tool_names or [], canvas_documents=canvas_documents)
     if not runtime_tool_names:
         return None
-    return {
-        "rules": [
-            "Call a tool only when it is required or when it will materially improve correctness, completeness, or safety. If you can answer reliably from the current context, do not call a tool.",
-            "Unnecessary tool calls waste tokens and context, so do not use tools for convenience, repetition, or curiosity.",
-            "If you do need a tool, call it via native function calling instead of writing tool JSON in assistant content.",
-            "Use only the tools exposed by the API for this turn, and provide arguments matching the documented types.",
-        ],
-    }
+    rules = [
+        "Call a tool only when it is required or when it will materially improve correctness, completeness, or safety. If you can answer reliably from the current context, do not call a tool.",
+        "Unnecessary tool calls waste tokens and context, so do not use tools for convenience, repetition, or curiosity.",
+        "If you do need a tool, call it via native function calling instead of writing tool JSON in assistant content.",
+        "Use only the tools exposed by the API for this turn, and provide arguments matching the documented types.",
+    ]
+
+    parallel_safe_tools = [name for name in PARALLEL_SAFE_READ_ONLY_TOOL_NAMES if name in runtime_tool_names]
+    if parallel_safe_tools:
+        rules.append(
+            "If you need multiple independent read-only lookups using "
+            + ", ".join(parallel_safe_tools)
+            + ", emit them together in one assistant turn so the runtime can execute those safe tools in parallel."
+        )
+
+    if any(name in runtime_tool_names for name in DEPENDENT_TOOL_NAMES):
+        rules.append(
+            "Do not batch search_knowledge_base or search_tool_memory with tool calls whose results they depend on. Run those dependent searches after the prerequisite results are available."
+        )
+
+    if "ask_clarifying_question" in runtime_tool_names:
+        rules.append("ask_clarifying_question must be the only tool call in its assistant turn.")
+
+    return {"rules": rules}
 
 
 def build_runtime_system_message(
@@ -531,6 +597,12 @@ def build_runtime_system_message(
         if other_documents:
             parts.append("## Other Canvas Documents")
             parts.append("```json\n" + json.dumps(other_documents, ensure_ascii=False, indent=2) + "\n```\n")
+
+    canvas_workflow_rules = _build_canvas_workflow_rules(active_tool_names, canvas_payload)
+    if canvas_workflow_rules:
+        parts.append("## Canvas Workflow")
+        parts.extend(f"- {rule}" for rule in canvas_workflow_rules)
+        parts.append("")
 
     contract = build_tool_call_contract(active_tool_names, canvas_documents=canvas_documents)
     if contract:

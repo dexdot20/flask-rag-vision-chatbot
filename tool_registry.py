@@ -838,7 +838,8 @@ TOOL_SPECS = [
         "name": "create_canvas_document",
         "description": (
             "Create a canvas document for the current conversation. "
-            "Use this for a single editable draft or as one file inside a multi-file canvas project workspace."
+            "Use this for a single editable draft or as one file inside a multi-file canvas project workspace. "
+            "Create one file or artifact per canvas document; when the user needs multiple files, use separate tool calls."
         ),
         "parameters": {
             "type": "object",
@@ -923,13 +924,15 @@ TOOL_SPECS = [
             },
             "guidance": (
                 "Use this when the user would benefit from a persistent artifact that can be revised. "
-                "Prefer creating the document before line-level edits. In project mode, set path and role so the workspace manifest stays coherent."
+                "Prefer creating the document before line-level edits. "
+                "Keep one file or artifact per canvas document instead of bundling multiple files together. "
+                "In project mode, set path, role, and ideally summary so the workspace manifest stays coherent."
             ),
         },
     },
     {
         "name": "rewrite_canvas_document",
-        "description": "Rewrite the full active canvas document while keeping the same document id.",
+        "description": "Rewrite one existing canvas document in full while keeping the same document id. Do not use this to append a different file into the current document.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -1005,11 +1008,16 @@ TOOL_SPECS = [
         "prompt": {
             "purpose": "Replaces the full content of an existing canvas document.",
             "inputs": {"content": "full document body", "title": "optional title", "format": "optional markdown or code", "language": "optional dominant code language", "path": "optional project-relative file path", "role": "optional semantic role", "summary": "optional short responsibility summary", "imports": "optional import list", "exports": "optional export list", "symbols": "optional symbol list", "dependencies": "optional dependency list", "project_id": "optional project identifier", "workspace_id": "optional workspace identifier", "document_id": "optional target id", "document_path": "optional target project-relative path"},
+            "guidance": (
+                "Use this for full-document replacement once you know the intended final content. "
+                "In project mode prefer document_path when possible. "
+                "If the user needs an additional file, create a separate canvas document instead of rewriting the current one into a different file."
+            ),
         },
     },
     {
         "name": "replace_canvas_lines",
-        "description": "Replace a 1-based inclusive line range inside the active canvas document.",
+        "description": "Replace a 1-based inclusive visible line range inside the active canvas document. Use this for localized edits, not broad rewrites.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -1034,11 +1042,15 @@ TOOL_SPECS = [
         "prompt": {
             "purpose": "Replaces specific lines in the canvas document.",
             "inputs": {"start_line": "first line", "end_line": "last line", "lines": "replacement lines", "document_id": "optional target id", "document_path": "optional target project-relative path"},
+            "guidance": (
+                "Use only when the exact 1-based line range is known from the visible excerpt or a recent scroll/expand result. "
+                "For broad rewrites, prefer rewrite_canvas_document. In project mode, prefer document_path when possible."
+            ),
         },
     },
     {
         "name": "insert_canvas_lines",
-        "description": "Insert one or more lines into the active canvas document after a given line number.",
+        "description": "Insert one or more lines into the active canvas document after a given visible line number.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -1062,11 +1074,15 @@ TOOL_SPECS = [
         "prompt": {
             "purpose": "Inserts lines into the canvas document.",
             "inputs": {"after_line": "insertion point", "lines": "new lines", "document_id": "optional target id", "document_path": "optional target project-relative path"},
+            "guidance": (
+                "Use only when the insertion point is known from the visible excerpt or a recent scroll/expand result. "
+                "If the target region is not visible, inspect it first. In project mode, prefer document_path when possible."
+            ),
         },
     },
     {
         "name": "delete_canvas_lines",
-        "description": "Delete a 1-based inclusive line range from the active canvas document.",
+        "description": "Delete a 1-based inclusive visible line range from the active canvas document.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -1086,6 +1102,10 @@ TOOL_SPECS = [
         "prompt": {
             "purpose": "Deletes specific lines from the canvas document.",
             "inputs": {"start_line": "first line", "end_line": "last line", "document_id": "optional target id", "document_path": "optional target project-relative path"},
+            "guidance": (
+                "Use only when the exact 1-based line range is visible in the current excerpt or in a recent scroll/expand result. "
+                "If the target region is not visible, inspect it first. In project mode, prefer document_path when possible."
+            ),
         },
     },
     {

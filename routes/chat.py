@@ -2065,6 +2065,7 @@ def register_chat_routes(app) -> None:
                         {
                             "type": "canvas_loading",
                             "tool": str(event.get("tool") or "").strip(),
+                            "preview_key": str(event.get("preview_key") or "").strip(),
                             "snapshot": event.get("snapshot") if isinstance(event.get("snapshot"), dict) else {},
                         },
                         ensure_ascii=False,
@@ -2075,6 +2076,7 @@ def register_chat_routes(app) -> None:
                         {
                             "type": "canvas_content_delta",
                             "tool": str(event.get("tool") or "").strip(),
+                            "preview_key": str(event.get("preview_key") or "").strip(),
                             "delta": str(event.get("delta") or ""),
                             "snapshot": event.get("snapshot") if isinstance(event.get("snapshot"), dict) else {},
                         },

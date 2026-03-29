@@ -1145,10 +1145,12 @@ def _extract_partial_json_string_value(arguments_text: str, field_name: str) -> 
 
 
 def _build_streaming_canvas_tool_preview(tool_call_parts: list[dict]) -> dict | None:
-    for raw_call in tool_call_parts:
+    for reverse_index, raw_call in enumerate(reversed(tool_call_parts)):
         tool_name = str(raw_call.get("name") or "").strip()
         if tool_name not in CANVAS_STREAM_OPEN_TOOL_NAMES:
             continue
+
+        preview_index = len(tool_call_parts) - reverse_index - 1
 
         arguments_text = "".join(raw_call.get("arguments_parts") or [])
         snapshot = {}
@@ -1163,6 +1165,7 @@ def _build_streaming_canvas_tool_preview(tool_call_parts: list[dict]) -> dict | 
 
         return {
             "tool": tool_name,
+            "preview_key": f"canvas-call-{preview_index}",
             "snapshot": snapshot,
             "content": content,
         }
@@ -2763,7 +2766,7 @@ def run_agent_stream(
         tool_call_parts = []
         content_streaming_live = False
         stream_error = None
-        announced_canvas_tool = None
+        announced_canvas_preview_key = None
         streamed_canvas_content_length = 0
 
         try:
@@ -2780,12 +2783,14 @@ def run_agent_stream(
                         canvas_preview = _build_streaming_canvas_tool_preview(tool_call_parts)
                         if canvas_preview is not None:
                             preview_tool_name = canvas_preview["tool"]
-                            if announced_canvas_tool != preview_tool_name:
-                                announced_canvas_tool = preview_tool_name
+                            preview_key = str(canvas_preview.get("preview_key") or "").strip()
+                            if announced_canvas_preview_key != preview_key:
+                                announced_canvas_preview_key = preview_key
                                 streamed_canvas_content_length = 0
                                 yield {
                                     "type": "canvas_tool_starting",
                                     "tool": preview_tool_name,
+                                    "preview_key": preview_key,
                                     "snapshot": canvas_preview["snapshot"],
                                 }
                             preview_content = canvas_preview.get("content")
@@ -2796,6 +2801,7 @@ def run_agent_stream(
                                     yield {
                                         "type": "canvas_content_delta",
                                         "tool": preview_tool_name,
+                                        "preview_key": preview_key,
                                         "delta": next_content_delta,
                                         "snapshot": canvas_preview["snapshot"],
                                     }
