@@ -1248,18 +1248,35 @@ function buildStreamingCanvasPreviewDocument(toolName, previewKey = "", snapshot
   const normalizedToolName = String(toolName || "").trim();
   const normalizedPreviewKey = String(previewKey || "").trim() || "canvas-call-0";
   const snapshotData = snapshot && typeof snapshot === "object" ? snapshot : {};
+  const allDocuments = getCanvasDocumentCollection(history);
   const activeDocument = getActiveCanvasDocument(history);
-  const isRewritePreview = normalizedToolName === "rewrite_canvas_document" && activeDocument;
+
+  // For rewrite operations, prefer the document explicitly identified in the
+  // snapshot (via document_id or document_path) over the generic active doc.
+  // This ensures the streaming preview tracks the correct file whenever the AI
+  // targets a non-active document for rewriting.
+  let targetDocument = activeDocument;
+  if (normalizedToolName === "rewrite_canvas_document") {
+    const snapshotDocId = String(snapshotData.document_id || "").trim();
+    const snapshotDocPath = String(snapshotData.document_path || "").trim();
+    if (snapshotDocId) {
+      targetDocument = getCanvasDocumentById(allDocuments, snapshotDocId) || activeDocument;
+    } else if (snapshotDocPath) {
+      targetDocument = allDocuments.find((d) => d.path === snapshotDocPath) || activeDocument;
+    }
+  }
+
+  const isRewritePreview = normalizedToolName === "rewrite_canvas_document" && targetDocument;
   const normalized = normalizeStreamingCanvasPreviewDocument({
-    id: isRewritePreview ? activeDocument.id : `streaming-canvas-preview-${normalizedPreviewKey}`,
-    title: String(snapshotData.title || (isRewritePreview ? activeDocument.title : "Canvas draft")).trim() || "Canvas draft",
-    path: String(snapshotData.path || (isRewritePreview ? activeDocument.path : "")).trim(),
-    role: String(snapshotData.role || (isRewritePreview ? activeDocument.role : "note")).trim(),
-    summary: isRewritePreview ? String(activeDocument.summary || "") : "",
-    format: String(snapshotData.format || (isRewritePreview ? activeDocument.format : "markdown")).trim() || "markdown",
-    language: String(snapshotData.language || (isRewritePreview ? activeDocument.language : "")).trim(),
+    id: isRewritePreview ? targetDocument.id : `streaming-canvas-preview-${normalizedPreviewKey}`,
+    title: String(snapshotData.title || (isRewritePreview ? targetDocument.title : "Canvas draft")).trim() || "Canvas draft",
+    path: String(snapshotData.path || (isRewritePreview ? targetDocument.path : "")).trim(),
+    role: String(snapshotData.role || (isRewritePreview ? targetDocument.role : "note")).trim(),
+    summary: isRewritePreview ? String(targetDocument.summary || "") : "",
+    format: String(snapshotData.format || (isRewritePreview ? targetDocument.format : "markdown")).trim() || "markdown",
+    language: String(snapshotData.language || (isRewritePreview ? targetDocument.language : "")).trim(),
     content: "",
-    source_message_id: isRewritePreview ? activeDocument.source_message_id : null,
+    source_message_id: isRewritePreview ? targetDocument.source_message_id : null,
   });
   return normalized ? { ...normalized, isStreamingPreview: true, tool: normalizedToolName, previewKey: normalizedPreviewKey } : null;
 }
@@ -1325,18 +1342,24 @@ function ensureStreamingCanvasPreview(toolName, previewKey = "", snapshot = {}) 
   if (!normalizedToolName) {
     return null;
   }
-  if (
+  const isNewPreview = (
     !streamingCanvasPreview
     || streamingCanvasPreview.tool !== normalizedToolName
     || streamingCanvasPreview.previewKey !== normalizedPreviewKey
-  ) {
+  );
+  if (isNewPreview) {
     streamingCanvasPreview = buildStreamingCanvasPreviewDocument(normalizedToolName, normalizedPreviewKey, snapshot);
   }
   if (!streamingCanvasPreview) {
     return null;
   }
   applyStreamingCanvasPreviewSnapshot(snapshot);
-  activeCanvasDocumentId = streamingCanvasPreview.id;
+  // Only switch the active view to the streaming preview when a new streaming
+  // operation starts. If the user has manually selected a different document
+  // during an ongoing stream, do not force the view back to the preview.
+  if (isNewPreview || activeCanvasDocumentId === streamingCanvasPreview.id) {
+    activeCanvasDocumentId = streamingCanvasPreview.id;
+  }
   return streamingCanvasPreview;
 }
 

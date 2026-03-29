@@ -1929,7 +1929,7 @@ def register_chat_routes(app) -> None:
             )
 
         settings = get_app_settings()
-        max_steps = max(1, min(10, int(settings.get("max_steps", 5))))
+        max_steps = max(1, min(50, int(settings.get("max_steps", 5))))
         active_tool_names = get_active_tool_names(settings)
         if not VISION_ENABLED:
             active_tool_names = [name for name in active_tool_names if name != "image_explain"]

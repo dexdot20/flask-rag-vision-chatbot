@@ -137,6 +137,33 @@ _NAME_LANGUAGE_MAP: dict[str, str] = {
     "jenkinsfile": "groovy",
 }
 
+_SHEBANG_LANGUAGE_MAP: dict[str, str] = {
+    "python": "python", "python3": "python", "python2": "python",
+    "node": "javascript", "nodejs": "javascript",
+    "ruby": "ruby",
+    "perl": "perl", "perl5": "perl",
+    "bash": "bash", "sh": "bash", "zsh": "bash", "dash": "bash",
+    "php": "php",
+    "lua": "lua",
+    "rscript": "r",
+    "groovy": "groovy",
+    "tclsh": "tcl", "expect": "tcl",
+    "awk": "awk", "gawk": "awk",
+}
+
+
+def _infer_canvas_language_from_content(content: str) -> str | None:
+    """Infer language from a shebang line (#!) at the top of the content."""
+    first_line = content.split("\n", 1)[0].strip() if content else ""
+    if not first_line.startswith("#!"):
+        return None
+    # e.g. "#!/usr/bin/env python3" or "#!/usr/bin/python3"
+    parts = first_line[2:].strip().split()
+    if not parts:
+        return None
+    interpreter = parts[-1].rsplit("/", 1)[-1].lower()
+    return _SHEBANG_LANGUAGE_MAP.get(interpreter)
+
 
 def _infer_canvas_language(path_or_name: str | None) -> str | None:
     if not path_or_name:
@@ -602,6 +629,7 @@ def normalize_canvas_document(value, *, fallback_title: str = "Canvas") -> dict 
         _normalize_canvas_language(value.get("language"))
         or _infer_canvas_language(path)
         or _infer_canvas_language(str(value.get("title") or "").strip())
+        or _infer_canvas_language_from_content(str(value.get("content") or "").lstrip())
     )
 
     # Promote format to "code" when path/title extension indicates source code and
@@ -1041,11 +1069,35 @@ def clear_canvas(runtime_state: dict) -> dict:
     }
 
 
-def build_canvas_tool_result(document: dict, *, action: str) -> dict:
+def build_canvas_tool_result(
+    document: dict,
+    *,
+    action: str,
+    edit_start_line: int | None = None,
+    edit_end_line: int | None = None,
+) -> dict:
     normalized = normalize_canvas_document(document)
     if not normalized:
         raise ValueError("Canvas document is invalid.")
-    preview = normalized["content"][:2000]
+    content = normalized["content"]
+    # For localized edits on code documents, show a context window around the
+    # affected region rather than the first 2000 chars. This lets the model
+    # verify its changes in place without having to scroll through the file.
+    if (
+        edit_start_line is not None
+        and normalized.get("format") == "code"
+        and action in ("lines_replaced", "lines_inserted", "lines_deleted")
+    ):
+        all_lines = list_canvas_lines(content)
+        total = len(all_lines)
+        end_ref = edit_end_line if edit_end_line is not None else edit_start_line
+        context_start = max(1, edit_start_line - 4)
+        context_end = min(total, end_ref + 4)
+        preview = "\n".join(f"{i}: {all_lines[i - 1]}" for i in range(context_start, context_end + 1))
+        content_truncated = total > (context_end - context_start + 1)
+    else:
+        preview = content[:2000]
+        content_truncated = len(content) > len(preview)
     result = {
         "status": "ok",
         "action": action,
@@ -1056,7 +1108,7 @@ def build_canvas_tool_result(document: dict, *, action: str) -> dict:
         "format": normalized["format"],
         "line_count": normalized["line_count"],
         "content": preview,
-        "content_truncated": len(normalized["content"]) > len(preview),
+        "content_truncated": content_truncated,
     }
     if normalized.get("language"):
         result["language"] = normalized["language"]

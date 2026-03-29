@@ -1520,7 +1520,7 @@ def _build_streaming_canvas_tool_preview(tool_call_parts: list[dict]) -> dict | 
 
         arguments_text = "".join(raw_call.get("arguments_parts") or [])
         snapshot = {}
-        for field_name in ("title", "format", "language", "path", "role"):
+        for field_name in ("title", "format", "language", "path", "role", "document_id", "document_path"):
             value = _extract_partial_json_string_value(arguments_text, field_name)
             if value is not None:
                 snapshot[field_name] = value
@@ -2291,39 +2291,66 @@ def _run_rewrite_canvas_document(tool_args: dict, runtime_state: dict):
 
 def _run_replace_canvas_lines(tool_args: dict, runtime_state: dict):
     canvas_state = _get_canvas_runtime_state(runtime_state)
+    start_line = int(tool_args.get("start_line") or 0)
+    replacement_lines = tool_args.get("lines") or []
     document = replace_canvas_lines(
         canvas_state,
-        start_line=tool_args.get("start_line", 0),
-        end_line=tool_args.get("end_line", 0),
-        lines=tool_args.get("lines", []),
+        start_line=start_line,
+        end_line=int(tool_args.get("end_line") or 0),
+        lines=replacement_lines,
         document_id=tool_args.get("document_id"),
         document_path=tool_args.get("document_path"),
     )
-    return build_canvas_tool_result(document, action="lines_replaced"), f"Canvas lines replaced in {document['title']}"
+    edit_end = start_line + len(replacement_lines) - 1 if replacement_lines else start_line
+    result = build_canvas_tool_result(
+        document,
+        action="lines_replaced",
+        edit_start_line=start_line,
+        edit_end_line=max(start_line, edit_end),
+    )
+    return result, f"Canvas lines replaced in {document['title']}"
 
 
 def _run_insert_canvas_lines(tool_args: dict, runtime_state: dict):
     canvas_state = _get_canvas_runtime_state(runtime_state)
+    after_line = int(tool_args.get("after_line") or 0)
+    insertion_lines = tool_args.get("lines") or []
     document = insert_canvas_lines(
         canvas_state,
-        after_line=tool_args.get("after_line", 0),
-        lines=tool_args.get("lines", []),
+        after_line=after_line,
+        lines=insertion_lines,
         document_id=tool_args.get("document_id"),
         document_path=tool_args.get("document_path"),
     )
-    return build_canvas_tool_result(document, action="lines_inserted"), f"Canvas lines inserted in {document['title']}"
+    edit_start = after_line + 1
+    edit_end = after_line + len(insertion_lines)
+    result = build_canvas_tool_result(
+        document,
+        action="lines_inserted",
+        edit_start_line=edit_start,
+        edit_end_line=max(edit_start, edit_end),
+    )
+    return result, f"Canvas lines inserted in {document['title']}"
 
 
 def _run_delete_canvas_lines(tool_args: dict, runtime_state: dict):
     canvas_state = _get_canvas_runtime_state(runtime_state)
+    start_line = int(tool_args.get("start_line") or 0)
     document = delete_canvas_lines(
         canvas_state,
-        start_line=tool_args.get("start_line", 0),
-        end_line=tool_args.get("end_line", 0),
+        start_line=start_line,
+        end_line=int(tool_args.get("end_line") or 0),
         document_id=tool_args.get("document_id"),
         document_path=tool_args.get("document_path"),
     )
-    return build_canvas_tool_result(document, action="lines_deleted"), f"Canvas lines deleted in {document['title']}"
+    # Show context around the deletion point so the model can verify placement.
+    result = build_canvas_tool_result(
+        document,
+        action="lines_deleted",
+        edit_start_line=start_line,
+        edit_end_line=start_line,
+    )
+    return result, f"Canvas lines deleted in {document['title']}"
 
 
 def _run_delete_canvas_document(tool_args: dict, runtime_state: dict):

@@ -13,7 +13,7 @@ from db import extract_message_attachments, parse_message_metadata, parse_messag
 from tool_registry import build_canvas_decision_matrix, resolve_runtime_tool_names
 
 SUMMARY_LABEL = "Conversation summary (generated from deleted messages):"
-CANVAS_PROMPT_MAX_CHARS = 12_000
+CANVAS_PROMPT_MAX_CHARS = 20_000
 CANVAS_PROMPT_MAX_LINES = 400
 PARALLEL_SAFE_READ_ONLY_TOOL_NAMES = (
     # Web / fetch
