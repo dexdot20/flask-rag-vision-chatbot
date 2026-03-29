@@ -2821,6 +2821,40 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(documents[0]["metadata"]["description"], "Use when answering operations questions.")
         self.assertFalse(documents[0]["metadata"]["auto_inject_enabled"])
 
+    def test_rag_upload_metadata_generation_uses_deepseek_chat(self):
+        fake_response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content='{"title":"Ops Notes","description":"Use this document for operations questions and process checks."}',
+                    )
+                )
+            ]
+        )
+
+        with patch("routes.conversations.client.chat.completions.create", return_value=fake_response) as mocked_create:
+            response = self.client.post(
+                "/api/rag/upload-metadata",
+                data={
+                    "document": (io.BytesIO(b"Alpha\nBeta\nGamma"), "ops-notes.txt", "text/plain"),
+                    "source_name": "Ops Notes Draft",
+                    "description": "Operations reference",
+                },
+                content_type="multipart/form-data",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["title"], "Ops Notes")
+        self.assertEqual(payload["description"], "Use this document for operations questions and process checks.")
+        self.assertTrue(payload["used_ai"])
+        mocked_create.assert_called_once()
+        call_kwargs = mocked_create.call_args.kwargs
+        self.assertEqual(call_kwargs["model"], "deepseek-chat")
+        prompt_text = "\n".join(message.get("content", "") for message in call_kwargs["messages"])
+        self.assertIn("ops-notes.txt", prompt_text)
+        self.assertIn("Alpha", prompt_text)
+
     def test_fix_text_endpoint(self):
         fake_result = {
             "content": "Improved text",

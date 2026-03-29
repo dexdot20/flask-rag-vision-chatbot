@@ -370,8 +370,11 @@
                   <input type="checkbox" id="kb-upload-auto-inject-toggle" checked />
                   <span>Allow this document in automatic RAG injection</span>
                 </label>
-                <div class="kb-actions-row">
-                  <button class="btn-primary" id="kb-upload-btn" type="button">Upload to knowledge base</button>
+                <div class="kb-actions-row kb-actions-row--upload">
+                  <div class="kb-actions-row__buttons">
+                    <button class="btn-ghost" id="kb-suggest-btn" type="button">Generate title &amp; description</button>
+                    <button class="btn-primary" id="kb-upload-btn" type="button">Upload to knowledge base</button>
+                  </div>
                   <span id="kb-upload-status" class="settings-status">Ready to upload</span>
                 </div>
               </div>

@@ -26,6 +26,7 @@ from conversation_export import (
 )
 from config import (
     AVAILABLE_MODEL_IDS,
+    client,
     RAG_DISABLED_FEATURE_ERROR,
     RAG_ENABLED,
     RAG_SEARCH_DEFAULT_TOP_K,
@@ -61,6 +62,7 @@ from rag_service import (
     sync_conversations_to_rag,
 )
 from routes.request_utils import normalize_model_id
+from vision import extract_json_object, extract_text_from_response_content
 
 
 def _sanitize_download_filename(value: str, fallback: str = "canvas") -> str:
@@ -124,6 +126,108 @@ def _parse_rag_source_type_filter(raw_value):
     normalized = normalize_rag_source_types(incoming)
     invalid = [value for value in incoming if value not in normalized]
     return normalized, invalid
+
+
+def _normalize_upload_metadata_title(raw_title: str) -> str:
+    text = re.sub(r"\s+", " ", str(raw_title or "").replace("\n", " ")).strip()
+    if not text:
+                return ""
+    text = re.sub(r"^[\s\-*>#`\"'“”‘’\[\](){}:;,.!?]+", "", text)
+    text = re.sub(r"[\s\-*>#`\"'“”‘’\[\](){}:;,.!?]+$", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:80]
+
+
+def _normalize_upload_metadata_description(raw_description: str) -> str:
+    text = re.sub(r"\s+", " ", str(raw_description or "").replace("\n", " ")).strip()
+    return text[:280]
+
+
+def _build_upload_metadata_fallback(filename: str, source_name: str, text: str) -> tuple[str, str]:
+    stem = os.path.splitext(os.path.basename(filename or "").strip())[0].strip()
+    fallback_title = (
+        _normalize_upload_metadata_title(source_name)
+        or _normalize_upload_metadata_title(stem.replace("_", " ").replace("-", " "))
+        or "Imported document"
+    )
+    snippet = ""
+    for paragraph in re.split(r"\n{2,}", str(text or "").strip()):
+        paragraph = re.sub(r"\s+", " ", paragraph).strip()
+        if paragraph:
+            snippet = paragraph
+            break
+    if snippet:
+        snippet = snippet[:220].rstrip()
+        if len(snippet) == 220:
+            snippet += "…"
+    fallback_description = snippet or f"Document imported from {os.path.basename(filename or 'uploaded file') or 'uploaded file'}."
+    return fallback_title, fallback_description
+
+
+def _generate_upload_metadata_suggestion(filename: str, mime_type: str, text: str, source_name: str = "", description: str = "") -> dict:
+    cleaned_filename = os.path.basename(str(filename or "uploaded.txt").strip()) or "uploaded.txt"
+    cleaned_source_name = _normalize_upload_metadata_title(source_name)
+    cleaned_description = _normalize_upload_metadata_description(description)
+    cleaned_text = re.sub(r"\n{3,}", "\n\n", str(text or "").strip())
+    excerpt_limit = 14000
+    excerpt = cleaned_text[:excerpt_limit]
+    excerpt_truncated = len(cleaned_text) > excerpt_limit
+
+    prompt = [
+        {
+            "role": "system",
+            "content": (
+                "You generate concise metadata for a knowledge base upload. "
+                "Return ONLY valid JSON with keys title and description. "
+                "Title must be 3-8 words, specific, and have no trailing punctuation. "
+                "Description must be 1-2 sentences, under 280 characters, and explain what the document is useful for. "
+                "Match the document language when clear. Do not mention that you are an AI."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Filename: {cleaned_filename}\n"
+                f"Mime type: {mime_type or 'text/plain'}\n"
+                f"User title hint: {cleaned_source_name or '(none)'}\n"
+                f"User description hint: {cleaned_description or '(none)'}\n"
+                f"Content truncated: {'yes' if excerpt_truncated else 'no'}\n\n"
+                f"Document content:\n{excerpt or '(no extracted text available)'}"
+            ),
+        },
+    ]
+
+    used_ai = False
+    raw_output = ""
+    try:
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=prompt,
+            temperature=0.2,
+        )
+        used_ai = True
+        choice = response.choices[0] if getattr(response, "choices", None) else None
+        message = getattr(choice, "message", None) if choice else None
+        raw_output = extract_text_from_response_content(getattr(message, "content", ""))
+    except Exception:
+        used_ai = False
+
+    parsed = extract_json_object(raw_output) if raw_output else {}
+    title = _normalize_upload_metadata_title(parsed.get("title") or "")
+    description_text = _normalize_upload_metadata_description(parsed.get("description") or "")
+
+    fallback_title, fallback_description = _build_upload_metadata_fallback(cleaned_filename, cleaned_source_name, cleaned_text)
+    if not title:
+        title = fallback_title
+    if not description_text:
+        description_text = fallback_description
+
+    return {
+        "title": title,
+        "description": description_text,
+        "used_ai": used_ai,
+        "model": "deepseek-chat",
+    }
 
 
 def register_conversation_routes(app) -> None:
@@ -585,6 +689,32 @@ def register_conversation_routes(app) -> None:
                 "text_length": len(text),
             }
         ), 201
+
+    @app.route("/api/rag/upload-metadata", methods=["POST"])
+    def suggest_rag_upload_metadata():
+        if not RAG_ENABLED:
+            return jsonify({"error": RAG_DISABLED_FEATURE_ERROR}), 410
+
+        try:
+            uploaded_document = request.files.get("document")
+            if not uploaded_document or not getattr(uploaded_document, "filename", ""):
+                return jsonify({"error": "Choose a document to analyze."}), 400
+
+            source_name = str(request.form.get("source_name") or "").strip()
+            description = str(request.form.get("description") or "").strip()
+            filename, mime_type, doc_bytes = read_uploaded_document(uploaded_document)
+            text = extract_document_text(doc_bytes, mime_type)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+        suggestion = _generate_upload_metadata_suggestion(
+            filename,
+            mime_type,
+            text,
+            source_name=source_name,
+            description=description,
+        )
+        return jsonify(suggestion)
 
     @app.route("/api/rag/sync-conversations", methods=["POST"])
     def sync_rag_conversations():

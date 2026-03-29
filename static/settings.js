@@ -49,6 +49,7 @@ const kbUploadFileEl = document.getElementById("kb-upload-file");
 const kbUploadTitleEl = document.getElementById("kb-upload-title");
 const kbUploadDescriptionEl = document.getElementById("kb-upload-description");
 const kbUploadAutoInjectEl = document.getElementById("kb-upload-auto-inject-toggle");
+const kbSuggestBtn = document.getElementById("kb-suggest-btn");
 const kbUploadBtn = document.getElementById("kb-upload-btn");
 const kbUploadStatusEl = document.getElementById("kb-upload-status");
 const settingsStatus = document.getElementById("settings-status");
@@ -573,6 +574,18 @@ function setKbUploadStatus(message, tone = "muted") {
   kbUploadStatusEl.dataset.tone = tone;
 }
 
+function syncKbUploadActionState() {
+  const ragEnabled = Boolean(featureFlags.rag_enabled);
+  const hasFile = Boolean(kbUploadFileEl?.files?.length);
+
+  if (kbSuggestBtn) {
+    kbSuggestBtn.disabled = !ragEnabled || !hasFile;
+  }
+  if (kbUploadBtn) {
+    kbUploadBtn.disabled = !ragEnabled || !hasFile;
+  }
+}
+
 function summarizeKbDocument(doc) {
   const metadata = doc && typeof doc.metadata === "object" ? doc.metadata : {};
   const parts = [RAG_SOURCE_TYPE_LABELS[doc.source_type] || doc.source_type || "Document"];
@@ -712,6 +725,9 @@ async function uploadKnowledgeBaseDocument() {
   if (kbUploadBtn) {
     kbUploadBtn.disabled = true;
   }
+  if (kbSuggestBtn) {
+    kbSuggestBtn.disabled = true;
+  }
   setKbUploadStatus("Uploading document...");
 
   try {
@@ -744,9 +760,58 @@ async function uploadKnowledgeBaseDocument() {
   } catch (error) {
     setKbUploadStatus(error.message || "Upload failed.", "error");
   } finally {
-    if (kbUploadBtn) {
-      kbUploadBtn.disabled = !Boolean(featureFlags.rag_enabled);
+    syncKbUploadActionState();
+  }
+}
+
+async function generateKnowledgeBaseMetadata() {
+  if (!Boolean(featureFlags.rag_enabled)) {
+    setKbUploadStatus("RAG disabled in .env", "warning");
+    return;
+  }
+
+  const file = kbUploadFileEl?.files?.[0];
+  if (!file) {
+    setKbUploadStatus("Choose a document first.", "warning");
+    return;
+  }
+
+  const formData = new FormData();
+  formData.append("document", file);
+  formData.append("source_name", kbUploadTitleEl?.value.trim() || "");
+  formData.append("description", kbUploadDescriptionEl?.value.trim() || "");
+
+  if (kbSuggestBtn) {
+    kbSuggestBtn.disabled = true;
+  }
+  if (kbUploadBtn) {
+    kbUploadBtn.disabled = true;
+  }
+  setKbUploadStatus("Generating title and description...", "muted");
+
+  try {
+    const response = await fetch("/api/rag/upload-metadata", {
+      method: "POST",
+      body: formData,
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(data.error || "Metadata generation failed.");
     }
+
+    if (kbUploadTitleEl && typeof data.title === "string") {
+      kbUploadTitleEl.value = data.title;
+    }
+    if (kbUploadDescriptionEl && typeof data.description === "string") {
+      kbUploadDescriptionEl.value = data.description;
+      autoResize(kbUploadDescriptionEl);
+    }
+
+    setKbUploadStatus("Title and description generated.", "success");
+  } catch (error) {
+    setKbUploadStatus(error.message || "Metadata generation failed.", "error");
+  } finally {
+    syncKbUploadActionState();
   }
 }
 
@@ -858,8 +923,12 @@ kbUploadFileEl?.addEventListener("change", () => {
   if (filename && kbUploadTitleEl && !kbUploadTitleEl.value.trim()) {
     kbUploadTitleEl.value = filename.replace(/\.[^.]+$/, "");
   }
+  syncKbUploadActionState();
 });
 kbUploadDescriptionEl?.addEventListener("input", () => autoResize(kbUploadDescriptionEl));
+kbSuggestBtn?.addEventListener("click", () => {
+  void generateKnowledgeBaseMetadata();
+});
 kbUploadBtn?.addEventListener("click", () => {
   void uploadKnowledgeBaseDocument();
 });
@@ -891,6 +960,7 @@ initializeTabs();
 registerDirtyListeners();
 applySettingsToForm();
 applyFeatureAvailability();
+syncKbUploadActionState();
 setSettingsStatus("Ready");
 setDirtyPill("All changes saved", "muted");
 void refreshSettings();
