@@ -2008,6 +2008,16 @@ def get_active_tool_names(settings: dict | None = None) -> list[str]:
     return []
 
 
+def get_model_temperature(settings: dict | None = None) -> float:
+    source = settings if settings is not None else get_app_settings()
+    raw_value = source.get("temperature", DEFAULT_SETTINGS["temperature"])
+    try:
+        temperature = float(raw_value)
+    except (TypeError, ValueError):
+        temperature = float(DEFAULT_SETTINGS["temperature"])
+    return max(0.0, min(2.0, temperature))
+
+
 def get_rag_auto_inject_enabled(settings: dict | None = None) -> bool:
     if not RAG_ENABLED:
         return False

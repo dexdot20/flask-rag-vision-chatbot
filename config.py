@@ -272,6 +272,7 @@ DEFAULT_SETTINGS = {
     "user_preferences": "",
     "scratchpad": "",
     "max_steps": "5",
+    "temperature": "0.7",
     "active_tools": json.dumps(DEFAULT_ACTIVE_TOOL_NAMES, ensure_ascii=False),
     "rag_auto_inject": "true",
     "rag_sensitivity": RAG_DEFAULT_SENSITIVITY_PRESET,

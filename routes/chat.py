@@ -53,6 +53,7 @@ from db import (
     get_db,
     get_fetch_url_clip_aggressiveness,
     get_fetch_url_token_threshold,
+    get_model_temperature,
     get_pruning_batch_size,
     get_pruning_enabled,
     get_pruning_token_threshold,
@@ -1378,6 +1379,7 @@ def maybe_create_conversation_summary(
                 summary_model,
                 1,
                 [],
+                temperature=get_model_temperature(settings),
                 fetch_url_token_threshold=fetch_url_token_threshold,
                 fetch_url_clip_aggressiveness=fetch_url_clip_aggressiveness,
             )
@@ -1815,7 +1817,8 @@ def register_chat_routes(app) -> None:
                 "content": f"<text>\n{text}\n</text>",
             },
         ]
-        result = collect_agent_response(messages, "deepseek-chat", 1, [])
+        settings = get_app_settings()
+        result = collect_agent_response(messages, "deepseek-chat", 1, [], temperature=get_model_temperature(settings))
         fixed_text = (result.get("content") or "").strip()
         if not fixed_text:
             errors = result.get("errors") or []
@@ -1947,6 +1950,7 @@ def register_chat_routes(app) -> None:
 
         settings = get_app_settings()
         max_steps = max(1, min(50, int(settings.get("max_steps", 5))))
+        temperature = get_model_temperature(settings)
         active_tool_names = get_active_tool_names(settings)
         if not VISION_ENABLED:
             active_tool_names = [name for name in active_tool_names if name != "image_explain"]
@@ -2224,6 +2228,7 @@ def register_chat_routes(app) -> None:
                 model,
                 max_steps,
                 runtime_tool_names,
+                temperature=temperature,
                 fetch_url_token_threshold=fetch_url_token_threshold,
                 fetch_url_clip_aggressiveness=fetch_url_clip_aggressiveness,
                 initial_canvas_documents=initial_canvas_documents,
@@ -2534,11 +2539,13 @@ def register_chat_routes(app) -> None:
 
         source_text = " ".join(str(message["content"] or "") for message in title_source_messages)
         try:
+            settings = get_app_settings()
             result = collect_agent_response(
                 prompt,
                 "deepseek-chat",
                 1,
                 [],
+                temperature=get_model_temperature(settings),
             )
         except Exception as exc:  # pragma: no cover - defensive fallback
             LOGGER.warning("Title generation failed for conversation %s: %s", conv_id, exc)

@@ -90,6 +90,9 @@
             </div>
             <label class="settings-label" for="preferences-input">Response preferences</label>
             <textarea id="preferences-input" rows="8" placeholder="Example: Reply in English, keep answers concise, and use bullet points when useful."></textarea>
+            <label class="settings-label" for="temperature-input">Response temperature (0.0-2.0)</label>
+            <input type="number" class="settings-number" id="temperature-input" min="0" max="2" step="0.1" value="0.7" />
+            <p class="settings-copy">Lower values are more deterministic; higher values add more variation to assistant replies.</p>
           </div>
 
           <div class="settings-page-grid settings-page-grid--two">
@@ -195,7 +198,7 @@
                 <p>Durable notes that are injected into the runtime system prompt.</p>
               </div>
               <div class="settings-label">Stored notes</div>
-              <p id="scratchpad-readonly-note" class="settings-copy" hidden>Scratchpad is visible but read-only because admin editing is disabled.</p>
+              <p id="scratchpad-readonly-note" class="settings-copy">Add, edit, or remove persistent notes here.</p>
               <div id="scratchpad-list" class="scratchpad-list" aria-label="Stored notes list"></div>
               <div class="scratchpad-toolbar">
                 <button class="btn-ghost" id="scratchpad-add-btn" type="button">Add note</button>

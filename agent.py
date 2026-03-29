@@ -99,6 +99,7 @@ TOOL_EXECUTION_RESULTS_MARKER = "[TOOL EXECUTION RESULTS]"
 REASONING_REPLAY_MARKER = "[AGENT REASONING CONTEXT]"
 MAX_REASONING_REPLAY_ENTRIES = 2
 MAX_REASONING_REPLAY_CHARS = 4_000
+MAX_REASONING_REPLAY_TOTAL_CHARS = 10_000
 CANVAS_TOOL_NAMES = {
     "expand_canvas_document",
     "scroll_canvas_document",
@@ -2424,6 +2425,8 @@ def collect_agent_response(
     model: str,
     max_steps: int,
     enabled_tool_names: list[str],
+    *,
+    temperature: float = 0.7,
     fetch_url_token_threshold: int | None = None,
     fetch_url_clip_aggressiveness: int | None = None,
 ) -> dict:
@@ -2438,6 +2441,7 @@ def collect_agent_response(
         model,
         max_steps,
         enabled_tool_names,
+        temperature=temperature,
         fetch_url_token_threshold=fetch_url_token_threshold,
         fetch_url_clip_aggressiveness=fetch_url_clip_aggressiveness,
     ):
@@ -2755,6 +2759,11 @@ def _append_reasoning_replay_entry(reasoning_state: dict, step: int, reasoning_t
     if not cleaned_reasoning:
         return
 
+    try:
+        max_entries = max(MAX_REASONING_REPLAY_ENTRIES, int(reasoning_state.get("max_entries") or 0))
+    except (TypeError, ValueError):
+        max_entries = MAX_REASONING_REPLAY_ENTRIES
+
     entries = reasoning_state.setdefault("entries", [])
     tool_names = [
         str(tool_call.get("name") or "").strip()
@@ -2769,8 +2778,8 @@ def _append_reasoning_replay_entry(reasoning_state: dict, step: int, reasoning_t
     if entries and entries[-1] == entry:
         return
     entries.append(entry)
-    if len(entries) > MAX_REASONING_REPLAY_ENTRIES:
-        del entries[:-MAX_REASONING_REPLAY_ENTRIES]
+    if len(entries) > max_entries:
+        del entries[:-max_entries]
 
 
 def _build_reasoning_replay_instruction(reasoning_state: dict, current_goal: str = "") -> dict | None:
@@ -2781,16 +2790,24 @@ def _build_reasoning_replay_instruction(reasoning_state: dict, current_goal: str
     if not entries:
         return None
 
+    try:
+        max_entries = max(MAX_REASONING_REPLAY_ENTRIES, int(reasoning_state.get("max_entries") or 0))
+    except (TypeError, ValueError):
+        max_entries = MAX_REASONING_REPLAY_ENTRIES
+
     parts = [REASONING_REPLAY_MARKER]
     parts.append(
         "Use this as your prior reasoning from earlier steps in the current run. Continue from it when it still fits, but correct it if tool results changed the picture."
     )
+    parts.append("Do not restart the plan from scratch after each tool result unless new evidence clearly invalidates it.")
 
     normalized_goal = _clean_tool_text(current_goal or "", limit=180)
     if normalized_goal:
         parts.append(f"Current goal: {normalized_goal}")
 
-    for entry in entries[-MAX_REASONING_REPLAY_ENTRIES:]:
+    selected_sections = []
+    remaining_chars = MAX_REASONING_REPLAY_TOTAL_CHARS
+    for entry in reversed(entries[-max_entries:]):
         step_number = max(1, int(entry.get("step") or 0))
         tool_names = [
             str(tool_name or "").strip()
@@ -2800,7 +2817,13 @@ def _build_reasoning_replay_instruction(reasoning_state: dict, current_goal: str
         header = f"Step {step_number} reasoning"
         if tool_names:
             header += ": planned tools = " + ", ".join(tool_names)
-        parts.append(header + "\n" + str(entry.get("reasoning") or ""))
+        section = header + "\n" + str(entry.get("reasoning") or "")
+        if selected_sections and len(section) > remaining_chars:
+            break
+        selected_sections.append(section)
+        remaining_chars -= len(section)
+
+    parts.extend(reversed(selected_sections))
 
     return {"role": "system", "content": "\n\n".join(parts)}
 
@@ -2858,6 +2881,8 @@ def run_agent_stream(
     model: str,
     max_steps: int,
     enabled_tool_names: list[str],
+    *,
+    temperature: float = 0.7,
     fetch_url_token_threshold: int | None = None,
     fetch_url_clip_aggressiveness: int | None = None,
     initial_canvas_documents: list[dict] | None = None,
@@ -2909,8 +2934,13 @@ def run_agent_stream(
         "steps_tried": [],
         "blockers": [],
     }
+    try:
+        reasoning_replay_entry_limit = max(MAX_REASONING_REPLAY_ENTRIES, int(max_steps or 0))
+    except (TypeError, ValueError):
+        reasoning_replay_entry_limit = MAX_REASONING_REPLAY_ENTRIES
     reasoning_state = {
         "entries": [],
+        "max_entries": reasoning_replay_entry_limit,
     }
 
     def build_tool_capture_event() -> dict:
@@ -3159,6 +3189,7 @@ def run_agent_stream(
             "messages": messages_to_send,
             "stream": True,
             "stream_options": {"include_usage": True},
+            "temperature": max(0.0, min(2.0, float(temperature))),
         }
         if allow_tools:
             current_canvas_documents = get_canvas_runtime_documents(runtime_state.get("canvas"))

@@ -25,6 +25,7 @@ from db import (
     get_chat_summary_trigger_token_count,
     get_fetch_url_clip_aggressiveness,
     get_fetch_url_token_threshold,
+    get_model_temperature,
     get_pruning_batch_size,
     get_pruning_enabled,
     get_pruning_token_threshold,
@@ -48,6 +49,7 @@ def build_settings_payload() -> dict:
         "user_preferences": raw["user_preferences"],
         "scratchpad": raw.get("scratchpad", ""),
         "max_steps": int(raw.get("max_steps", DEFAULT_SETTINGS["max_steps"])),
+        "temperature": get_model_temperature(raw),
         "active_tools": get_active_tool_names(raw),
         "rag_auto_inject": get_rag_auto_inject_enabled(raw),
         "rag_sensitivity": get_rag_sensitivity(raw),
@@ -95,6 +97,7 @@ def register_page_routes(app) -> None:
         data = request.get_json(silent=True) or {}
         user_preferences = data.get("user_preferences")
         max_steps_raw = data.get("max_steps")
+        temperature_raw = data.get("temperature")
         active_tools_raw = data.get("active_tools")
         rag_auto_inject = data.get("rag_auto_inject")
         rag_sensitivity = data.get("rag_sensitivity")
@@ -119,6 +122,7 @@ def register_page_routes(app) -> None:
             user_preferences is None
             and scratchpad is None
             and max_steps_raw is None
+            and temperature_raw is None
             and active_tools_raw is None
             and rag_auto_inject is None
             and rag_sensitivity is None
@@ -163,6 +167,15 @@ def register_page_routes(app) -> None:
             if not (1 <= max_steps <= 50):
                 return jsonify({"error": "max_steps must be between 1 and 50."}), 400
             settings["max_steps"] = str(max_steps)
+
+        if temperature_raw is not None:
+            try:
+                temperature = float(temperature_raw)
+            except (TypeError, ValueError):
+                return jsonify({"error": "temperature must be a number."}), 400
+            if not (0.0 <= temperature <= 2.0):
+                return jsonify({"error": "temperature must be between 0 and 2."}), 400
+            settings["temperature"] = str(temperature)
 
         if active_tools_raw is not None:
             if not isinstance(active_tools_raw, list):
@@ -320,6 +333,7 @@ def register_page_routes(app) -> None:
                 "user_preferences": settings["user_preferences"],
                 "scratchpad": settings.get("scratchpad", ""),
                 "max_steps": int(settings["max_steps"]),
+                "temperature": get_model_temperature(settings),
                 "active_tools": get_active_tool_names(settings),
                 "rag_auto_inject": get_rag_auto_inject_enabled(settings),
                 "rag_sensitivity": get_rag_sensitivity(settings),

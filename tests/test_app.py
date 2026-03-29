@@ -175,6 +175,7 @@ class AppRoutesTestCase(unittest.TestCase):
         payload = response.get_json()
         self.assertEqual(payload["scratchpad"], "")
         self.assertEqual(payload["max_steps"], 5)
+        self.assertAlmostEqual(payload["temperature"], 0.7)
         self.assertEqual(payload["canvas_prompt_max_lines"], 800)
         self.assertEqual(payload["canvas_expand_max_lines"], 1600)
         self.assertEqual(payload["canvas_scroll_window_lines"], 200)
@@ -204,6 +205,7 @@ class AppRoutesTestCase(unittest.TestCase):
             json={
                 "user_preferences": "Keep answers short.",
                 "max_steps": 3,
+                "temperature": 1.1,
                 "chat_summary_mode": "aggressive",
                 "chat_summary_trigger_token_count": 9000,
                 "pruning_enabled": True,
@@ -227,6 +229,7 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertEqual(payload["user_preferences"], "Keep answers short.")
         self.assertEqual(payload["scratchpad"], "")
         self.assertEqual(payload["max_steps"], 3)
+        self.assertAlmostEqual(payload["temperature"], 1.1)
         self.assertEqual(payload["chat_summary_mode"], "aggressive")
         self.assertEqual(payload["chat_summary_trigger_token_count"], 9000)
         self.assertTrue(payload["pruning_enabled"])
@@ -2958,6 +2961,7 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn('value="ask_clarifying_question"', html)
         self.assertIn('id="scratchpad-list"', html)
         self.assertIn('id="scratchpad-add-btn"', html)
+        self.assertIn('Add, edit, or remove persistent notes here.', html)
         self.assertIn('id="summary-mode-select"', html)
         self.assertIn('id="summary-trigger-input"', html)
         self.assertIn('id="fetch-threshold-input"', html)
@@ -3248,6 +3252,7 @@ class AppRoutesTestCase(unittest.TestCase):
             {
                 "user_preferences": "",
                 "max_steps": "2",
+                "temperature": "0.3",
                 "active_tools": "[]",
                 "rag_auto_inject": "false",
             }
@@ -3286,7 +3291,7 @@ class AppRoutesTestCase(unittest.TestCase):
             ]
         )
 
-        with patch("routes.chat.run_agent_stream", return_value=fake_events):
+        with patch("routes.chat.run_agent_stream", return_value=fake_events) as mocked_stream:
             response = self.client.post(
                 "/chat",
                 json={
@@ -3299,6 +3304,7 @@ class AppRoutesTestCase(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         body = response.get_data(as_text=True).strip().splitlines()
+        self.assertAlmostEqual(mocked_stream.call_args.kwargs["temperature"], 0.3)
         events = [json.loads(line) for line in body]
         event_types = [event["type"] for event in events]
         self.assertIn("answer_start", event_types)
@@ -5342,6 +5348,58 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn("I should search first", replay_message["content"])
         self.assertIn("search backend unavailable", blocker_message["content"])
 
+    def test_run_agent_stream_keeps_initial_reasoning_plan_across_long_tool_loop(self):
+        responses = [
+            iter(
+                [
+                    self._stream_chunk(reasoning="Plan: first search broad context, then verify details, then draft the answer."),
+                    self._tool_call_chunk("search_web", {"queries": ["broad context"]}, call_id="tool-call-1"),
+                    self._stream_chunk(usage=SimpleNamespace(prompt_tokens=2, completion_tokens=3, total_tokens=5)),
+                ]
+            ),
+            iter(
+                [
+                    self._stream_chunk(reasoning="The broad search is done. I should verify one detail before drafting."),
+                    self._tool_call_chunk("search_web", {"queries": ["verify detail"]}, call_id="tool-call-2"),
+                    self._stream_chunk(usage=SimpleNamespace(prompt_tokens=2, completion_tokens=3, total_tokens=5)),
+                ]
+            ),
+            iter(
+                [
+                    self._stream_chunk(reasoning="I have enough evidence. I will do one final targeted search, then answer."),
+                    self._tool_call_chunk("search_web", {"queries": ["final confirmation"]}, call_id="tool-call-3"),
+                    self._stream_chunk(usage=SimpleNamespace(prompt_tokens=2, completion_tokens=3, total_tokens=5)),
+                ]
+            ),
+            iter(
+                [
+                    self._stream_chunk(content="Final answer."),
+                    self._stream_chunk(usage=SimpleNamespace(prompt_tokens=2, completion_tokens=4, total_tokens=6)),
+                ]
+            ),
+        ]
+
+        with patch("agent.client.chat.completions.create", side_effect=responses) as mocked_create, patch(
+            "agent.search_web_tool",
+            return_value=[{"title": "Test", "url": "https://example.com", "snippet": "Snippet"}],
+        ):
+            events = list(run_agent_stream([{"role": "user", "content": "Find current info"}], "deepseek-reasoner", 4, ["search_web"]))
+
+        self.assertIn({"type": "answer_delta", "text": "Final answer."}, events)
+        fourth_call_messages = mocked_create.call_args_list[3].kwargs["messages"]
+        replay_message = next(
+            (
+                message
+                for message in fourth_call_messages
+                if message.get("role") == "system" and "[AGENT REASONING CONTEXT]" in message.get("content", "")
+            ),
+            None,
+        )
+        self.assertIsNotNone(replay_message)
+        self.assertIn("Plan: first search broad context, then verify details, then draft the answer.", replay_message["content"])
+        self.assertIn("I should verify one detail before drafting.", replay_message["content"])
+        self.assertIn("I will do one final targeted search, then answer.", replay_message["content"])
+
     def test_estimate_message_breakdown_counts_reasoning_replay_as_internal_state(self):
         content = "[AGENT REASONING CONTEXT]\n\nPrior reasoning"
         breakdown = _estimate_message_breakdown({"role": "system", "content": content})
@@ -6137,7 +6195,7 @@ class AppRoutesTestCase(unittest.TestCase):
     def test_run_agent_stream_streams_native_pre_tool_text_live_and_preserves_history(self):
         captured_calls = []
 
-        def fake_create(model, messages, stream, stream_options=None, tools=None, tool_choice=None):
+        def fake_create(model, messages, stream, stream_options=None, tools=None, tool_choice=None, temperature=None):
             captured_calls.append(list(messages))
             call_index = len(captured_calls)
             if call_index == 1:

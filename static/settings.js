@@ -14,6 +14,7 @@ const appSettings = bootstrapData.settings || {};
 const featureFlags = bootstrapData.features || appSettings.features || {};
 
 const preferencesEl = document.getElementById("preferences-input");
+const temperatureEl = document.getElementById("temperature-input");
 const scratchpadListEl = document.getElementById("scratchpad-list");
 const scratchpadAddBtn = document.getElementById("scratchpad-add-btn");
 const scratchpadCountEl = document.getElementById("scratchpad-count");
@@ -134,6 +135,21 @@ function readNumericSetting(element, defaultValue, { allowZero = true } = {}) {
   return parsed;
 }
 
+function readFloatSetting(element, defaultValue, { min = -Infinity, max = Infinity } = {}) {
+  if (!element) {
+    return defaultValue;
+  }
+  const rawValue = String(element.value || "").trim();
+  if (!rawValue) {
+    return defaultValue;
+  }
+  const parsed = Number.parseFloat(rawValue);
+  if (Number.isNaN(parsed) || parsed < min || parsed > max) {
+    return defaultValue;
+  }
+  return parsed;
+}
+
 function readScratchpadNotesFromList() {
   if (!scratchpadListEl) {
     return [];
@@ -163,9 +179,7 @@ function getScratchpadNotesFromSettings() {
 }
 
 function getVisibleScratchpadNotes() {
-  return Boolean(featureFlags.scratchpad_admin_editing)
-    ? readScratchpadNotesFromList()
-    : getScratchpadNotesFromSettings();
+  return scratchpadListEl ? readScratchpadNotesFromList() : getScratchpadNotesFromSettings();
 }
 
 function updateScratchpadCount() {
@@ -345,12 +359,11 @@ function syncOverviewStats() {
 }
 
 function applySettingsToForm() {
-  const scratchpadAdminEditingEnabled = Boolean(featureFlags.scratchpad_admin_editing);
-
   if (preferencesEl) {
     preferencesEl.value = appSettings.user_preferences || "";
     autoResize(preferencesEl);
   }
+  if (temperatureEl) temperatureEl.value = String(appSettings.temperature ?? 0.7);
   if (maxStepsEl) maxStepsEl.value = String(appSettings.max_steps || 5);
   if (summaryModeEl) summaryModeEl.value = appSettings.chat_summary_mode || "auto";
   if (summaryTriggerEl) summaryTriggerEl.value = String(appSettings.chat_summary_trigger_token_count || 80000);
@@ -380,18 +393,13 @@ function applySettingsToForm() {
   }
   updateRagSensitivityHint();
   if (scratchpadListEl || scratchpadAddBtn || scratchpadCountEl) {
-    if (scratchpadAdminEditingEnabled) {
-      renderScratchpad(true);
-    } else {
-      renderScratchpad(false);
-    }
+    renderScratchpad(true);
   }
   syncOverviewStats();
 }
 
 function applyFeatureAvailability() {
   const ragEnabled = Boolean(featureFlags.rag_enabled);
-  const scratchpadAdminEditingEnabled = Boolean(featureFlags.scratchpad_admin_editing);
 
   if (ragAutoInjectEl) ragAutoInjectEl.disabled = !ragEnabled;
   if (ragSensitivityEl) ragSensitivityEl.disabled = !ragEnabled;
@@ -416,10 +424,10 @@ function applyFeatureAvailability() {
     toolMemoryDisabledNoteEl.hidden = ragEnabled;
   }
   if (scratchpadAddBtn) {
-    scratchpadAddBtn.hidden = !scratchpadAdminEditingEnabled;
+    scratchpadAddBtn.hidden = false;
   }
   if (scratchpadReadonlyNoteEl) {
-    scratchpadReadonlyNoteEl.hidden = scratchpadAdminEditingEnabled;
+    scratchpadReadonlyNoteEl.hidden = false;
   }
   if (!ragEnabled) {
     setKbStatus("RAG disabled in .env", "warning");
@@ -442,6 +450,7 @@ async function refreshSettings() {
     appSettings.user_preferences = data.user_preferences || "";
     appSettings.scratchpad = data.scratchpad || "";
     appSettings.max_steps = data.max_steps || 5;
+    appSettings.temperature = data.temperature ?? 0.7;
     appSettings.chat_summary_mode = data.chat_summary_mode || "auto";
     appSettings.chat_summary_trigger_token_count = data.chat_summary_trigger_token_count || 80000;
     appSettings.summary_skip_first = data.summary_skip_first ?? 2;
@@ -475,9 +484,9 @@ async function refreshSettings() {
 }
 
 async function saveSettings() {
-  const scratchpadAdminEditingEnabled = Boolean(featureFlags.scratchpad_admin_editing);
   const payload = {
     user_preferences: preferencesEl?.value.trim() || "",
+    temperature: readFloatSetting(temperatureEl, 0.7, { min: 0, max: 2 }),
     max_steps: readNumericSetting(maxStepsEl, 5, { allowZero: false }),
     chat_summary_mode: summaryModeEl?.value || "auto",
     chat_summary_trigger_token_count: readNumericSetting(summaryTriggerEl, 80000, { allowZero: false }),
@@ -497,11 +506,8 @@ async function saveSettings() {
     rag_context_size: ragContextSizeEl?.value || "medium",
     rag_source_types: featureFlags.rag_enabled ? getSelectedRagSourceTypes() : [],
     tool_memory_auto_inject: featureFlags.rag_enabled ? Boolean(toolMemoryAutoInjectEl?.checked) : false,
+    scratchpad: readScratchpadNotesFromList().join("\n"),
   };
-
-  if (scratchpadAdminEditingEnabled) {
-    payload.scratchpad = readScratchpadNotesFromList().join("\n");
-  }
 
   saveButtons.forEach((button) => {
     button.disabled = true;
@@ -523,6 +529,7 @@ async function saveSettings() {
     appSettings.user_preferences = data.user_preferences || "";
     appSettings.scratchpad = data.scratchpad || "";
     appSettings.max_steps = data.max_steps || 5;
+    appSettings.temperature = data.temperature ?? 0.7;
     appSettings.chat_summary_mode = data.chat_summary_mode || "auto";
     appSettings.chat_summary_trigger_token_count = data.chat_summary_trigger_token_count || 80000;
     appSettings.summary_skip_first = data.summary_skip_first ?? 2;
