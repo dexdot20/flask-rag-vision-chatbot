@@ -122,6 +122,12 @@ CANVAS_STREAM_CONTENT_TOOL_NAMES = {
     "create_canvas_document",
     "rewrite_canvas_document",
 }
+DSML_INVOKE_TAG_RE = re.compile(r'<[^>]*invoke\s+name="(?P<name>[^"]+)"[^>]*>', re.IGNORECASE)
+DSML_PARAMETER_TAG_RE = re.compile(
+    r'<[^>]*parameter\s+name="(?P<name>[^"]+)"(?P<attrs>[^>]*)>(?P<value>.*?)</[^>]*parameter\s*>',
+    re.IGNORECASE | re.DOTALL,
+)
+DSML_STRING_ATTR_RE = re.compile(r'\bstring\s*=\s*["\']true["\']', re.IGNORECASE)
 WEB_TOOL_NAMES = {
     "search_web",
     "fetch_url",
@@ -965,14 +971,106 @@ def _read_api_field(value, key: str, default=None):
     return getattr(value, key, default)
 
 
+def _parse_json_like_text(text: str):
+    raw_text = str(text or "").strip()
+    if not raw_text:
+        return None
+
+    try:
+        return json.loads(raw_text)
+    except Exception:
+        try:
+            return ast.literal_eval(raw_text)
+        except Exception:
+            return None
+
+
+def _parse_dsml_argument_value(value_text: str, attrs_text: str = ""):
+    raw_value = str(value_text or "")
+    if DSML_STRING_ATTR_RE.search(str(attrs_text or "")):
+        return raw_value
+
+    parsed_value = _parse_json_like_text(raw_value)
+    if parsed_value is not None:
+        return parsed_value
+
+    return raw_value.strip()
+
+
+def _parse_dsml_argument_object(arguments_text: str) -> dict | None:
+    raw_arguments = str(arguments_text or "")
+    parsed_arguments = {}
+    found_parameter = False
+
+    for match in DSML_PARAMETER_TAG_RE.finditer(raw_arguments):
+        found_parameter = True
+        field_name = str(match.group("name") or "").strip()
+        if not field_name:
+            continue
+
+        field_value = _parse_dsml_argument_value(match.group("value"), match.group("attrs"))
+        existing_value = parsed_arguments.get(field_name)
+        if existing_value is None:
+            parsed_arguments[field_name] = field_value
+            continue
+        if isinstance(existing_value, list):
+            existing_value.append(field_value)
+            continue
+        parsed_arguments[field_name] = [existing_value, field_value]
+
+    if not found_parameter:
+        return None
+    return parsed_arguments
+
+
+def _extract_dsml_tool_calls_from_content(content_text: str) -> tuple[str, list[dict] | None]:
+    raw_content = str(content_text or "")
+    invoke_matches = list(DSML_INVOKE_TAG_RE.finditer(raw_content))
+    if not invoke_matches:
+        return raw_content, None
+
+    tool_calls = []
+    dsml_start = invoke_matches[0].start()
+    for index, match in enumerate(invoke_matches, start=1):
+        tool_name = str(match.group("name") or "").strip()
+        if not tool_name:
+            continue
+
+        next_start = invoke_matches[index].start() if index < len(invoke_matches) else len(raw_content)
+        arguments_text = raw_content[match.end():next_start]
+        parsed_arguments = _parse_dsml_argument_object(arguments_text) or {}
+        tool_calls.append(
+            {
+                "id": f"content-tool-call-{index}",
+                "name": tool_name,
+                "arguments": parsed_arguments,
+            }
+        )
+
+    if not tool_calls:
+        return raw_content, None
+
+    return raw_content[:dsml_start].strip(), tool_calls
+
+
 def _parse_tool_call_arguments(arguments_text: str, label: str) -> tuple[dict | None, str | None]:
     raw_arguments = str(arguments_text or "").strip()
     if not raw_arguments:
         return {}, None
+
+    parsed_arguments = None
+    json_error = None
     try:
         parsed_arguments = json.loads(raw_arguments)
     except json.JSONDecodeError as exc:
-        return None, f"Invalid tool arguments JSON for {label}: {exc.msg}"
+        json_error = exc.msg
+
+    if parsed_arguments is None:
+        parsed_arguments = _parse_json_like_text(raw_arguments)
+    if parsed_arguments is None:
+        parsed_arguments = _parse_dsml_argument_object(raw_arguments)
+    if parsed_arguments is None:
+        return None, f"Invalid tool arguments JSON for {label}: {json_error or 'Could not parse arguments'}"
     if not isinstance(parsed_arguments, dict):
         return None, f"Tool arguments for {label} must be an object"
     return parsed_arguments, None
@@ -1247,18 +1345,7 @@ def _parse_json_like_value(value):
         return value
     if not isinstance(value, str):
         return None
-
-    text = value.strip()
-    if not text:
-        return None
-
-    try:
-        return json.loads(text)
-    except Exception:
-        try:
-            return ast.literal_eval(text)
-        except Exception:
-            return None
+    return _parse_json_like_text(value)
 
 
 def _coerce_clarification_question_item(raw_question):
@@ -2743,6 +2830,10 @@ def run_agent_stream(
             message = response.choices[0].message
             reasoning_text, content_text = _extract_reasoning_and_content(message)
             tool_calls, tool_call_error = _extract_native_tool_calls(message)
+            if not tool_calls and not tool_call_error:
+                content_text, content_tool_calls = _extract_dsml_tool_calls_from_content(content_text)
+                if content_tool_calls:
+                    tool_calls = content_tool_calls
             _trace_agent_event(
                 "model_turn_completed",
                 trace_id=trace_id,
@@ -2839,6 +2930,10 @@ def run_agent_stream(
         final_reasoning = "".join(reasoning_parts).strip()
         final_content = "".join(content_parts).strip()
         tool_calls, tool_call_error = _finalize_stream_tool_calls(tool_call_parts)
+        if not tool_calls and not tool_call_error:
+            final_content, content_tool_calls = _extract_dsml_tool_calls_from_content(final_content)
+            if content_tool_calls:
+                tool_calls = content_tool_calls
         finalize_call_usage()
         if buffered_content_deltas and not tool_calls and not tool_call_error:
             for pending_delta in buffered_content_deltas:

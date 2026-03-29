@@ -4461,6 +4461,88 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn("MISSING FINAL ANSWER", retry_content)
         self.assertIn("assistant content only", retry_content)
 
+    def test_run_agent_stream_accepts_python_literal_tool_call_arguments(self):
+        responses = [
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            reasoning_content="",
+                            content="",
+                            tool_calls=[
+                                {
+                                    "id": "call-1",
+                                    "function": {
+                                        "name": "create_canvas_document",
+                                        "arguments": "{'title': 'Robot Plan', 'content': '# Notes'}",
+                                    },
+                                }
+                            ],
+                        )
+                    )
+                ],
+                usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+            ),
+            iter(
+                [
+                    self._stream_chunk(content="Tamam."),
+                    self._stream_chunk(usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2)),
+                ]
+            ),
+        ]
+
+        with patch("agent.client.chat.completions.create", side_effect=responses):
+            events = list(run_agent_stream([{"role": "user", "content": "Canvas oluştur"}], "deepseek-chat", 2, ["create_canvas_document"]))
+
+        self.assertIn({"type": "answer_delta", "text": "Tamam."}, events)
+        parser_errors = [event for event in events if event["type"] == "tool_error" and event["tool"] == "parser"]
+        self.assertEqual(parser_errors, [])
+        tool_capture_event = next(event for event in events if event["type"] == "tool_capture")
+        self.assertEqual([doc["title"] for doc in tool_capture_event["canvas_documents"]], ["Robot Plan"])
+        self.assertEqual(tool_capture_event["canvas_documents"][0]["content"], "# Notes")
+
+    def test_run_agent_stream_extracts_dsml_tool_calls_from_content(self):
+        dsml_content = (
+            "<｜DSML｜function_calls>\n"
+            "<｜DSML｜invoke name=\"create_canvas_document\">\n"
+            "<｜DSML｜parameter name=\"title\" string=\"true\">Arduino Kodu - RobotBeyni.ino</｜DSML｜parameter>\n"
+            "<｜DSML｜parameter name=\"content\" string=\"true\">// test\nint led = 13;</｜DSML｜parameter>\n"
+            "</｜DSML｜invoke>\n"
+            "</｜DSML｜function_calls>"
+        )
+        responses = [
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            reasoning_content="",
+                            content=dsml_content,
+                            tool_calls=[],
+                        )
+                    )
+                ],
+                usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+            ),
+            iter(
+                [
+                    self._stream_chunk(content="Bitti."),
+                    self._stream_chunk(usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2)),
+                ]
+            ),
+        ]
+
+        with patch("agent.client.chat.completions.create", side_effect=responses):
+            events = list(run_agent_stream([{"role": "user", "content": "Canvas oluştur"}], "deepseek-reasoner", 2, ["create_canvas_document"]))
+
+        self.assertIn({"type": "answer_delta", "text": "Bitti."}, events)
+        leaked_dsml = [event for event in events if event["type"] == "answer_delta" and "function_calls" in event["text"]]
+        self.assertEqual(leaked_dsml, [])
+        parser_errors = [event for event in events if event["type"] == "tool_error" and event["tool"] == "parser"]
+        self.assertEqual(parser_errors, [])
+        tool_capture_event = next(event for event in events if event["type"] == "tool_capture")
+        self.assertEqual([doc["title"] for doc in tool_capture_event["canvas_documents"]], ["Arduino Kodu - RobotBeyni.ino"])
+        self.assertEqual(tool_capture_event["canvas_documents"][0]["content"], "// test\nint led = 13;")
+
     def test_context_overflow_error_detection(self):
         self.assertTrue(_is_context_overflow_error("context_length_exceeded: requested 200000 tokens"))
         self.assertTrue(_is_context_overflow_error("This model's maximum context length is 128000 tokens."))
