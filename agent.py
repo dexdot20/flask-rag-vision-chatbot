@@ -124,6 +124,7 @@ CANVAS_STREAM_CONTENT_TOOL_NAMES = {
     "rewrite_canvas_document",
 }
 DSML_INVOKE_TAG_RE = re.compile(r'<[^>]*invoke\s+name="(?P<name>[^"]+)"[^>]*>', re.IGNORECASE)
+DSML_FUNCTION_CALLS_TAG_RE = re.compile(r'<[^>]*function_calls[^>]*>', re.IGNORECASE)
 DSML_PARAMETER_TAG_RE = re.compile(
     r'<[^>]*parameter\s+name="(?P<name>[^"]+)"(?P<attrs>[^>]*)>(?P<value>.*?)</[^>]*parameter\s*>',
     re.IGNORECASE | re.DOTALL,
@@ -1237,6 +1238,9 @@ def _extract_dsml_tool_calls_from_content(content_text: str) -> tuple[str, list[
 
     tool_calls = []
     dsml_start = invoke_matches[0].start()
+    function_calls_tag_match = DSML_FUNCTION_CALLS_TAG_RE.search(raw_content)
+    if function_calls_tag_match and function_calls_tag_match.start() < dsml_start:
+        dsml_start = function_calls_tag_match.start()
     for index, match in enumerate(invoke_matches, start=1):
         tool_name = str(match.group("name") or "").strip()
         if not tool_name:
@@ -3040,6 +3044,7 @@ def run_agent_stream(
         messages_to_send: list[dict],
         allow_tools: bool = True,
         *,
+        buffer_answer: bool = False,
         call_type: str = "agent_step",
         retry_reason: str | None = None,
     ) -> dict:
@@ -3195,9 +3200,11 @@ def run_agent_stream(
                                     }
                 if content_delta:
                     content_parts.append(content_delta)
-                    if not turn_tools:
+                    if not turn_tools and not buffer_answer:
                         for event in emit_answer(content_delta):
                             yield event
+                    elif not turn_tools and buffer_answer:
+                        buffered_content_deltas.append(content_delta)
                     elif content_streaming_live:
                         for event in emit_answer(content_delta):
                             yield event
@@ -3893,6 +3900,7 @@ def run_agent_stream(
             turn_result = yield from stream_model_turn(
                 final_messages,
                 allow_tools=False,
+                buffer_answer=True,
                 call_type="final_answer",
                 retry_reason=final_retry_reason,
             )
@@ -3935,13 +3943,16 @@ def run_agent_stream(
                 )
                 stream_error = CONTEXT_OVERFLOW_RECOVERY_ERROR_TEXT
             if tool_calls:
-                yield {
-                    "type": "tool_error",
-                    "step": step,
-                    "tool": "agent",
-                    "error": "Tool limit reached before the model produced a final answer.",
-                }
-                final_text = FINAL_ANSWER_ERROR_TEXT
+                if content_text:
+                    final_text = content_text
+                else:
+                    yield {
+                        "type": "tool_error",
+                        "step": step,
+                        "tool": "agent",
+                        "error": "Tool limit reached before the model produced a final answer.",
+                    }
+                    final_text = FINAL_ANSWER_ERROR_TEXT
             elif not content_text:
                 yield {
                     "type": "tool_error",

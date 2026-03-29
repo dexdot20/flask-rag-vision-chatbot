@@ -7231,6 +7231,48 @@ class AppRoutesTestCase(unittest.TestCase):
         leaked_json = [event for event in events if event["type"] == "answer_delta" and "tool_calls" in event["text"]]
         self.assertEqual(leaked_json, [])
 
+    def test_final_answer_phase_dsml_tool_call_does_not_leak_to_user(self):
+        dsml_in_final = (
+            "Tamam.\n"
+            "<｜DSML｜function_calls>\n"
+            "<｜DSML｜invoke name=\"append_scratchpad\">\n"
+            "<｜DSML｜parameter name=\"note\" string=\"true\">some note</｜DSML｜parameter>\n"
+            "</｜DSML｜invoke>\n"
+            "</｜DSML｜function_calls>"
+        )
+        responses = [
+            iter(
+                [
+                    self._tool_call_chunk("search_web", {"queries": ["x"]}),
+                    self._stream_chunk(usage=SimpleNamespace(prompt_tokens=2, completion_tokens=3, total_tokens=5)),
+                ]
+            ),
+            iter(
+                [
+                    self._stream_chunk(content=dsml_in_final),
+                    self._stream_chunk(usage=SimpleNamespace(prompt_tokens=2, completion_tokens=3, total_tokens=5)),
+                ]
+            ),
+        ]
+
+        with patch("agent.client.chat.completions.create", side_effect=responses), patch(
+            "agent.search_web_tool",
+            return_value=[{"title": "T", "url": "https://example.com", "snippet": "S"}],
+        ):
+            events = list(run_agent_stream([{"role": "user", "content": "Test"}], "deepseek-chat", 1, ["search_web", "append_scratchpad"]))
+
+        answer_deltas = [event["text"] for event in events if event["type"] == "answer_delta"]
+        full_answer = "".join(answer_deltas)
+        self.assertNotIn("DSML", full_answer)
+        self.assertNotIn("function_calls", full_answer)
+        self.assertNotIn("append_scratchpad", full_answer)
+        self.assertIn("Tamam.", full_answer)
+        tool_limit_errors = [
+            event for event in events
+            if event["type"] == "tool_error" and event["error"] == "Tool limit reached before the model produced a final answer."
+        ]
+        self.assertEqual(tool_limit_errors, [])
+
     def test_generate_title_updates_conversation(self):
         conversation_id = self._create_conversation(title="Untitled")
         with get_db() as conn:
