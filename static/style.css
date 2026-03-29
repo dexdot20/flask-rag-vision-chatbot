@@ -2659,6 +2659,8 @@ kbd {
 .canvas-document {
   flex: 1;
   overflow-y: auto;
+  overflow-x: hidden;
+  min-width: 0;
   padding: 28px 28px 40px;
   font-size: 0.94rem;
   line-height: 1.78;
@@ -2778,7 +2780,7 @@ kbd {
 
 .canvas-code-line {
   display: grid;
-  grid-template-columns: 56px 1fr;
+  grid-template-columns: 56px minmax(0, 1fr);
   align-items: start;
   min-height: 1.5em;
 }
@@ -2794,9 +2796,10 @@ kbd {
 
 .canvas-code-line__content {
   display: block;
+  min-width: 0;
   padding: 0 16px;
   white-space: pre;
-  overflow-x: auto;
+  overflow: visible;
 }
 
 .canvas-code-document {

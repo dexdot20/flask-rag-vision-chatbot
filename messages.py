@@ -463,11 +463,12 @@ def _build_canvas_editing_guidance(active_tool_names: list[str], canvas_payload:
         "- Prefer the smallest valid canvas change that satisfies the request.",
         "- Do not rewrite the whole document when only part needs to change; use replace_canvas_lines, insert_canvas_lines, or delete_canvas_lines for local edits when the exact visible lines are known.",
         "- If the target lines are not visible yet, inspect first with scroll_canvas_document for a focused range or expand_canvas_document for a wider view.",
+        "- If you do not know the document_id, use the document_path from the workspace summary, active file label, or manifest; document_id is optional.",
         "- Use rewrite_canvas_document when most of the document should change or when you already know the complete intended replacement content.",
         "- Multiple canvas tool calls in one answer are fine when needed: inspect, then edit, then create or update other files.",
     ]
     if (canvas_payload or {}).get("mode") == "project":
-        lines.append("- In project mode, prefer document_path for targeting and keep one file per canvas document.")
+        lines.append("- In project mode, prefer document_path for targeting; it is enough even when you do not know the document_id yet, and keep one file per canvas document.")
     lines.append("")
     return lines
 
@@ -502,6 +503,17 @@ def build_tool_call_contract(active_tool_names: list[str], canvas_documents=None
     return {"rules": rules}
 
 
+def _build_current_time_context(now: datetime) -> str:
+    normalized_now = now.astimezone()
+    offset = normalized_now.strftime("%z")
+    timezone_label = f"UTC{offset[:3]}:{offset[3:]}" if offset else (normalized_now.tzname() or "UTC")
+    return (
+        f"## Current Date and Time\n- ISO: {normalized_now.isoformat(timespec='seconds')}\n"
+        f"- Date: {normalized_now.date().isoformat()}\n- Time: {normalized_now.strftime('%H:%M:%S')}\n"
+        f"- Weekday: {normalized_now.strftime('%A')}\n- Timezone: {timezone_label}\n"
+    )
+
+
 def build_runtime_system_message(
     user_preferences="",
     active_tool_names=None,
@@ -516,18 +528,14 @@ def build_runtime_system_message(
     canvas_prompt_max_lines: int | None = None,
     workspace_root: str | None = None,
     project_workflow: dict | None = None,
+    include_time_context: bool = True,
 ):
     now = (now or datetime.now().astimezone()).astimezone()
     preferences_text = (user_preferences or "").strip()[:MAX_USER_PREFERENCES_LENGTH]
     scratchpad_text = (scratchpad or "").strip()
     active_tool_names = resolve_runtime_tool_names(active_tool_names or [], canvas_documents=canvas_documents)
-    offset = now.strftime("%z")
-    timezone_label = f"UTC{offset[:3]}:{offset[3:]}" if offset else (now.tzname() or "UTC")
     
     parts = ["You are a helpful AI assistant. You must respect the rules and guidelines provided below.\n"]
-    
-    # Time context
-    parts.append(f"## Current Date and Time\n- ISO: {now.isoformat(timespec='seconds')}\n- Date: {now.date().isoformat()}\n- Time: {now.strftime('%H:%M:%S')}\n- Weekday: {now.strftime('%A')}\n- Timezone: {timezone_label}\n")
 
     # User preferences
     if preferences_text:
@@ -648,6 +656,7 @@ def build_runtime_system_message(
         )
         parts.append(
             "- Guidance: Use visible line numbers for line-level canvas edits. "
+            "If you do not know the document_id, target by document_path from the workspace summary or active file label instead. "
             "If this excerpt is truncated, call expand_canvas_document for a larger view or scroll_canvas_document for a targeted range before editing. "
             "Never guess line numbers outside the visible excerpt."
         )
@@ -679,6 +688,9 @@ def build_runtime_system_message(
         for rule in contract["rules"]:
             parts.append(f"- {rule}")
         parts.append("")
+
+    if include_time_context:
+        parts.append(_build_current_time_context(now))
 
     return {
         "role": "system",
@@ -715,12 +727,15 @@ def prepend_runtime_context(
         canvas_prompt_max_lines=canvas_prompt_max_lines,
         workspace_root=workspace_root,
         project_workflow=project_workflow,
+        include_time_context=False,
     )
     
     system_content = runtime_message["content"]
     
     if summary_count:
         system_content += f"\n\n## Conversation Summaries\nCount: {summary_count}\n*Guidance: Summary-role messages compress earlier deleted conversation turns and should be treated as authoritative context.*"
+
+    system_content += "\n\n" + _build_current_time_context(datetime.now().astimezone()).strip()
 
     return [
         {

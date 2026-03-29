@@ -1439,6 +1439,7 @@ class AppRoutesTestCase(unittest.TestCase):
         content = message["content"]
         self.assertIn("## Canvas Editing Guidance", content)
         self.assertIn("Do not rewrite the whole document when only part needs to change", content)
+        self.assertIn("If you do not know the document_id, use the document_path", content)
         self.assertIn("## Tool Calling", content)
         self.assertIn("Native function calling is enabled for this turn.", content)
         self.assertNotIn("## Active Canvas Document", content)
@@ -1470,6 +1471,7 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn("2: print('world')", content)
         self.assertIn("## Canvas Editing Guidance", content)
         self.assertIn("Multiple canvas tool calls in one answer are fine", content)
+        self.assertIn("If you do not know the document_id, target by document_path", content)
         self.assertIn("## Canvas Decision Matrix", content)
         self.assertIn("| Situation | Preferred tool | Notes |", content)
         self.assertIn("create_canvas_document", content)
@@ -1550,10 +1552,14 @@ class AppRoutesTestCase(unittest.TestCase):
     def test_canvas_tool_specs_prefer_smallest_valid_edit(self):
         rewrite_guidance = TOOL_SPEC_BY_NAME["rewrite_canvas_document"]["prompt"]["guidance"]
         replace_guidance = TOOL_SPEC_BY_NAME["replace_canvas_lines"]["prompt"]["guidance"]
+        expand_description = TOOL_SPEC_BY_NAME["expand_canvas_document"]["description"]
+        expand_guidance = TOOL_SPEC_BY_NAME["expand_canvas_document"]["prompt"]["guidance"]
         scroll_description = TOOL_SPEC_BY_NAME["scroll_canvas_document"]["description"]
 
         self.assertIn("Do not default to this when only part of the file needs to change", rewrite_guidance)
         self.assertIn("Multiple localized replace_canvas_lines calls are fine", replace_guidance)
+        self.assertIn("document_id is optional", expand_description)
+        self.assertIn("use document_path from the workspace summary or manifest", expand_guidance)
         self.assertIn("before line-level edits", scroll_description)
 
     def test_openai_tool_specs_include_expand_canvas_document_with_canvas_documents(self):
@@ -1607,6 +1613,21 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn("Date: ", content)
         self.assertIn("Time: ", content)
         self.assertEqual(messages[1]["role"], "user")
+
+    def test_prepend_runtime_context_places_datetime_after_conversation_summaries(self):
+        messages = prepend_runtime_context(
+            [
+                {"role": "summary", "content": "Earlier summary"},
+                {"role": "user", "content": "Hello"},
+            ],
+            user_preferences="",
+            active_tool_names=[],
+        )
+
+        content = messages[0]["content"]
+        self.assertIn("## Conversation Summaries", content)
+        self.assertIn("## Current Date and Time", content)
+        self.assertLess(content.index("## Conversation Summaries"), content.index("## Current Date and Time"))
 
     def test_runtime_system_message_includes_workspace_sandbox(self):
         message = build_runtime_system_message(

@@ -6072,7 +6072,7 @@ async function sendMessage(options = {}) {
         }
         ensureStreamingCanvasPreview(event.tool, event.preview_key, event.snapshot);
         if (!isCanvasOpen()) {
-          openCanvas();
+          setCanvasAttention(true);
         } else {
           renderCanvasPanel();
         }
@@ -6086,7 +6086,7 @@ async function sendMessage(options = {}) {
           previewDocument.content += String(event.delta || "");
           previewDocument.line_count = previewDocument.content ? previewDocument.content.split("\n").length : 0;
           if (!isCanvasOpen()) {
-            openCanvas();
+            setCanvasAttention(true);
           }
           setCanvasStatus("Generating live canvas...", "muted");
           scheduleCanvasPreviewRender();
@@ -6138,12 +6138,13 @@ async function sendMessage(options = {}) {
                 setCanvasStatus(`${requestLabel} ${Number(pendingCanvasRequest.fileCount || 1) > 1 ? "are" : "is"} ready in Canvas. Open the panel when needed.`, "muted");
               },
             });
-          } else if (event.auto_open && !isCanvasOpen()) {
-            openCanvas();
-            setCanvasStatus("Document opened in Canvas.", "success");
           } else if (activeDocumentChangeMessage) {
+            if (!isCanvasOpen()) {
+              setCanvasAttention(true);
+            }
             setCanvasStatus(activeDocumentChangeMessage, "muted");
           } else if (isCanvasOpen()) {
+            setCanvasAttention(false);
             setCanvasStatus("Canvas updated.", "success");
           } else {
             setCanvasAttention(true);

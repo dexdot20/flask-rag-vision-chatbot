@@ -452,6 +452,7 @@ TOOL_SPECS = [
         "description": (
             "Load the full context of a specific canvas document when the active excerpt and manifest summaries are not enough. "
             "Use this before deciding between localized line edits and a full rewrite. "
+            "If document_id is unknown, target by document_path from the workspace summary or manifest; document_id is optional. "
             "Prefer targeting by document_path in project mode."
         ),
         "parameters": {
@@ -473,6 +474,7 @@ TOOL_SPECS = [
             "guidance": (
                 "Use this when the manifest and active-document excerpt are insufficient and you need another canvas file in full detail. "
                 "After expanding, prefer the smallest valid edit that solves the request. "
+                "If you do not know the document_id, use document_path from the workspace summary or manifest instead of getting stuck. "
                 "In project mode, prefer document_path over document_id so file targeting stays stable."
             ),
         },
@@ -482,6 +484,7 @@ TOOL_SPECS = [
         "description": (
             "Read a targeted line range from a specific canvas document when you need lines outside the visible excerpt. "
             "Use this before line-level edits when the target region is not visible yet. "
+            "If document_id is unknown, target by document_path from the workspace summary or manifest; document_id is optional. "
             "Prefer targeting by document_path in project mode."
         ),
         "parameters": {
@@ -517,6 +520,7 @@ TOOL_SPECS = [
             "guidance": (
                 "Use this when you know which region you need and the active excerpt is truncated. "
                 "After inspecting the right window, prefer line-level edit tools for localized changes instead of rewriting the whole file. "
+                "If you do not know the document_id, use document_path from the workspace summary or manifest instead of stopping to search for the id. "
                 "In project mode, prefer document_path over document_id so file targeting stays stable."
             ),
         },
@@ -1086,6 +1090,7 @@ TOOL_SPECS = [
             "guidance": (
                 "Use this for full-document replacement once you know the intended final content. "
                 "Do not default to this when only part of the file needs to change; use replace_canvas_lines, insert_canvas_lines, or delete_canvas_lines for targeted edits. "
+                "If you do not know the document_id, use document_path from the workspace summary or manifest. "
                 "In project mode prefer document_path when possible. "
                 "If the user needs an additional file, create a separate canvas document instead of rewriting the current one into a different file."
             ),
@@ -1121,6 +1126,7 @@ TOOL_SPECS = [
             "guidance": (
                 "Use only when the exact 1-based line range is known from the visible excerpt or a recent scroll/expand result. "
                 "Multiple localized replace_canvas_lines calls are fine when the changes are separated. "
+                "If you do not know the document_id, use document_path from the workspace summary or manifest. "
                 "For broad rewrites, prefer rewrite_canvas_document. In project mode, prefer document_path when possible."
             ),
         },
