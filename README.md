@@ -1,6 +1,6 @@
 # Flask ChatBot: DeepSeek + Tools + RAG + Vision + Canvas + Memory
 
-This is a single-page Flask chat application built around DeepSeek models, multi-step tool use, local RAG, local vision OCR, conversation summarization, pruning, persistent memory, and editable canvas documents.
+This is a single-page Flask chat application built around DeepSeek models, multi-step tool use, local RAG, local vision OCR, conversation summarization, pruning, persistent memory, editable canvas documents, and a per-conversation workspace sandbox.
 
 It is not a minimal prompt/response demo. The app keeps conversation history in SQLite, restores assistant metadata when a conversation is reopened, supports editing earlier user messages, streams tool progress and reasoning, can enrich a user turn with local OCR or extracted document text before the model sees it, and can compact older content with summaries and pruning.
 
@@ -47,13 +47,7 @@ It is not a minimal prompt/response demo. The app keeps conversation history in 
 - Supports model-emitted tool JSON fallback handling
 - Limits tool rounds with configurable `max_steps` from 1 to 10
 - Forces a final-answer phase when the tool budget is exhausted
-- Tracks estimated prompt composition locally with these categories:
-  - system prompt
-  - user messages
-  - assistant history
-  - tool results
-  - RAG context
-  - final instruction
+- Tracks estimated prompt composition locally across runtime instructions, tool specs, canvas context, scratchpad, tool trace, tool memory, RAG context, message history, tool calls, tool results, and provider overhead
 - Estimates per-turn and session cost with the app's configured DeepSeek pricing logic
 - Writes rotating agent trace logs to `logs/agent-trace.log` by default
 
@@ -78,17 +72,19 @@ It is not a minimal prompt/response demo. The app keeps conversation history in 
 - Persistent scratchpad for durable user-specific facts and preferences
 - Persistent user profile memory extracted from structured conversation summaries
 - Tool memory for successful web/news/URL results from earlier sessions
-- RAG knowledge base built from stored conversations, successful text-like tool results, and tool memory entries
+- RAG knowledge base built from stored conversations, successful text-like tool results, remembered web results, and uploaded documents
 - Optional auto-injection of retrieved RAG context into each turn
 - Optional auto-injection of remembered tool results into each turn
+- RAG source pools can be scoped in Settings to conversations, tool results, tool memory, and uploaded documents
 - Structured clarification tool for cases where the request is underspecified
 
 ### Canvas documents
 
 - The model can create and edit Markdown canvas documents attached to the current conversation
-- The model can also create code-format canvas documents with language metadata
+- The model can also create code-format canvas documents with language metadata, path/role metadata, and project summaries when working in project mode
 - The UI can display multiple canvas documents, search within them, filter them, and export them
 - Canvas documents can be edited line-by-line by the model
+- Targeted reads use `scroll_canvas_document`, while wider reads use `expand_canvas_document`
 - Project-mode canvas sessions include a file tree with active-file highlighting
 - Canvas documents can be downloaded as Markdown, HTML, or PDF
 
@@ -97,7 +93,7 @@ Manual smoke test checklist for the Canvas UI is available in [docs/canvas-ui-sm
 ### Observability
 
 - Usage panel separates provider-reported usage from local input-source estimates
-- Panel shows session totals, latest-turn totals, per-turn cost, and non-zero input-source chips
+- Panel shows provider session totals, latest-turn totals, peak prompt size, configured per-call caps, and per-turn cost alongside non-zero input-source chips
 - Stored assistant metadata is used to rebuild the panel after reload
 - Summary inspector surfaces trigger thresholds, token gaps, source-message counts, and recent summary status
 
@@ -261,6 +257,10 @@ Some settings come from environment variables, and some are stored in SQLite thr
 | `AGENT_TRACE_LOG_PATH` | `logs/agent-trace.log` | Rotating agent trace log file |
 | `IMAGE_STORAGE_DIR` | `./data/images` | Directory used for uploaded image assets |
 | `DOCUMENT_STORAGE_DIR` | `./data/documents` | Directory used for uploaded document assets |
+| `PROJECT_WORKSPACE_ROOT` | `./data/workspaces` | Root directory for per-conversation workspace sandboxes |
+| `CANVAS_PROMPT_DEFAULT_MAX_LINES` | `800` | Default number of canvas lines injected into prompts |
+| `CANVAS_EXPAND_DEFAULT_MAX_LINES` | `1600` | Default number of canvas lines returned by expand |
+| `CANVAS_SCROLL_WINDOW_LINES` | `200` | Default targeted canvas scroll window |
 | `SCRATCHPAD_ADMIN_EDITING_ENABLED` | `false` | Shows scratchpad editing in the UI |
 
 ### Login and session protection
@@ -286,14 +286,16 @@ Some settings come from environment variables, and some are stored in SQLite thr
 | `BGE_M3_TRUST_REMOTE_CODE` | `false` | Allow Sentence Transformers remote code |
 | `BGE_M3_BATCH_SIZE` | `32` | Embedding batch size |
 | `BGE_M3_PRELOAD` | `true` | Preload the embedder on startup |
-| `RAG_AUTO_INJECT_TOP_K` | `5` | Auto-inject candidate count |
+| `RAG_AUTO_INJECT_TOP_K` | `3` | Seed value used to derive the default context-size preset |
 | `RAG_SEARCH_DEFAULT_TOP_K` | `5` | Default knowledge-base search size |
-| `RAG_AUTO_INJECT_THRESHOLD` | `0.35` | Similarity threshold for auto-injected context |
+| `RAG_AUTO_INJECT_THRESHOLD` | `0.50` | Seed value used to derive the default sensitivity preset |
 | `RAG_SEARCH_MIN_SIMILARITY` | `0.35` | Minimum similarity shown in search results |
 | `RAG_QUERY_EXPANSION_ENABLED` | `true` | Expands some search queries before retrieval |
 | `RAG_QUERY_EXPANSION_MAX_VARIANTS` | `3` | Maximum query expansion variants |
 | `RAG_TEMPORAL_DECAY_ALPHA` | `0.15` | Score decay factor for recency weighting |
 | `RAG_TEMPORAL_DECAY_LAMBDA` | `0.05` | Score decay factor for time-based weighting |
+
+Note: `rag_context_size` and `rag_sensitivity` are the runtime settings used during retrieval. The corresponding env vars above only seed the default presets stored in SQLite.
 
 ### Vision and OCR
 
@@ -368,7 +370,11 @@ The Settings page persists these values in `app_settings`:
 - `rag_auto_inject`
 - `rag_sensitivity`
 - `rag_context_size`
+- `rag_source_types`
 - `tool_memory_auto_inject`
+- `canvas_prompt_max_lines`
+- `canvas_expand_max_lines`
+- `canvas_scroll_window_lines`
 - `chat_summary_mode`
 - `chat_summary_trigger_token_count`
 - `summary_skip_first`
@@ -401,10 +407,10 @@ The Settings page persists these values in `app_settings`:
 
 The app includes a dedicated `/settings` page.
 
-- Assistant tab: user preferences, web-step budget, fetch clipping, summarization, and pruning
-- Memory tab: scratchpad, tool-memory auto-injection, RAG auto-injection, and user profile memory behavior
-- Tools tab: active tool permissions
-- Knowledge tab: RAG maintenance and sync controls
+- Assistant tab: user preferences, tool-step budget, fetch clipping, canvas limits, summarization, and pruning
+- Memory tab: scratchpad, tool-memory auto-injection, RAG auto-injection, RAG source pools, and user profile memory behavior
+- Tools tab: active tool permissions, including canvas and project-workspace tools
+- Knowledge tab: knowledge-base uploads, RAG maintenance, and sync controls
 
 Use the settings page when you want to change global behavior without opening layered panels on the chat screen.
 
@@ -420,9 +426,10 @@ Section by section:
 - Header badge: cumulative provider total tokens for completed assistant turns in the current conversation
 - Provider totals (session): session-level sum of prompt tokens, completion tokens, total tokens, and estimated cost
 - Provider totals (latest assistant turn): the most recent completed assistant reply only, including all model calls used during that reply if tools were involved
-- Estimated input sources (session): cumulative local six-category breakdown across completed assistant turns
-- Estimated input sources (latest assistant turn): local breakdown for the most recent completed assistant reply only
-- Completed assistant turns: one row per completed assistant reply, with model, provider token totals, optional per-turn cost, and non-zero breakdown chips
+- Provider totals (latest assistant turn) also show the peak prompt seen in a single model call and the configured per-call prompt cap
+- Estimated billed input sources (session): cumulative local breakdown across completed assistant turns, aligned to the provider billed prompt total
+- Estimated billed input sources (latest assistant turn): local breakdown for the most recent completed assistant reply only
+- Completed assistant turns: one row per completed assistant reply, with model, provider token totals, optional per-turn cost, and expandable per-call details
 
 Important interpretation details:
 
@@ -455,13 +462,15 @@ The backend also stores the analysis so follow-up questions about the same image
 
 ### Document upload workflow
 
-If you attach a document (DOCX, PDF, TXT, CSV, or MD):
+If you attach a document (DOCX, PDF, TXT, CSV, Markdown, or a common code/config file):
 
 1. The frontend validates file type and size.
 2. The backend extracts plain text from the document.
 3. The extracted text is stored as a file asset and can be opened in Canvas.
 4. The text is injected into the user message as a context block.
 5. If the extracted text is large, it is truncated before it enters the model context.
+
+The same extraction path is also used by the knowledge-base upload form in Settings, where the uploaded file can be indexed as an `uploaded_document` source with a title, description, and auto-inject preference.
 
 ### Scratchpad workflow
 
@@ -487,8 +496,9 @@ If you attach a document (DOCX, PDF, TXT, CSV, or MD):
 ### Canvas documents workflow
 
 - The model can create a canvas document with `create_canvas_document`.
+- Canvas documents may be markdown or code artifacts, and in project mode they can carry `path`, `role`, `summary`, `imports`, `exports`, `symbols`, `dependencies`, `project_id`, and `workspace_id` metadata.
 - The model can expand a non-active canvas file with `expand_canvas_document` when project summaries are insufficient.
-- Existing documents can be rewritten with `rewrite_canvas_document`.
+- Targeted reads use `scroll_canvas_document`; existing documents can then be rewritten with `rewrite_canvas_document`.
 - Line-level edits use `replace_canvas_lines`, `insert_canvas_lines`, and `delete_canvas_lines`.
 - Canvas documents can be deleted with `delete_canvas_document` or cleared with `clear_canvas`.
 - Canvas documents are stored in SQLite and attached to the current conversation.
@@ -497,10 +507,14 @@ If you attach a document (DOCX, PDF, TXT, CSV, or MD):
 
 ### Workspace project workflow
 
-- Project-mode turns can track a structured workflow state with plan, skeleton, content, validation, and fix stages.
+- Project-mode turns can track a structured workflow state with plan, skeleton, content, validate, fix, and validated stages.
 - Workspace tools operate in a conversation-scoped sandbox rooted under `PROJECT_WORKSPACE_ROOT`.
-- Batch file writes can preview diffs before confirmation.
-- Workspace file history supports undo and redo for recorded file changes.
+- `plan_project_workspace` creates or revises the project plan, and `get_project_workflow_status` reports the current stage.
+- `create_project_scaffold` creates a Python-project starter structure when you want a quick baseline.
+- `preview_workspace_changes` shows unified diffs before a write.
+- `write_project_tree` and `bulk_update_workspace_files` handle batch writes with overwrite confirmation when needed.
+- `create_directory`, `create_file`, `update_file`, `read_file`, `list_dir`, and `search_files` operate inside the workspace sandbox.
+- Workspace file history supports undo and redo for recorded file changes, and `validate_project_workspace` runs lightweight checks.
 
 ### Exporting conversations
 
@@ -530,20 +544,19 @@ Canvas documents can also be exported individually with `/api/conversations/<id>
 
 ### Knowledge base workflow
 
-RAG is not a generic manual file-ingestion system in this codebase.
+RAG is a structured retrieval layer in this codebase.
 
 Supported behavior:
 
 - sync existing conversations into RAG
 - sync successful text-like tool results into RAG
 - sync tool-memory entries into RAG
+- index uploaded documents as `uploaded_document` sources via the Settings page or `/api/rag/ingest`
 - search the knowledge base from the API or from the model tool
 - auto-inject retrieved context into each chat turn
 - delete indexed sources one by one
 
-Intentionally disabled:
-
-- manual `/api/rag/ingest` document ingestion
+The Settings page can scope retrieval to conversation, tool result, tool memory, and uploaded-document source pools.
 
 ## Available tools
 
@@ -589,14 +602,14 @@ Answer a follow-up question about a previously uploaded image saved in the curre
 
 #### `search_knowledge_base`
 
-Semantic search over synced conversations and stored tool results.
+Semantic search over synced conversations, stored tool results, remembered web results, and uploaded documents.
 
 - Arguments:
   - `query` (string, required) - semantic search query
   - `category` (string, optional) - optional category filter
   - `top_k` (integer, optional, 1-12) - maximum number of chunks to retrieve
 
-The current code accepts conversation, tool_result, and tool_memory categories.
+The current code accepts conversation, tool_result, tool_memory, and uploaded_document categories.
 
 #### `search_tool_memory`
 
@@ -650,18 +663,43 @@ Create a new canvas document for the current conversation.
 
 - Arguments:
   - `title` (string, required) - document title
-  - `content` (string, required) - full Markdown content
-  - `format` (string, optional) - currently only `markdown`
+  - `content` (string, required) - full document content
+  - `format` (string, optional) - `markdown` or `code`
   - `language` (string, optional) - optional dominant code language
+  - `path` (string, optional) - optional project-relative path
+  - `role` (string, optional) - optional semantic role inside a project workspace
+  - `summary` (string, optional) - optional short responsibility summary
+
+#### `expand_canvas_document`
+
+Load the full context of a canvas document when the current excerpt is not enough.
+
+- Arguments:
+  - `document_id` (string, optional) - target canvas document id
+  - `document_path` (string, optional) - target project-relative path
+
+#### `scroll_canvas_document`
+
+Read a targeted 1-based line range from a canvas document.
+
+- Arguments:
+  - `document_id` (string, optional) - target canvas document id
+  - `document_path` (string, optional) - target project-relative path
+  - `start_line` (integer, required) - 1-based starting line number
+  - `end_line` (integer, required) - 1-based ending line number
 
 #### `rewrite_canvas_document`
 
 Rewrite the full active canvas document while keeping the same document id.
 
 - Arguments:
-  - `content` (string, required) - full replacement Markdown content
+  - `content` (string, required) - full replacement content
   - `title` (string, optional) - optional replacement title
+  - `format` (string, optional) - `markdown` or `code`
   - `language` (string, optional) - optional dominant code language
+  - `path` (string, optional) - optional project-relative path
+  - `role` (string, optional) - optional semantic role inside a project workspace
+  - `summary` (string, optional) - optional short responsibility summary
   - `document_id` (string, optional) - optional target document id
 
 #### `replace_canvas_lines`
@@ -705,6 +743,19 @@ Delete all canvas documents for the current conversation.
 
 - Arguments: none
 
+### Project workspace tools
+
+Workspace tools let the assistant plan, preview, scaffold, validate, and edit files in the conversation sandbox rooted under `PROJECT_WORKSPACE_ROOT`.
+
+- `plan_project_workspace` creates or revises a structured project plan before file writes.
+- `get_project_workflow_status` returns the current project workflow stage.
+- `create_project_scaffold` creates a starter Python-project layout.
+- `preview_workspace_changes` previews unified diffs for proposed writes.
+- `write_project_tree` and `bulk_update_workspace_files` apply batch file writes with overwrite confirmation when needed.
+- `create_directory`, `create_file`, `update_file`, `read_file`, `list_dir`, and `search_files` operate inside the workspace sandbox.
+- `get_workspace_file_history`, `undo_workspace_file_change`, and `redo_workspace_file_change` manage file history.
+- `validate_project_workspace` runs lightweight validation on the workspace or a subdirectory.
+
 ## HTTP endpoints
 
 | Method | Path | Purpose |
@@ -731,7 +782,8 @@ Delete all canvas documents for the current conversation.
 | `DELETE` | `/api/rag/documents/<source_key>` | Delete one indexed RAG source |
 | `GET` | `/api/rag/search?q=...` | Search the knowledge base |
 | `POST` | `/api/rag/sync-conversations` | Sync one conversation or all conversations into RAG |
-| `POST` | `/api/rag/ingest` | Disabled on purpose; returns `410 Gone` |
+| `POST` | `/api/rag/upload-metadata` | Suggest a title and description for an uploaded knowledge-base file |
+| `POST` | `/api/rag/ingest` | Upload text or a file into RAG as an `uploaded_document` source |
 
 ## Data storage
 
@@ -776,6 +828,8 @@ RAG data is stored in a persistent Chroma collection under `CHROMA_DB_PATH`.
 - optional proxies are loaded from `proxies.txt`
 - uploaded images are stored in `data/images/`
 - uploaded documents are stored in `data/documents/`
+- project workspace files default to `data/workspaces/`
+- workspace history metadata is stored alongside each workspace under `.workspace-history/`
 
 ## Development
 
@@ -827,7 +881,7 @@ A sample `.pre-commit-config.yaml` is not included in the repository.
 - uploaded images and documents are MIME-checked and size-limited
 - assistant Markdown is sanitized in the browser
 - repeated web and fetch calls benefit from caching
-- manual RAG ingestion is disabled so indexed sources stay limited to internal conversation and tool data
+- knowledge-base ingestion is limited to synced conversations, tool outputs, remembered web results, and explicit uploads through Settings
 - the app stores conversation content locally; plan backups accordingly
 - local vision requires a local model download and enough hardware to run it
 - scratchpad admin editing is disabled by default; enable it only if you trust the UI users
@@ -870,7 +924,7 @@ Image uploads require an existing saved conversation and a supported image type.
 
 **Document uploads fail**
 
-Only DOCX, PDF, TXT, CSV, and Markdown files are accepted. The document must also contain extractable text.
+Only DOCX, PDF, TXT, CSV, Markdown, and common code/config files are accepted. The document must also contain extractable text.
 
 ## FAQ
 
