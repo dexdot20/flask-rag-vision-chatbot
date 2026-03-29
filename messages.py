@@ -10,7 +10,7 @@ from config import (
     RAG_ENABLED,
 )
 from db import extract_message_attachments, parse_message_metadata, parse_message_tool_calls
-from tool_registry import resolve_runtime_tool_names
+from tool_registry import build_canvas_decision_matrix, resolve_runtime_tool_names
 
 SUMMARY_LABEL = "Conversation summary (generated from deleted messages):"
 CANVAS_PROMPT_MAX_CHARS = 12_000
@@ -364,7 +364,64 @@ def _build_canvas_prompt_payload(
     }
 
 
-def _build_canvas_workflow_rules(active_tool_names: list[str], canvas_payload: dict | None = None) -> list[str]:
+def _build_canvas_workspace_summary(canvas_payload: dict) -> list[str]:
+    manifest = canvas_payload.get("manifest") if isinstance(canvas_payload.get("manifest"), dict) else {}
+    active_document = canvas_payload.get("active_document") if isinstance(canvas_payload.get("active_document"), dict) else {}
+    lines = ["## Canvas Workspace Summary"]
+    lines.append(f"- Working mode: {canvas_payload.get('mode') or 'document'}")
+    lines.append(f"- Document count: {canvas_payload.get('document_count') or 0}")
+
+    project_name = str(manifest.get("project_name") or "").strip()
+    if project_name:
+        lines.append(f"- Project label: {project_name}")
+
+    target_type = str(manifest.get("target_type") or "").strip()
+    if target_type:
+        lines.append(f"- Target type: {target_type}")
+
+    active_label = str(active_document.get("path") or active_document.get("title") or active_document.get("id") or "Canvas").strip()
+    lines.append(f"- Active file: {active_label}")
+
+    validation_status = str(manifest.get("last_validation_status") or "ok").strip() or "ok"
+    lines.append(f"- Validation status: {validation_status}")
+
+    open_issues = [str(issue).strip() for issue in (manifest.get("open_issues") or []) if str(issue).strip()]
+    if open_issues:
+        lines.append(f"- Open issues: {'; '.join(open_issues[:4])}")
+    else:
+        lines.append("- Open issues: none")
+
+    file_list = manifest.get("file_list") if isinstance(manifest.get("file_list"), list) else []
+    if file_list:
+        lines.append("- Files in scope:")
+        for entry in file_list[:8]:
+            label = str(entry.get("path") or entry.get("title") or entry.get("id") or "Canvas").strip() or "Canvas"
+            summary_parts = []
+            if entry.get("active"):
+                summary_parts.append("active")
+            if entry.get("role"):
+                summary_parts.append(str(entry["role"]))
+            if entry.get("language"):
+                summary_parts.append(str(entry["language"]))
+            summary_parts.append(f"{int(entry.get('line_count') or 0)} lines")
+            summary = str(entry.get("summary") or "").strip()
+            suffix = f" | {summary}" if summary else ""
+            lines.append(f"  - {label} ({', '.join(summary_parts)}){suffix}")
+        if len(file_list) > 8:
+            lines.append(f"  - ... {len(file_list) - 8} more files omitted from this summary.")
+
+    relationship_map = canvas_payload.get("relationship_map") if isinstance(canvas_payload.get("relationship_map"), dict) else {}
+    for key, label in (("imports", "Shared imports"), ("exports", "Shared exports"), ("dependencies", "Shared dependencies")):
+        values = relationship_map.get(key) if isinstance(relationship_map.get(key), list) else []
+        compact_values = [str(value).strip() for value in values if str(value).strip()][:8]
+        if compact_values:
+            lines.append(f"- {label}: {', '.join(compact_values)}")
+
+    lines.append("")
+    return lines
+
+
+def _build_canvas_decision_matrix_rows(active_tool_names: list[str], canvas_payload: dict | None = None) -> list[dict[str, str]]:
     active_set = set(active_tool_names or [])
     if not active_set.intersection(
         {
@@ -379,28 +436,11 @@ def _build_canvas_workflow_rules(active_tool_names: list[str], canvas_payload: d
     ):
         return []
 
-    rules = [
-        "Create one canvas document per file or artifact. If the user asks for multiple files, create separate canvas documents instead of concatenating multiple files into one document.",
-        "Use create_canvas_document for new files or drafts. Use rewrite_canvas_document for full-document replacement. Use replace_canvas_lines, insert_canvas_lines, and delete_canvas_lines only for localized edits.",
-    ]
-
-    if canvas_payload and canvas_payload.get("mode") == "project":
-        rules.append(
-            "In project mode, target existing files with document_path when possible and include path, role, and preferably summary when creating new files so the workspace remains coherent."
-        )
-    else:
-        rules.append("When the user wants a new artifact, create it first as a canvas document before attempting line-level edits.")
-
-    if canvas_payload:
-        rules.append(
-            "For line-level edits, use only the visible 1-based line numbers from the current excerpt. If the target region is not visible or the excerpt is truncated, call scroll_canvas_document or expand_canvas_document first."
-        )
-    else:
-        rules.append(
-            "Before line-level edits, make sure the target document already exists in canvas and that you have an excerpt with exact visible 1-based line numbers."
-        )
-
-    return rules
+    return build_canvas_decision_matrix(
+        active_tool_names,
+        has_canvas_documents=bool(canvas_payload),
+        canvas_mode=(canvas_payload or {}).get("mode"),
+    )
 
 
 def build_tool_call_contract(active_tool_names: list[str], canvas_documents=None) -> dict | None:
@@ -556,14 +596,7 @@ def build_runtime_system_message(
         max_lines=canvas_prompt_max_lines or CANVAS_PROMPT_MAX_LINES,
     )
     if canvas_payload:
-        manifest = canvas_payload.get("manifest")
-        if manifest and canvas_payload.get("mode") == "project":
-            parts.append("## Canvas Project Manifest")
-            parts.append("```json\n" + json.dumps(manifest, ensure_ascii=False, indent=2) + "\n```\n")
-        relationship_map = canvas_payload.get("relationship_map")
-        if relationship_map and canvas_payload.get("mode") == "project":
-            parts.append("## Canvas Relationship Map")
-            parts.append("```json\n" + json.dumps(relationship_map, ensure_ascii=False, indent=2) + "\n```\n")
+        parts.extend(_build_canvas_workspace_summary(canvas_payload))
         active_document = canvas_payload["active_document"]
         parts.append("## Active Canvas Document")
         parts.append(f"- Working mode: {canvas_payload['mode']}")
@@ -590,18 +623,17 @@ def build_runtime_system_message(
             "Never guess line numbers outside the visible excerpt."
         )
         if canvas_payload["visible_lines"]:
-            parts.append("```json\n" + json.dumps(canvas_payload["visible_lines"], ensure_ascii=False, indent=2) + "\n```\n")
+            parts.append("```text\n" + "\n".join(canvas_payload["visible_lines"]) + "\n```\n")
         else:
             parts.append("(The active canvas document is empty.)\n")
-        other_documents = canvas_payload.get("other_documents") or []
-        if other_documents:
-            parts.append("## Other Canvas Documents")
-            parts.append("```json\n" + json.dumps(other_documents, ensure_ascii=False, indent=2) + "\n```\n")
 
-    canvas_workflow_rules = _build_canvas_workflow_rules(active_tool_names, canvas_payload)
-    if canvas_workflow_rules:
-        parts.append("## Canvas Workflow")
-        parts.extend(f"- {rule}" for rule in canvas_workflow_rules)
+    canvas_decision_matrix = _build_canvas_decision_matrix_rows(active_tool_names, canvas_payload)
+    if canvas_decision_matrix:
+        parts.append("## Canvas Decision Matrix")
+        parts.append("| Situation | Preferred tool | Notes |")
+        parts.append("| --- | --- | --- |")
+        for row in canvas_decision_matrix:
+            parts.append(f"| {row['situation']} | {row['tool']} | {row['notes']} |")
         parts.append("")
 
     contract = build_tool_call_contract(active_tool_names, canvas_documents=canvas_documents)

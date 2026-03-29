@@ -34,6 +34,10 @@
         {% endfor %}
       </select>
     </div>
+    <button class="btn-ghost btn-canvas" id="canvas-toggle-btn" type="button" aria-controls="canvas-panel" aria-expanded="false" title="Open Canvas">
+      <span class="btn-canvas__label">Canvas</span>
+      <span id="canvas-btn-indicator" class="canvas-btn-indicator" hidden></span>
+    </button>
     <button class="btn-ghost mobile-tools-toggle" id="mobile-tools-btn" type="button" aria-controls="mobile-tools-panel" aria-expanded="false" title="More options">
       <span aria-hidden="true">⋯</span>
     </button>
@@ -222,15 +226,24 @@
     </button>
   </div>
   <div class="canvas-panel-actions">
-    <button class="btn-ghost" id="canvas-edit-btn" type="button">Edit</button>
-    <button class="btn-primary" id="canvas-save-btn" type="button" hidden>Save</button>
-    <button class="btn-ghost" id="canvas-cancel-btn" type="button" hidden>Cancel</button>
-    <button class="btn-ghost" id="canvas-copy-btn" type="button" hidden>Copy</button>
-    <button class="btn-ghost btn-ghost--danger" id="canvas-delete-btn" type="button">Delete current</button>
-    <button class="btn-ghost btn-ghost--danger" id="canvas-clear-btn" type="button">Clear all</button>
-    <button class="btn-ghost" id="canvas-download-html-btn" type="button">Download .html</button>
-    <button class="btn-ghost" id="canvas-download-md-btn" type="button">Download .md</button>
-    <button class="btn-primary" id="canvas-download-pdf-btn" type="button">Download .pdf</button>
+    <div id="canvas-actions-edit" class="canvas-action-group" role="group" aria-label="Canvas editing actions">
+      <span class="canvas-action-group__label">Edit</span>
+      <button class="btn-ghost" id="canvas-edit-btn" type="button">Edit</button>
+      <button class="btn-primary" id="canvas-save-btn" type="button" hidden>Save</button>
+      <button class="btn-ghost" id="canvas-cancel-btn" type="button" hidden>Cancel</button>
+      <button class="btn-ghost" id="canvas-copy-btn" type="button" hidden>Copy</button>
+    </div>
+    <div id="canvas-actions-manage" class="canvas-action-group" role="group" aria-label="Canvas management actions">
+      <span class="canvas-action-group__label">Manage</span>
+      <button class="btn-ghost btn-ghost--danger" id="canvas-delete-btn" type="button">Delete current</button>
+      <button class="btn-ghost btn-ghost--danger" id="canvas-clear-btn" type="button">Clear all</button>
+    </div>
+    <div id="canvas-actions-export" class="canvas-action-group" role="group" aria-label="Canvas export actions">
+      <span class="canvas-action-group__label">Export</span>
+      <button class="btn-ghost" id="canvas-download-html-btn" type="button">Download .html</button>
+      <button class="btn-ghost" id="canvas-download-md-btn" type="button">Download .md</button>
+      <button class="btn-primary" id="canvas-download-pdf-btn" type="button">Download .pdf</button>
+    </div>
   </div>
   <div id="canvas-document-tabs" class="canvas-document-tabs" hidden></div>
   <div id="canvas-meta-bar" class="canvas-meta-bar" hidden>
@@ -249,7 +262,8 @@
       <option value="code">Code</option>
     </select>
   </div>
-  <div id="canvas-status" class="canvas-status">Canvas idle</div>
+  <div id="canvas-search-status" class="canvas-search-status" role="status" aria-live="polite" hidden></div>
+  <div id="canvas-status" class="canvas-status" role="status" aria-live="polite">Canvas idle</div>
   <div id="canvas-hint" class="canvas-hint" hidden></div>
     <div class="canvas-workspace-shell">
       <aside id="canvas-tree-panel" class="canvas-tree-panel" hidden>
@@ -267,7 +281,7 @@
             <option value="">All paths</option>
           </select>
         </div>
-        <div id="canvas-tree" class="canvas-tree" aria-label="Canvas project tree"></div>
+        <div id="canvas-tree" class="canvas-tree" role="tree" aria-label="Canvas project tree"></div>
       </aside>
       <div class="canvas-workspace-main">
         <section id="canvas-diff" class="canvas-diff" hidden></section>

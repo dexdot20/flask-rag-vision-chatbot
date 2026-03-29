@@ -16,6 +16,75 @@ CANVAS_DOCUMENT_TOOL_NAMES = {
     "clear_canvas",
 }
 
+
+def build_canvas_decision_matrix(
+    active_tool_names: list[str] | None = None,
+    *,
+    has_canvas_documents: bool = False,
+    canvas_mode: str | None = None,
+) -> list[dict[str, str]]:
+    active_set = set(active_tool_names or [])
+
+    def enabled(*tool_names: str) -> bool:
+        if not active_set:
+            return True
+        return any(tool_name in active_set for tool_name in tool_names)
+
+    rows: list[dict[str, str]] = []
+    if enabled("create_canvas_document"):
+        rows.append(
+            {
+                "situation": (
+                    "No canvas document exists yet and the user wants a draft, file, or editable artifact."
+                    if not has_canvas_documents
+                    else "You need a brand-new file, draft, or artifact."
+                ),
+                "tool": "create_canvas_document",
+                "notes": "Create one file or artifact per canvas document before attempting line-level edits.",
+            }
+        )
+    if enabled("rewrite_canvas_document"):
+        rows.append(
+            {
+                "situation": "The whole document should be replaced in one pass.",
+                "tool": "rewrite_canvas_document",
+                "notes": "Keep the same document id; do not turn one existing file into a different file.",
+            }
+        )
+    if enabled("replace_canvas_lines", "insert_canvas_lines", "delete_canvas_lines"):
+        rows.append(
+            {
+                "situation": "Only a localized region should change and the exact visible 1-based lines are known.",
+                "tool": "replace_canvas_lines / insert_canvas_lines / delete_canvas_lines",
+                "notes": "Use only the visible excerpt or a recent scroll/expand result. Never guess hidden line numbers.",
+            }
+        )
+    if enabled("scroll_canvas_document"):
+        rows.append(
+            {
+                "situation": "You need a specific hidden range outside the visible excerpt.",
+                "tool": "scroll_canvas_document",
+                "notes": "Read the smallest relevant window instead of expanding the entire file.",
+            }
+        )
+    if enabled("expand_canvas_document"):
+        rows.append(
+            {
+                "situation": "You need a wider full-file view before reasoning or editing.",
+                "tool": "expand_canvas_document",
+                "notes": "Use this when the excerpt or targeted scroll is still insufficient.",
+            }
+        )
+    if canvas_mode == "project" and rows:
+        rows.append(
+            {
+                "situation": "Project mode targeting and file identity.",
+                "tool": "Prefer document_path",
+                "notes": "Use document_path over document_id when possible, and include path, role, and ideally summary for new files.",
+            }
+        )
+    return rows
+
 TOOL_SPECS = [
     {
         "name": "append_scratchpad",

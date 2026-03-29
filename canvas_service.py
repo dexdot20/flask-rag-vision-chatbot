@@ -885,8 +885,16 @@ def delete_canvas_document(
     if not isinstance(documents, list):
         raise ValueError("No canvas document is available yet.")
 
+    previous_active_document_id = get_canvas_runtime_active_document_id(runtime_state)
     removed = documents.pop(index)
-    runtime_state["active_document_id"] = documents[-1]["id"] if documents else None
+    if documents:
+        runtime_state["active_document_id"] = (
+            documents[-1]["id"]
+            if str(removed.get("id") or "") == str(previous_active_document_id or "")
+            else previous_active_document_id
+        )
+    else:
+        runtime_state["active_document_id"] = None
     _refresh_canvas_runtime_state(runtime_state)
     return {
         "status": "ok",

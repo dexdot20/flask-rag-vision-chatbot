@@ -1402,12 +1402,15 @@ class AppRoutesTestCase(unittest.TestCase):
         )
 
         content = message["content"]
+        self.assertIn("## Canvas Workspace Summary", content)
         self.assertIn("## Active Canvas Document", content)
         self.assertIn("- Language: python", content)
         self.assertIn("1: print('hello')", content)
         self.assertIn("2: print('world')", content)
-        self.assertIn("## Canvas Workflow", content)
-        self.assertIn("Create one canvas document per file or artifact.", content)
+        self.assertIn("## Canvas Decision Matrix", content)
+        self.assertIn("| Situation | Preferred tool | Notes |", content)
+        self.assertIn("create_canvas_document", content)
+        self.assertNotIn("## Canvas Workflow", content)
         self.assertIn("## Tool Calling", content)
         self.assertIn("Use only the tools exposed by the API for this turn", content)
 
@@ -1424,7 +1427,7 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn("search_web, fetch_url, image_explain", rules_text)
         self.assertIn("search_tool_memory", rules_text)
 
-    def test_runtime_system_message_includes_canvas_project_manifest(self):
+    def test_runtime_system_message_includes_canvas_workspace_summary(self):
         message = build_runtime_system_message(
             active_tool_names=[
                 "create_canvas_document",
@@ -1462,17 +1465,23 @@ class AppRoutesTestCase(unittest.TestCase):
         )
 
         content = message["content"]
-        self.assertIn("## Canvas Project Manifest", content)
-        self.assertIn("## Canvas Relationship Map", content)
-        self.assertIn('"project_name": "demo-app"', content)
-        self.assertIn('"active_document_id": "canvas-1"', content)
-        self.assertIn('"last_validation_status": "ok"', content)
-        self.assertIn('"imports": [', content)
+        self.assertIn("## Canvas Workspace Summary", content)
         self.assertIn("- Working mode: project", content)
+        self.assertIn("- Project label: demo-app", content)
+        self.assertIn("- Active file: src/app.py", content)
+        self.assertIn("- Validation status: ok", content)
+        self.assertIn("- Files in scope:", content)
+        self.assertIn("src/app.py (active, source, python, 3 lines)", content)
+        self.assertIn("src/config.py (config, python, 1 lines)", content)
+        self.assertIn("- Shared imports: config", content)
         self.assertIn("- Path: src/app.py", content)
         self.assertIn("- Role: source", content)
-        self.assertIn("## Other Canvas Documents", content)
-        self.assertIn('"path": "src/config.py"', content)
+        self.assertIn("- Active document id: canvas-1", content)
+        self.assertIn("## Canvas Decision Matrix", content)
+        self.assertIn("Prefer document_path", content)
+        self.assertNotIn("## Canvas Project Manifest", content)
+        self.assertNotIn("## Canvas Relationship Map", content)
+        self.assertNotIn("## Other Canvas Documents", content)
 
     def test_openai_tool_specs_include_expand_canvas_document_with_canvas_documents(self):
         tools = get_openai_tool_specs(
@@ -2645,7 +2654,15 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn('id="canvas-role-filter"', html_text)
         self.assertIn('id="canvas-path-filter"', html_text)
         self.assertIn('id="canvas-tree"', html_text)
+        self.assertIn('role="tree"', html_text)
+        self.assertIn('id="canvas-toggle-btn"', html_text)
+        self.assertIn('id="canvas-search-status"', html_text)
+        self.assertIn('id="canvas-actions-edit"', html_text)
+        self.assertIn('id="canvas-actions-manage"', html_text)
+        self.assertIn('id="canvas-actions-export"', html_text)
         self.assertIn('id="canvas-resize-handle"', html_text)
+        self.assertIn('const canvasToggleBtn = document.getElementById("canvas-toggle-btn")', script_text)
+        self.assertIn('const canvasSearchStatus = document.getElementById("canvas-search-status")', script_text)
         self.assertIn('const canvasMetaBar = document.getElementById("canvas-meta-bar")', script_text)
         self.assertIn('const canvasCopyRefBtn = document.getElementById("canvas-copy-ref-btn")', script_text)
         self.assertIn('const canvasResetFiltersBtn = document.getElementById("canvas-reset-filters-btn")', script_text)
@@ -2659,6 +2676,11 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn('function resetCanvasFilters({ silent = false } = {})', script_text)
         self.assertIn('function getCanvasVisibleDocuments(documents)', script_text)
         self.assertIn('function buildCanvasTreeNodes(documents)', script_text)
+        self.assertIn('function setCanvasSearchStatus(message, tone = "muted")', script_text)
+        self.assertIn('function updateCanvasSearchFeedback(renderState, matchCount = 0)', script_text)
+        self.assertIn('function handleCanvasTreeItemKeydown(event)', script_text)
+        self.assertIn('function syncCanvasToggleButton()', script_text)
+        self.assertIn('event.active_document_id', script_text)
         self.assertIn('function renderCanvasTree(documents, activeDocument)', script_text)
         self.assertIn('function renderHighlightedCodeBlock(codeText, rawLang = null)', script_text)
         self.assertIn('async function saveCanvasEdits()', script_text)
@@ -2668,6 +2690,8 @@ class AppRoutesTestCase(unittest.TestCase):
         self.assertIn('.canvas-workspace-shell', style_text)
         self.assertIn('.canvas-tree-panel', style_text)
         self.assertIn('.canvas-tree-file.active', style_text)
+        self.assertIn('.canvas-action-group', style_text)
+        self.assertIn('.canvas-search-status', style_text)
 
     def test_settings_ui_exposes_fetch_threshold_input(self):
         html = self.client.get("/settings").get_data(as_text=True)
@@ -3712,7 +3736,15 @@ class AppRoutesTestCase(unittest.TestCase):
                         "format": "markdown",
                         "content": "# Two",
                     },
+                    {
+                        "id": "canvas-three",
+                        "title": "Draft Three",
+                        "format": "markdown",
+                        "content": "# Three",
+                    },
                 ]
+                ,
+                "active_document_id": "canvas-one",
             }
         )
 
@@ -3720,14 +3752,16 @@ class AppRoutesTestCase(unittest.TestCase):
             insert_message(conn, conversation_id, "assistant", "Canvas ready.", metadata=metadata)
 
         delete_response = self.client.delete(
-            f"/api/conversations/{conversation_id}/canvas?document_id=canvas-two"
+            f"/api/conversations/{conversation_id}/canvas?document_id=canvas-three"
         )
         self.assertEqual(delete_response.status_code, 200)
         delete_payload = delete_response.get_json()
         self.assertFalse(delete_payload["cleared"])
-        self.assertEqual(delete_payload["remaining_count"], 1)
-        self.assertEqual(delete_payload["deleted_document_id"], "canvas-two")
+        self.assertEqual(delete_payload["remaining_count"], 2)
+        self.assertEqual(delete_payload["deleted_document_id"], "canvas-three")
+        self.assertEqual(delete_payload["active_document_id"], "canvas-one")
         self.assertEqual(delete_payload["documents"][0]["id"], "canvas-one")
+        self.assertEqual(delete_payload["documents"][1]["id"], "canvas-two")
 
         clear_response = self.client.delete(
             f"/api/conversations/{conversation_id}/canvas?clear_all=true"
@@ -3779,6 +3813,49 @@ class AppRoutesTestCase(unittest.TestCase):
         delete_payload = delete_response.get_json()
         self.assertEqual(delete_payload["remaining_count"], 1)
         self.assertEqual(delete_payload["documents"][0]["path"], "src/app.py")
+
+    def test_canvas_delete_endpoint_reassigns_active_document_when_active_deleted(self):
+        conversation_id = self._create_conversation()
+        metadata = serialize_message_metadata(
+            {
+                "canvas_documents": [
+                    {
+                        "id": "canvas-one",
+                        "title": "Draft One",
+                        "format": "markdown",
+                        "content": "# One",
+                    },
+                    {
+                        "id": "canvas-two",
+                        "title": "Draft Two",
+                        "format": "markdown",
+                        "content": "# Two",
+                    },
+                    {
+                        "id": "canvas-three",
+                        "title": "Draft Three",
+                        "format": "markdown",
+                        "content": "# Three",
+                    },
+                ],
+                "active_document_id": "canvas-two",
+            }
+        )
+
+        with get_db() as conn:
+            insert_message(conn, conversation_id, "assistant", "Canvas ready.", metadata=metadata)
+
+        delete_response = self.client.delete(
+            f"/api/conversations/{conversation_id}/canvas?document_id=canvas-two"
+        )
+        self.assertEqual(delete_response.status_code, 200)
+        delete_payload = delete_response.get_json()
+        self.assertFalse(delete_payload["cleared"])
+        self.assertEqual(delete_payload["remaining_count"], 2)
+        self.assertEqual(delete_payload["deleted_document_id"], "canvas-two")
+        self.assertEqual(delete_payload["active_document_id"], "canvas-three")
+        self.assertEqual(delete_payload["documents"][0]["id"], "canvas-one")
+        self.assertEqual(delete_payload["documents"][1]["id"], "canvas-three")
 
     def test_canvas_patch_endpoint_updates_document_content_and_format(self):
         conversation_id = self._create_conversation()
