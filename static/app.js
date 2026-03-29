@@ -4410,6 +4410,17 @@ function buildVisionNoteHtml(metadata) {
     return "";
   }
 
+  const hasVisionContent = imageAttachments.some((attachment) => {
+    const summary = String(attachment.vision_summary || "").trim();
+    const guidance = String(attachment.assistant_guidance || "").trim();
+    const ocrText = String(attachment.ocr_text || "").trim();
+    const keyPoints = Array.isArray(attachment.key_points) ? attachment.key_points.filter(Boolean) : [];
+    return Boolean(summary || guidance || ocrText || keyPoints.length);
+  });
+  if (!hasVisionContent) {
+    return "";
+  }
+
   return imageAttachments.map((attachment, index) => {
     const summary = String(attachment.vision_summary || "").trim();
     const guidance = String(attachment.assistant_guidance || "").trim();
